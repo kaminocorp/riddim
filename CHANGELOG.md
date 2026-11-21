@@ -86,6 +86,9 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 - `riddim render` and `riddim session render` go through `bounce`, so their files start at the timeline's start rather than a plan-latency late.
 - The audio thread reports loop wraps and locates to the control thread.
 
+#### Fixed (after the phase's pull request was opened)
+- **A healthy plugin could end up on the scan blocklist when two Riddim processes ran at once.** A process that read the scan cache while another was probing a plugin later wrote its stale copy of the "being probed" mark over the other's finished result; the plugin then read as having crashed its host. A process now writes only the entries it changed itself.
+
 #### Verified
 - On Linux, on the deterministic manual device: a dry path and a path through a plugin with latency cancel exactly (silence, not merely −120 dBFS) through a bus, through a send, and with the plugin bypassed; two bounces of a project are the same file byte for byte and equal the live render sample for sample; automation steps land on their sample; a slow plugin load neither stalls the audio callback nor delays an edit; a demo song through Surge XT and Surge XT Effects plays, saves, reopens and bounces.
 
