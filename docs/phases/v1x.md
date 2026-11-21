@@ -4,7 +4,7 @@ Completion notes for the fifth row of the vision's phasing (§5): CLAP, the out-
 
 **Where it stands (2026-11-21):** all four are written, and everything that can run without a Mac passes on Linux. CLAP hosting has been run against real plugins (Surge XT's CLAP builds); the bridge against the test plugins, including ones told to crash and to hang. **Nothing here has run on a Mac**, and the bridge's first exit criterion (Kontakt bridged at 128 frames with no xruns) needs Kontakt, which has not been bought. The stability promise is written and guarded but not made: that is Phil's to do, with a 1.0.
 
-GitHub Actions could still not start jobs on this repository when this was written (an account-level block), so the check on the pull request is red for that reason alone. The same job, run in a clean Ubuntu 24.04 container on two cores with `scripts/ci-clean.sh` (decision D73), passes for this branch and for every phase branch below it. CI is one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded below.
+The GitHub check is green on this pull request and on every phase branch below it (2026-11-21, 247 tests passed here). Until the repository was made public (decision D81) GitHub Actions could not start jobs on it (an account-level block), and the same job was run in a clean Ubuntu 24.04 container on two cores with `scripts/ci-clean.sh` instead (decision D73). CI is one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded below.
 
 Where every phase's exit criteria stand, on one page: [`README.md`](README.md).
 

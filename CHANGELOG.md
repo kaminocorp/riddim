@@ -10,6 +10,7 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 
 #### Decided (Phil's answers to the vision's open questions, 2026-11-21; decisions D77 to D83)
 - **Owner and licence notices.** The copyright owner is Kamino Research Corporation (legal entity: Bradgate Capital Management Pte Ltd, Singapore): `COPYRIGHT`, the C header, crate manifests and the README say so. The licence stays AGPL-3.0-only.
+- **Public.** The repository is public as of 2026-11-21.
 - **Open to contributions.** `CONTRIBUTING.md` (the maintainer reviews every change) and `CLA.md` (a licence grant that keeps a commercial licence possible; a draft no lawyer has read yet), with a Developer Certificate of Origin sign-off on every commit.
 - **Windows later, portable now.** The whole workspace is type-checked and linted for `x86_64-pc-windows-msvc` in `scripts/ci.sh`. WASAPI and ASIO are the future device backends.
 - **Whiplash is a Tauri 2 application** linking the engine in process: [`docs/api/embedding.md`](docs/api/embedding.md).
