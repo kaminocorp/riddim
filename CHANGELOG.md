@@ -8,6 +8,17 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 
 ### v1.x
 
+#### Decided (Phil's answers to the vision's open questions, 2026-11-21; decisions D77 to D83)
+- **Owner and licence notices.** The copyright owner is Kamino Research Corporation (legal entity: Bradgate Capital Management Pte Ltd, Singapore): `COPYRIGHT`, the C header, crate manifests and the README say so. The licence stays AGPL-3.0-only.
+- **Open to contributions.** `CONTRIBUTING.md` (the maintainer reviews every change) and `CLA.md` (a licence grant that keeps a commercial licence possible; a draft no lawyer has read yet), with a Developer Certificate of Origin sign-off on every commit.
+- **Windows later, portable now.** The whole workspace is type-checked and linted for `x86_64-pc-windows-msvc` in `scripts/ci.sh`. WASAPI and ASIO are the future device backends.
+- **Whiplash is a Tauri 2 application** linking the engine in process: [`docs/api/embedding.md`](docs/api/embedding.md).
+- **Target machine**: a Mac Mini with an M4 Pro and a Scarlett 2i2. **Helix** is a future test plugin, not a requirement.
+
+#### Changed for in-process hosts
+- **`Engine` is `Send`.** It used to hold the plugin-carrying main-thread half until asked for it, so it could not be kept in an application's shared state. It now makes that half when `take_main_thread` is called, on the calling thread.
+- `TransportCommand` can be read from JSON; `Applied`, `Rejected`, `Status` and `StreamInfo` can be written as JSON.
+
 #### Added
 - **CLAP hosting** on `clack-host`: scanning, instantiation, audio and note ports, parameters, sample-offset events both ways, transport, state, latency, and an editor through the `gui` extension (*the editor is unverified*). `.clap` files are scanned and cached with everything else.
 - **The out-of-process bridge**: a plugin slot marked `bridged` runs in a `riddim-bridge` child process. Shared memory for audio and events, a socket hand-off per block, JSON for everything else. A plugin that crashes or hangs is taken out of the mix (`plugin_crashed`) and the session carries on. Unix only; no editor for bridged plugins yet.

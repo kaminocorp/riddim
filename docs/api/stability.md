@@ -13,6 +13,8 @@ Four surfaces. Everything else is implementation.
 | The project format | the model as JSON (`Model::to_json`, `riddim_model_json`) and ops as JSON | the model's `schema` number |
 | Events and status | [`events.md`](events.md) | with the C ABI |
 
+The JSON forms of transport commands, of the results of an edit (`Applied`, `Rejected`) and of `Status` and `StreamInfo` were added for in-process hosts ([`embedding.md`](embedding.md)). They belong with events and status in the table above, and are not yet pinned by a test beyond the transport commands' own.
+
 Not public, and free to change: the `riddim` command-line tool's options and output, `riddim-scan`'s and `riddim-bridge`'s protocols (they are only ever run by the same build of the engine), the scan cache file, the names of recorded files.
 
 ## The promise, from 1.0

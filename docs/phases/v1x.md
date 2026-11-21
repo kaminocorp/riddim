@@ -4,7 +4,7 @@ Completion notes for the fifth row of the vision's phasing (§5): CLAP, the out-
 
 **Where it stands (2026-11-21):** all four are written, and everything that can run without a Mac passes on Linux. CLAP hosting has been run against real plugins (Surge XT's CLAP builds); the bridge against the test plugins, including ones told to crash and to hang. **Nothing here has run on a Mac**, and the bridge's first exit criterion (Kontakt bridged at 128 frames with no xruns) needs Kontakt, which has not been bought. The stability promise is written and guarded but not made: that is Phil's to do, with a 1.0.
 
-GitHub Actions could still not start jobs on this repository when this was written (an account billing matter), so the check on the pull request is red for that reason alone. The same job, run in a clean Ubuntu 24.04 container on two cores with `scripts/ci-clean.sh` (decision D73), passes for this branch and for every phase branch below it. CI is one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded below.
+GitHub Actions could still not start jobs on this repository when this was written (an account-level block), so the check on the pull request is red for that reason alone. The same job, run in a clean Ubuntu 24.04 container on two cores with `scripts/ci-clean.sh` (decision D73), passes for this branch and for every phase branch below it. CI is one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded below.
 
 Where every phase's exit criteria stand, on one page: [`README.md`](README.md).
 
@@ -50,8 +50,9 @@ Run on the Linux build machine (x86-64, 8 cores and 16 threads, Rust 1.100.0) wi
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | the same for `--target aarch64-apple-darwin` | clean |
-| `cargo test --workspace` | 244 passed, 0 failed, 2 ignored (the hour-long recording and one documentation example). The macOS-only tests compile for Apple Silicon but cannot run here |
-| the CI job in a clean container (`scripts/ci-clean.sh`: fmt, clippy, test, on two cores) | passed: 244 tests; likewise 66, 158, 180 and 209 for the heads of the four phase branches below this one |
+| the same for `--target x86_64-pc-windows-msvc` (type-check of the portable core, decision D82) | clean |
+| `cargo test --workspace` | 247 passed, 0 failed, 2 ignored (the hour-long recording and one documentation example). The macOS-only tests compile for Apple Silicon but cannot run here |
+| the CI job in a clean container (`scripts/ci-clean.sh`: fmt, clippy, test, on two cores) | passed: 247 tests; likewise 66, 158, 180 and 209 for the heads of the four phase branches below this one |
 | third-party conformance run: Surge XT and Surge XT Effects, VST3 and CLAP | passed, all four |
 | third-party demo song, VST3 and CLAP | passed, both |
 | `scripts/rtsan.sh` (RealtimeSanitizer) | 171 passed, 0 failed, with the sanitizer live, including the bridge tests, the CLAP fixture tests and the CLAP demo song |

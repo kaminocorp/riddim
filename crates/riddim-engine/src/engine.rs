@@ -19,7 +19,7 @@ use riddim_rt::spsc::{self, Producer};
 use crate::audio::AudioEngine;
 use crate::control::{Applied, Control, ControlMsg, ControlSetup, Rejected, TransportCommand};
 use crate::events::{Event, TransportState};
-use crate::host::MainThread;
+use crate::host::{HostReply, HostRequest, MainThread};
 use crate::shared::Shared;
 
 /// Which audio device the engine runs on.
@@ -125,8 +125,11 @@ impl std::fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+/// The channel ends and the bridge path a [`MainThread`] is made from.
+type MainThreadParts = (Receiver<HostRequest>, Sender<HostReply>, Option<PathBuf>);
+
 /// A snapshot of what the engine is doing.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 #[non_exhaustive]
 pub struct Status {
     pub transport: TransportState,
@@ -174,7 +177,8 @@ pub struct Engine {
     control: Sender<ControlMsg>,
     control_thread: Option<JoinHandle<()>>,
     host_thread: Option<JoinHandle<()>>,
-    main_thread: Option<MainThread>,
+    /// What the main-thread half is made from, until it is taken.
+    main_thread: Option<MainThreadParts>,
     stream: Option<Stream>,
     info: StreamInfo,
     shared: Arc<Shared>,
@@ -292,12 +296,12 @@ impl Engine {
             .map_err(EngineError::Io)?;
 
         let (main_thread, host_thread) = match config.main_thread {
+            // Only what the main-thread half is made from is kept here, and the half itself is
+            // made where it is taken: it holds plugin instances, which must never change
+            // thread, and an `Engine` holding one could not be handed to another thread or
+            // kept in an application's shared state.
             MainThreadMode::External => (
-                Some(MainThread::new(
-                    host_rx,
-                    host_reply_tx,
-                    config.bridge_executable.clone(),
-                )),
+                Some((host_rx, host_reply_tx, config.bridge_executable.clone())),
                 None,
             ),
             MainThreadMode::Internal => {
@@ -562,8 +566,14 @@ impl Engine {
 
     /// Takes the main-thread half of the engine. Only present with
     /// [`MainThreadMode::External`], and only once.
+    ///
+    /// Call this on the thread that will pump it, which on macOS must be the application's
+    /// main thread: the half that comes back holds the plugin instances and cannot be sent
+    /// to another thread. The `Engine` itself can be (it is `Send`), so an application can
+    /// take this on its main thread and keep the engine wherever its commands are handled.
     pub fn take_main_thread(&mut self) -> Option<MainThread> {
-        self.main_thread.take()
+        let (requests, replies, bridge) = self.main_thread.take()?;
+        Some(MainThread::new(requests, replies, bridge))
     }
 }
 

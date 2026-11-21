@@ -4,7 +4,7 @@ Completion notes for phase 3 of the vision (the third row of §5): sends and bus
 
 **Where it stands (2026-11-21):** the mixing engine is written and everything that can run without a Mac passes, on a deterministic simulated device and with Surge XT standing in for the commercial plugins. **Nothing here has run on a Mac or on real audio hardware, and nothing has been run with Kontakt, Superior Drummer 3, EZbass or Helix Native**, which have not been bought. The phase's first exit criterion (a demo song with all four, bounced, in Whiplash) is therefore not met and cannot be from here.
 
-Still true from earlier phases: GitHub Actions could not start jobs on this repository (an account billing matter), and CI is deliberately one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded below.
+Still true from earlier phases: GitHub Actions could not start jobs on this repository (an account-level block), and CI is deliberately one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded below.
 
 ## What was built
 

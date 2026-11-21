@@ -806,6 +806,7 @@ dependencies = [
  "riddim-rt",
  "riddim-test-support",
  "riddim-time",
+ "serde",
  "serde_json",
 ]
 
@@ -884,6 +885,7 @@ dependencies = [
  "objc2-core-audio-types",
  "objc2-core-foundation",
  "riddim-rt",
+ "serde",
 ]
 
 [[package]]

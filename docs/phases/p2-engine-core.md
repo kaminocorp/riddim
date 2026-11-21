@@ -4,7 +4,7 @@ Completion notes for phase 2 of the vision (the second row of §5): the engine t
 
 **Where it stands (2026-11-21):** the engine is written and everything that can run without a Mac passes, on a deterministic simulated device. **Nothing here has run on a Mac or on real audio hardware.** The phase's first exit criterion (Phil records a take over an instrument in Whiplash, saves, reopens and hears it identically) cannot be met from here: it needs a Mac, real hardware and Whiplash. A terminal stand-in for that flow exists (`riddim session`) and is what the Mac checklist below asks to be run.
 
-Still true from phase 1: GitHub Actions could not start jobs on this repository (billing), and CI is deliberately one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded here; and the commercial plugins have not been bought, so Surge XT stands in for the instrument.
+Still true from phase 1: GitHub Actions could not start jobs on this repository (an account-level block), and CI is deliberately one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded here; and the commercial plugins have not been bought, so Surge XT stands in for the instrument.
 
 ## What was built
 

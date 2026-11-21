@@ -31,6 +31,14 @@ else
     echo "note: aarch64-apple-darwin target not installed; skipping the macOS type-check"
 fi
 
+# The core must stay portable: nothing outside the platform backends may assume macOS or Unix.
+if rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-msvc$'; then
+    step "clippy (x86_64-pc-windows-msvc, type-check only)"
+    cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+else
+    echo "note: x86_64-pc-windows-msvc target not installed; skipping the Windows type-check"
+fi
+
 step "tests"
 cargo test --workspace
 

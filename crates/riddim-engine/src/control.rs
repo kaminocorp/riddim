@@ -39,7 +39,11 @@ use crate::plan::{
 use crate::shared::{MeterCell, Shared};
 
 /// A transport request from the client.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// As JSON: `{"command":"play"}`, `{"command":"stop"}`, `{"command":"record"}`,
+/// `{"command":"locate","position":{"beats":0}}`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "command", content = "position")]
 pub enum TransportCommand {
     Play,
     Stop,
@@ -50,7 +54,7 @@ pub enum TransportCommand {
 }
 
 /// The result of a successfully applied batch.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Applied {
     pub revision: u64,
     /// Undo the batch by applying these first to last.
@@ -63,6 +67,17 @@ pub struct Rejected {
     /// The op in the batch that failed.
     pub index: usize,
     pub error: OpError,
+}
+
+/// As JSON: `{"index": 2, "error": "..."}`, the error in words, as events carry it.
+impl serde::Serialize for Rejected {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("Rejected", 2)?;
+        out.serialize_field("index", &self.index)?;
+        out.serialize_field("error", &self.error.to_string())?;
+        out.end()
+    }
 }
 
 pub(crate) enum ControlMsg {

@@ -1,5 +1,6 @@
 [toolchain]
 channel = "1.100.0"
 components = ["rustfmt", "clippy"]
-# The Apple Silicon target lets Linux machines (and CI) type-check the macOS-only code.
-targets = ["aarch64-apple-darwin"]
+# The Apple Silicon and Windows targets let any machine type-check the code it cannot run:
+# the macOS backends, and the portability of everything else (decision D82).
+targets = ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"]

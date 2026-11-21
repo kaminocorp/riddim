@@ -4,10 +4,10 @@ Riddim is a native audio engine written in Rust. It handles playback, recording,
 
 **Status:** under construction, phase by phase. See the [changelog](CHANGELOG.md) for what exists, and the per-phase notes in [`docs/phases/`](docs/phases/) for what has actually been run and on what. The design is in the vision: [`docs/visions/riddim.md`](docs/visions/riddim.md). Decisions taken along the way are in [`docs/decisions.md`](docs/decisions.md).
 
-- **Platform:** macOS first (CoreAudio, Apple Silicon); Windows later. Everything platform-neutral also builds and is tested on Linux.
+- **Platform:** macOS first (CoreAudio, Apple Silicon); Windows later (WASAPI or ASIO). Everything platform-neutral also builds and is tested on Linux, and is type-checked for Windows. **Nothing has been run on macOS yet**: see the phase notes.
 - **Plugin formats:** VST3, AU and CLAP, in process or (opt-in per plugin) each in a process of its own.
 - **Architecture:** real-time safe by design, and deterministic in offline render.
-- **First client:** [Whiplash](https://github.com/hejijunhao/whiplash), through a defined command/query/event API with a C ABI.
+- **First client:** [Whiplash](https://github.com/hejijunhao/whiplash), a Tauri 2 application that links the engine in process ([`docs/api/embedding.md`](docs/api/embedding.md)). The API is commands, queries and events; there is a C ABI for clients that are not Rust.
 
 ## Layout
 
@@ -59,6 +59,12 @@ cargo run -p riddim-cli -- session play mix.json --switch-buffer 256 --render-th
 
 `riddim --help` lists the commands. `riddim-render model.json --out mix.wav` bounces a project with no device or terminal.
 
+## Contributing
+
+Contributions are welcome, and every one is reviewed by the maintainer before it is merged. [`CONTRIBUTING.md`](CONTRIBUTING.md) says how; it asks for a sign-off on each commit and, once, agreement to a contributor licence agreement ([`CLA.md`](CLA.md)).
+
 ## Licence
 
-AGPL-3.0-only (see `LICENSE`); a commercial licence is planned. See the vision, §6.
+Copyright © 2026 Kamino Research Corporation (legal entity: Bradgate Capital Management Pte Ltd, Singapore). See [`COPYRIGHT`](COPYRIGHT).
+
+Riddim is free software under the GNU Affero General Public License, version 3 only ([`LICENSE`](LICENSE)). A commercial licence, for those who cannot use AGPL code, is planned and does not exist yet; the reasoning is in the vision, §6.

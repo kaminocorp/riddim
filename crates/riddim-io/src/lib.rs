@@ -63,7 +63,7 @@ impl Default for StreamConfig {
 }
 
 /// What was actually opened.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct StreamInfo {
     pub device_name: String,
     pub sample_rate: f64,
