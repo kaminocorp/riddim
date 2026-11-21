@@ -310,6 +310,10 @@ pub(crate) struct Control {
     /// Reads long files ahead of the playhead.
     streamer: crate::stream::Streamer,
     starved_seen: u64,
+    /// The recording in `recording` has been told to stop; its takes are not back yet.
+    recording_stopping: bool,
+    /// Record was asked for while the previous recording was still being put away.
+    record_again: bool,
 }
 
 /// What mutes and solos leave to be heard.
@@ -458,6 +462,8 @@ impl Control {
             streamer: crate::stream::Streamer::start(setup.streaming, rate, setup.shared.clone())
                 .expect("the reader thread could not be started"),
             starved_seen: 0,
+            recording_stopping: false,
+            record_again: false,
             sources: HashMap::new(),
             plan_serial: 0,
             installed: (0, 0, 0),
@@ -1631,7 +1637,11 @@ impl Control {
     fn transport(&mut self, command: TransportCommand) {
         match command {
             TransportCommand::Play => self.send(ToAudio::Play),
-            TransportCommand::Stop => self.send(ToAudio::Stop),
+            TransportCommand::Stop => {
+                self.recording_stopping = self.recording.is_some();
+                self.record_again = false;
+                self.send(ToAudio::Stop);
+            }
             TransportCommand::Locate(position) => {
                 if self.recording.is_some() {
                     self.emit(Event::Error {
@@ -1650,6 +1660,12 @@ impl Control {
 
     fn start_recording(&mut self) {
         if self.recording.is_some() {
+            // Already recording: nothing to do. Unless that recording has been told to stop
+            // and its takes are still on their way back from the audio thread; then this is
+            // a new recording, to be started as soon as the old one has been put away.
+            if self.recording_stopping {
+                self.record_again = true;
+            }
             return;
         }
         let armed: Vec<Arc<Track>> = self
@@ -1775,6 +1791,14 @@ impl Control {
     }
 
     fn finish_recording(&mut self, captures: Vec<CaptureRt>, rolled: i64) {
+        self.finish_takes(captures, rolled);
+        self.recording_stopping = false;
+        if std::mem::take(&mut self.record_again) {
+            self.start_recording();
+        }
+    }
+
+    fn finish_takes(&mut self, captures: Vec<CaptureRt>, rolled: i64) {
         // Dropping the sinks tells nobody anything; the butler is told explicitly below.
         drop(captures);
         let Some(session) = self.recording.take() else {

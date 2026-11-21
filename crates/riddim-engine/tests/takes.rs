@@ -520,3 +520,60 @@ fn a_punch_that_cannot_happen_is_refused_and_one_already_under_way_is_cut_to_fit
     assert_eq!(takes[0].2, 20_000 - ROUND_TRIP as u64);
     assert_eq!(engine.status().rt_violations, 0);
 }
+
+#[test]
+fn record_pressed_again_before_the_last_take_is_put_away_starts_a_new_one() {
+    // Stop and Record in quick succession: the first take's audio is still on its way back
+    // from the audio thread when the second recording is asked for. It must not be lost.
+    let dir = temp_dir("record-again");
+    let mut engine = engine_with(&dir, loopback());
+    let events = engine.subscribe();
+    coded_session(&engine, &dir);
+    engine.transport(TransportCommand::Locate(Position::START));
+    engine.transport(TransportCommand::Record);
+    engine.sync();
+    engine.run(10_000);
+    // No block runs between these two, so the audio thread has not even stopped yet.
+    engine.transport(TransportCommand::Stop);
+    engine.transport(TransportCommand::Record);
+    engine.sync();
+    engine.run(BLOCK);
+    let (first, _) = finished(&events, 20, 1);
+    assert_eq!(first[0].2, 10_000 - ROUND_TRIP as u64);
+    // The second recording starts by itself once the first has been put away.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine.status().transport != TransportState::Recording {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second recording never started"
+        );
+        engine.sync();
+        engine.run(BLOCK);
+    }
+    let from = engine.status().position_samples;
+    engine.run(8_000);
+    engine.transport(TransportCommand::Stop);
+    engine.sync();
+    engine.run(BLOCK);
+    let (second, _) = finished(&events, 20, 1);
+    assert!(
+        second[0].2 >= 8_000 - ROUND_TRIP as u64,
+        "the second take has {} frames",
+        second[0].2
+    );
+    assert!(from >= 10_000);
+    // Pressing Record twice while one is running is still just one recording.
+    engine.transport(TransportCommand::Record);
+    engine.transport(TransportCommand::Record);
+    engine.sync();
+    engine.run(4_000);
+    engine.transport(TransportCommand::Stop);
+    engine.sync();
+    engine.run(BLOCK);
+    finished(&events, 20, 1);
+    engine.sync();
+    engine.run(4 * BLOCK);
+    engine.sync();
+    assert_eq!(engine.status().transport, TransportState::Stopped);
+    assert_eq!(engine.model().track(TrackId(20)).unwrap().clips.len(), 3);
+}
