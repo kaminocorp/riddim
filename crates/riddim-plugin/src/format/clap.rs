@@ -32,6 +32,7 @@ use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamInfoBuffer,
     ParamInfoFlags, ParamRescanFlags, PluginParams,
 };
+use clack_extensions::render::{PluginRender, RenderMode};
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_host::events::event_types::{
     MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
@@ -49,7 +50,7 @@ use crate::error::{PluginError, Result};
 use crate::event::{Event, EventBody};
 use crate::instance::{
     ActivateConfig, EditorSize, ParamFlags, ParamId, ParamInfo, ParentWindow, PluginEvent,
-    PluginInstance, PluginProcessor, Tail,
+    PluginInstance, PluginProcessor, ProcessMode, Tail,
 };
 use crate::process::{ProcessContext, ProcessStatus as OurStatus};
 use crate::state::StateBlob;
@@ -169,6 +170,7 @@ struct Extensions {
     params: Option<PluginParams>,
     state: Option<PluginState>,
     latency: Option<PluginLatency>,
+    render: Option<PluginRender>,
     gui: Option<PluginGui>,
 }
 
@@ -188,6 +190,7 @@ impl<'a> SharedHandler<'a> for Shared {
             params: instance.get_extension(),
             state: instance.get_extension(),
             latency: instance.get_extension(),
+            render: instance.get_extension(),
             gui: instance.get_extension(),
         });
     }
@@ -530,6 +533,17 @@ impl PluginInstance for ClapInstance {
         // The layout and the parameter list may have changed while inactive.
         self.read_layout();
         self.read_ranges();
+        // Tell a plugin that wants to know whether this is a render with no clock behind it:
+        // a sampler may then wait for its disk instead of dropping notes, and anything may
+        // choose its better, slower algorithms. A plugin that declines is run as it is.
+        if let Some(render) = &self.extensions().render {
+            let mode = match config.mode {
+                ProcessMode::Offline => RenderMode::Offline,
+                ProcessMode::Realtime => RenderMode::Realtime,
+            };
+            let mut instance = self.instance.borrow_mut();
+            let _ = render.set(&instance.plugin_handle(), mode);
+        }
         let stopped = self
             .instance
             .borrow_mut()

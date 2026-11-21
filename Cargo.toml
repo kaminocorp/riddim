@@ -47,7 +47,7 @@ clack-host = "0.2"
 # The CLAP C ABI itself, for the CLAP test fixture (clack-host builds on the same crate).
 clap-sys = "0.5"
 libc = "0.2"
-clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "params", "state", "latency", "gui", "log"] }
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "params", "state", "latency", "gui", "log", "render"] }
 crossbeam-queue = "0.3"
 clap = { version = "4", features = ["derive"] }
 proptest = "1"

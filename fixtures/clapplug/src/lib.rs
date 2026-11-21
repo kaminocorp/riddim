@@ -8,7 +8,8 @@
 //! * **Riddim CLAP Synth** (`dev.riddim.test.clap-synth`): no input, one stereo output, one
 //!   note port. A sine per held key at a quarter of full scale times the velocity, starting at
 //!   phase zero on the exact sample of the note-on and stopping on the exact sample of the
-//!   note-off. One parameter, gain, with a plain range of 0 to 2.
+//!   note-off. A gain parameter with a plain range of 0 to 2, and a read-only one that is 1
+//!   after the host has said (through the render extension) that it is rendering offline.
 //! * **Riddim CLAP Delay** (`dev.riddim.test.clap-delay`): stereo in, stereo out, delayed by
 //!   exactly [`DELAY_LATENCY`] samples, which it reports as its latency. The same gain
 //!   parameter.
@@ -19,7 +20,7 @@
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
@@ -39,6 +40,11 @@ use clap_sys::ext::note_ports::{
 };
 use clap_sys::ext::params::{
     clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE,
+    CLAP_PARAM_IS_READONLY,
+};
+use clap_sys::ext::render::{
+    clap_plugin_render, clap_plugin_render_mode, CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE,
+    CLAP_RENDER_REALTIME,
 };
 use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
 use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
@@ -56,6 +62,8 @@ const DELAY_ID: &CStr = c"dev.riddim.test.clap-delay";
 
 /// The synth's gain parameter. Plain range 0 to 2, default 1.
 const SYNTH_GAIN: clap_id = 100;
+/// The synth's read-only parameter: 1 once the host has announced an offline render, else 0.
+const SYNTH_OFFLINE: clap_id = 101;
 /// The delay's gain parameter. The same range.
 const DELAY_GAIN: clap_id = 7;
 const GAIN_MAX: f64 = 2.0;
@@ -185,6 +193,8 @@ struct Plugin {
     /// The gain, as the bits of an `f64`: read by the main thread, written by whichever
     /// thread is handed parameter events.
     gain: AtomicU64,
+    /// Whether the host last announced an offline render.
+    offline: AtomicBool,
     audio: UnsafeCell<Audio>,
 }
 
@@ -516,8 +526,12 @@ static NOTE_PORTS: clap_plugin_note_ports = clap_plugin_note_ports {
     get: Some(note_ports_get),
 };
 
-unsafe extern "C" fn params_count(_plugin: *const clap_plugin) -> u32 {
-    1
+unsafe extern "C" fn params_count(plugin: *const clap_plugin) -> u32 {
+    // SAFETY: a live plugin of ours.
+    match unsafe { this(plugin) }.kind {
+        Kind::Synth => 2,
+        Kind::Delay => 1,
+    }
 }
 
 unsafe extern "C" fn params_get_info(
@@ -525,20 +539,28 @@ unsafe extern "C" fn params_get_info(
     index: u32,
     info: *mut clap_param_info,
 ) -> bool {
-    if index != 0 || info.is_null() {
-        return false;
-    }
     // SAFETY: a live plugin of ours, and `info` is the host's to fill.
     unsafe {
+        if index >= params_count(plugin) || info.is_null() {
+            return false;
+        }
         let info = &mut *info;
-        info.id = this(plugin).kind.gain_id();
-        info.flags = CLAP_PARAM_IS_AUTOMATABLE;
         info.cookie = ptr::null_mut();
-        write_name(&mut info.name, c"Gain");
         write_name(&mut info.module, c"");
         info.min_value = 0.0;
-        info.max_value = GAIN_MAX;
-        info.default_value = GAIN_DEFAULT;
+        if index == 0 {
+            info.id = this(plugin).kind.gain_id();
+            info.flags = CLAP_PARAM_IS_AUTOMATABLE;
+            write_name(&mut info.name, c"Gain");
+            info.max_value = GAIN_MAX;
+            info.default_value = GAIN_DEFAULT;
+        } else {
+            info.id = SYNTH_OFFLINE;
+            info.flags = CLAP_PARAM_IS_READONLY;
+            write_name(&mut info.name, c"Offline");
+            info.max_value = 1.0;
+            info.default_value = 0.0;
+        }
     }
     true
 }
@@ -551,10 +573,16 @@ unsafe extern "C" fn params_get_value(
     // SAFETY: a live plugin of ours, and `out` is the host's to fill.
     unsafe {
         let plugin = this(plugin);
-        if id != plugin.kind.gain_id() || out.is_null() {
+        if out.is_null() {
             return false;
         }
-        *out = plugin.gain();
+        if id == plugin.kind.gain_id() {
+            *out = plugin.gain();
+        } else if id == SYNTH_OFFLINE && plugin.kind == Kind::Synth {
+            *out = plugin.offline.load(Ordering::Relaxed) as u8 as f64;
+        } else {
+            return false;
+        }
     }
     true
 }
@@ -695,6 +723,28 @@ unsafe extern "C" fn state_load(plugin: *const clap_plugin, stream: *const clap_
     true
 }
 
+unsafe extern "C" fn render_has_hard_realtime_requirement(_plugin: *const clap_plugin) -> bool {
+    false
+}
+
+unsafe extern "C" fn render_set(plugin: *const clap_plugin, mode: clap_plugin_render_mode) -> bool {
+    let offline = match mode {
+        CLAP_RENDER_OFFLINE => true,
+        CLAP_RENDER_REALTIME => false,
+        _ => return false,
+    };
+    // SAFETY: a live plugin of ours.
+    unsafe { this(plugin) }
+        .offline
+        .store(offline, Ordering::Relaxed);
+    true
+}
+
+static RENDER: clap_plugin_render = clap_plugin_render {
+    has_hard_realtime_requirement: Some(render_has_hard_realtime_requirement),
+    set: Some(render_set),
+};
+
 static STATE: clap_plugin_state = clap_plugin_state {
     save: Some(state_save),
     load: Some(state_load),
@@ -720,6 +770,8 @@ unsafe extern "C" fn get_extension(plugin: *const clap_plugin, id: *const c_char
         (&raw const PARAMS).cast()
     } else if id == CLAP_EXT_STATE {
         (&raw const STATE).cast()
+    } else if id == CLAP_EXT_RENDER {
+        (&raw const RENDER).cast()
     } else if id == CLAP_EXT_NOTE_PORTS && kind == Kind::Synth {
         (&raw const NOTE_PORTS).cast()
     } else if id == CLAP_EXT_LATENCY && kind == Kind::Delay {
@@ -782,6 +834,7 @@ unsafe extern "C" fn create_plugin(
         },
         kind,
         gain: AtomicU64::new(GAIN_DEFAULT.to_bits()),
+        offline: AtomicBool::new(false),
         audio: UnsafeCell::new(Audio {
             sample_rate: 48_000.0,
             voices: [SILENT; VOICES],

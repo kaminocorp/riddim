@@ -113,7 +113,10 @@ fn the_synth_reports_its_ports_and_its_parameter_in_normalised_terms() {
 
     // The plugin's range is 0 to 2 with a default of 1; the contract's is 0 to 1.
     let params = instance.params();
-    assert_eq!(params.len(), 1);
+    assert_eq!(params.len(), 2);
+    let offline = &params[1];
+    assert_eq!(offline.id, ids::CLAP_SYNTH_OFFLINE);
+    assert!(offline.flags.read_only && !offline.flags.automatable);
     let gain = &params[0];
     assert_eq!(gain.id, ids::CLAP_SYNTH_GAIN);
     assert_eq!(gain.name, "Gain");
@@ -126,7 +129,7 @@ fn the_synth_reports_its_ports_and_its_parameter_in_normalised_terms() {
         instance.param_text(ids::CLAP_SYNTH_GAIN, 0.25).as_deref(),
         Some("0.50 x")
     );
-    assert_eq!(instance.param_value(ids::CLAP_SYNTH_GAIN + 1), None);
+    assert_eq!(instance.param_value(9_999), None);
     assert_eq!(instance.latency_samples(), 0);
     assert!(!instance.is_active());
 }
@@ -339,6 +342,27 @@ fn reactivation_at_another_rate_and_oversized_blocks() {
     let fits = rig.run(32, &[vec![1.0; 32], vec![1.0; 32]], &[]);
     assert_eq!(fits.status, ProcessStatus::Ok);
     rig.finish(delay.as_mut());
+}
+
+#[test]
+fn a_plugin_is_told_whether_a_render_is_offline() {
+    let mut instance = instantiate(&descriptor(ids::CLAP_SYNTH_ID)).unwrap();
+    assert_eq!(instance.param_value(ids::CLAP_SYNTH_OFFLINE), Some(0.0));
+    let offline = ActivateConfig {
+        mode: ProcessMode::Offline,
+        ..config()
+    };
+    let rig = Rig::new(instance.as_mut(), &offline);
+    assert_eq!(
+        instance.param_value(ids::CLAP_SYNTH_OFFLINE),
+        Some(1.0),
+        "a bounce must be announced: a sampler waits for its disk only if it knows it may"
+    );
+    rig.finish(instance.as_mut());
+    // And told again when it is back on a clock.
+    let rig = Rig::new(instance.as_mut(), &config());
+    assert_eq!(instance.param_value(ids::CLAP_SYNTH_OFFLINE), Some(0.0));
+    rig.finish(instance.as_mut());
 }
 
 #[test]

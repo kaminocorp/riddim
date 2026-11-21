@@ -24,6 +24,7 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 
 #### Fixed
 - The scan cache could blocklist a healthy plugin when two Riddim processes ran at once: found here, fixed on the phase 3 branch, where it came from (see that section).
+- A bounce did not tell CLAP plugins that it was offline (VST3 and Audio Unit plugins were told). It now does, through CLAP's `render` extension, so a sampler can wait for its disk instead of dropping notes.
 - The CLAP host passed a block larger than the plugin was activated for on to the plugin, and for an effect indexed past its own input buffers (a panic on the audio thread). Such a block is now refused and silenced, as the VST3 host does. The engine never sends one; the CLAP fixture found it.
 
 #### Verified

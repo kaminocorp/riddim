@@ -49,6 +49,8 @@ pub mod ids {
     pub const CLAP_DELAY_ID: &str = "dev.riddim.test.clap-delay";
     /// Their gain parameters: a plain range of 0 to [`CLAP_GAIN_MAX`], 1 by default.
     pub const CLAP_SYNTH_GAIN: u32 = 100;
+    /// The CLAP synth's read-only parameter: 1 once it has been told a render is offline.
+    pub const CLAP_SYNTH_OFFLINE: u32 = 101;
     pub const CLAP_DELAY_GAIN: u32 = 7;
     pub const CLAP_GAIN_MAX: f64 = 2.0;
     /// How many samples the CLAP delay delays by, and reports.
