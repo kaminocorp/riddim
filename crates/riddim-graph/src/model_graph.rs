@@ -38,6 +38,10 @@ pub enum NodeKind {
     Strip(TrackId),
     /// The gain stage of a send, between its tap on the track and the bus it feeds.
     Send(TrackId, SendId),
+    /// The switch on a track's way to its output. Only tracks with post-fader sends have one:
+    /// those sends tap the strip itself, so this is what lets a solo elsewhere close the
+    /// track's own output while a send from it stays open (soloing an effect return).
+    MainOut(TrackId),
     Metronome,
     /// The device output.
     Output,
@@ -183,7 +187,12 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
             sends.push((node, send.target));
         }
         let output = (track.kind != TrackKind::Master).then_some(track.output);
-        strips.push((track.id, strip, output));
+        let mut last = strip;
+        if output.is_some() && track.sends.iter().any(|send| !send.pre_fader) {
+            last = graph.add(NodeKind::MainOut(track.id), stereo_through());
+            graph.connect(strip, last, 0);
+        }
+        strips.push((track.id, last, output));
     }
 
     // Pass 2: routing between tracks, and the way out.
@@ -488,7 +497,14 @@ mod tests {
                 .unwrap()
                 .delay
         };
-        assert_eq!(delay_from(NodeKind::Strip(TrackId(1))), 100);
+        // The track has a post-fader send, so its own output goes through a switch that solo
+        // can close without silencing the send. The bus has no sends and needs none.
+        assert!(has_edge(
+            NodeKind::Strip(TrackId(1)),
+            NodeKind::MainOut(TrackId(1))
+        ));
+        assert!(graph.index_of(NodeKind::MainOut(TrackId(3))).is_none());
+        assert_eq!(delay_from(NodeKind::MainOut(TrackId(1))), 100);
         assert_eq!(delay_from(NodeKind::Strip(TrackId(3))), 0);
         assert_eq!(plan.max_latency, 100);
     }

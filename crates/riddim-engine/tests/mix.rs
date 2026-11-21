@@ -12,8 +12,8 @@ use riddim_engine::{
 };
 use riddim_model::time::{Position, Ticks};
 use riddim_model::{
-    AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, CurveShape, LaneId, Model,
-    Op, Send, SendId, SlotId, TrackChange, TrackId, TrackKind, TrackOutput,
+    AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, CurveShape, LaneId,
+    LoopRange, Model, Op, Send, SendId, SlotId, TrackChange, TrackId, TrackKind, TrackOutput,
 };
 use riddim_rt::guard::RtCheckAllocator;
 use riddim_test_support::ids;
@@ -179,6 +179,115 @@ fn sends_add_a_second_path_before_or_after_the_fader() {
     close(
         level(&mut engine, vec![set(20, TrackChange::Gain(0.25))]),
         0.3,
+    );
+    assert_eq!(engine.status().rt_violations, 0);
+}
+
+#[test]
+fn solo_follows_the_signal_through_sends() {
+    // A track at 0.5 with a post-fader send (x0.5) to an effect return, a second track at
+    // 0.125 with a pre-fader send (x0.5) to the same return, and a third at 0.03125 that sends
+    // nowhere. Powers of two, so every sum below is exact.
+    let dir = temp_dir("solo-sends");
+    let mut engine = engine(&dir);
+    let dc = |id: u64, level: f32| media(&dir, id, RATE, vec![vec![level; 20_000]]);
+    let clip = |track: u64, id: u64| Op::AddClip {
+        track: TrackId(track),
+        clip: audio_clip(id + 100, id, 0, 20_000),
+    };
+    let add_send = |track: u64, id: u64, pre_fader: bool| Op::AddSend {
+        track: TrackId(track),
+        index: 0,
+        send: send(id, 40, 0.5, pre_fader),
+    };
+    engine
+        .apply_wait(vec![
+            dc(1, 0.5),
+            dc(2, 0.125),
+            dc(3, 0.03125),
+            add_track(0, 10, TrackKind::Audio),
+            add_track(1, 20, TrackKind::Audio),
+            add_track(2, 30, TrackKind::Audio),
+            add_track(3, 40, TrackKind::Bus),
+            clip(10, 1),
+            clip(20, 2),
+            clip(30, 3),
+            add_send(10, 50, false),
+            add_send(20, 51, true),
+        ])
+        .unwrap();
+    engine.sync();
+    let level = |engine: &mut Engine, ops: Vec<Op>| {
+        engine.apply_wait(ops).unwrap();
+        engine.sync();
+        let out = play_from_start(engine, 4096);
+        assert_eq!(out[0][2000], out[1][2000]);
+        out[0][2000]
+    };
+    let (dry, wet) = (0.5 + 0.125 + 0.03125, 0.25 + 0.0625);
+    assert_eq!(level(&mut engine, vec![]), dry + wet);
+
+    // Solo the return: the effect alone. The tracks that feed it are not heard dry, although
+    // one of them has to keep its fader running for its post-fader send.
+    assert_eq!(
+        level(&mut engine, vec![set(40, TrackChange::Solo(true))]),
+        wet
+    );
+
+    // Solo a track: itself and its share of the return, and nothing of the others.
+    assert_eq!(
+        level(
+            &mut engine,
+            vec![
+                set(40, TrackChange::Solo(false)),
+                set(10, TrackChange::Solo(true))
+            ]
+        ),
+        0.5 + 0.25
+    );
+    assert_eq!(
+        level(
+            &mut engine,
+            vec![
+                set(10, TrackChange::Solo(false)),
+                set(20, TrackChange::Solo(true))
+            ]
+        ),
+        0.125 + 0.0625
+    );
+    // A track with no sends, soloed: the return has nothing to say.
+    assert_eq!(
+        level(
+            &mut engine,
+            vec![
+                set(20, TrackChange::Solo(false)),
+                set(30, TrackChange::Solo(true))
+            ]
+        ),
+        0.03125
+    );
+    // Mute still wins over solo, and a muted track's post-fader send goes with it.
+    assert_eq!(
+        level(
+            &mut engine,
+            vec![
+                set(30, TrackChange::Solo(false)),
+                set(10, TrackChange::Solo(true)),
+                set(10, TrackChange::Mute(true))
+            ]
+        ),
+        0.0
+    );
+    // Back to no solo: everything again.
+    assert_eq!(
+        level(
+            &mut engine,
+            vec![
+                set(10, TrackChange::Solo(false)),
+                set(10, TrackChange::Mute(false))
+            ]
+        ),
+        dry + wet
     );
     assert_eq!(engine.status().rt_violations, 0);
 }
@@ -523,11 +632,9 @@ fn touching_a_fader_writes_its_moves_into_the_lane() {
             .unwrap()
     };
     assert_eq!(at((1, 1)), 1.0, "before the pass the old curve stands");
-    assert!(
-        (at((5, 2)) - 0.5).abs() < 0.26,
-        "first move, got {}",
-        at((5, 2))
-    );
+    // Held at 0.5 for half a second, then moved: a flat line and a step, not a slide.
+    assert_eq!(at((5, 2)), 0.5, "first move");
+    assert_eq!(at((11, 4)), 0.5, "first move, held until the second");
     assert!(
         (at((7, 2)) - 0.25).abs() < 1e-6,
         "second move, got {}",
@@ -721,6 +828,107 @@ fn demo_project(dir: &std::path::Path) -> Model {
 }
 
 #[test]
+fn an_automation_pass_does_not_span_a_loop_wrap() {
+    // A write-mode lane over a two-beat loop (one second). The fader is moved once on each
+    // time round; each round is its own pass, and the last one played is what the lane holds.
+    let dir = temp_dir("loopwrite");
+    let mut engine = engine(&dir);
+    let events = engine.subscribe();
+    engine
+        .apply_wait(vec![
+            media(&dir, 1, RATE, vec![vec![1.0; 200_000]]),
+            add_track(0, 10, TrackKind::Audio),
+            Op::AddClip {
+                track: TrackId(10),
+                clip: audio_clip(11, 1, 0, 200_000),
+            },
+            Op::AddLane {
+                track: TrackId(10),
+                lane: lane(
+                    50,
+                    AutomationTarget::TrackGain,
+                    AutomationMode::Write,
+                    vec![
+                        point((0, 1), 1.0, CurveShape::Linear),
+                        point((8, 1), 1.0, CurveShape::Linear),
+                    ],
+                ),
+            },
+            Op::SetLoop {
+                range: Some(LoopRange {
+                    start: Position::START,
+                    end: Position::Beats(Ticks::from_beats(2)),
+                }),
+                enabled: true,
+            },
+        ])
+        .unwrap();
+    engine.transport(TransportCommand::Locate(Position::START));
+    engine.transport(TransportCommand::Play);
+    engine.sync();
+    engine.run(1024);
+    engine.sync();
+
+    let passes = |events: &std::sync::mpsc::Receiver<Event>| {
+        let mut count = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(&event, Event::ModelChanged { ops, .. } if matches!(ops[0], Op::ReplaceLane { .. }))
+            {
+                count += 1;
+            }
+        }
+        count
+    };
+    // First time round: down to 0.5 at half a second.
+    engine.run(24_000 - 1024);
+    engine
+        .apply_wait(vec![set(10, TrackChange::Gain(0.5))])
+        .unwrap();
+    engine.run(24_000 + 2048); // ... and over the wrap
+    engine.sync();
+    assert_eq!(passes(&events), 1, "the wrap ends the first pass");
+    // Second time round: down to 0.25 at half a second, then stop before the loop ends.
+    engine.run(24_000 - 2048);
+    engine
+        .apply_wait(vec![set(10, TrackChange::Gain(0.25))])
+        .unwrap();
+    engine.run(12_000);
+    engine.transport(TransportCommand::Stop);
+    engine.sync();
+    engine.run(256);
+    engine.sync();
+    assert_eq!(passes(&events), 1, "stopping ends the second");
+
+    let model = engine.model();
+    let written = model
+        .track(TrackId(10))
+        .unwrap()
+        .lane(LaneId(50))
+        .unwrap()
+        .clone();
+    let at = |beats: (i64, i64)| {
+        written
+            .value_at(Ticks::from_beat_fraction(beats.0, beats.1))
+            .unwrap()
+    };
+    // Time only ever goes forwards in a lane.
+    assert!(
+        written.points.windows(2).all(|w| w[0].at < w[1].at),
+        "{:?}",
+        written.points
+    );
+    // The second round: 0.5 (where the fader was left) from the loop start, 0.25 from half a
+    // second on, as far as it was played (three quarters of a second: beat 1.5).
+    assert_eq!(at((1, 2)), 0.5);
+    assert_eq!(at((5, 4)), 0.25);
+    // Past where the second round stopped, the first round's pass still stands (0.5 to the
+    // loop end), and past the loop the lane is untouched.
+    assert_eq!(at((7, 4)), 0.5);
+    assert_eq!(at((4, 1)), 1.0);
+    assert_eq!(engine.status().rt_violations, 0);
+}
+
+#[test]
 fn two_bounces_of_the_same_project_are_bit_identical() {
     // Phase 3 exit criterion 3.
     let dir = temp_dir("bounce");
@@ -852,6 +1060,11 @@ fn a_slow_loading_plugin_does_not_stall_the_audio() {
         index: 0,
         slot: fixture_slot(12, ids::SLOW_UID),
     }]);
+    // The engine keeps taking edits while the plugin loads: a fader move goes through at once.
+    engine
+        .apply_wait(vec![set(10, TrackChange::Gain(0.5))])
+        .unwrap();
+    let edit_took = started.elapsed();
     let mut samples = vec![(started.elapsed(), engine.status().blocks)];
     let mut loaded_after = None;
     while loaded_after.is_none() && started.elapsed() < std::time::Duration::from_secs(10) {
@@ -870,6 +1083,10 @@ fn a_slow_loading_plugin_does_not_stall_the_audio() {
         }
     }
     let loaded_after = loaded_after.expect("the slow plugin never loaded");
+    assert!(
+        edit_took < std::time::Duration::from_millis(ids::SLOW_LOAD_MS / 2),
+        "an edit made during the load took {edit_took:?}: it waited for the plugin"
+    );
     assert!(
         loaded_after >= std::time::Duration::from_millis(ids::SLOW_LOAD_MS - 50),
         "the plugin loaded in {loaded_after:?}; it is supposed to be slow"

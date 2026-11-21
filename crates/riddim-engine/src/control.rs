@@ -214,6 +214,8 @@ pub(crate) struct Control {
     recording: Option<RecordingSession>,
     /// Automation being written right now.
     writes: Vec<Writing>,
+    /// Stands in for the playhead while a jump is being accounted for (see `playhead_jumped`).
+    write_clock: Option<Ticks>,
     take_counter: u32,
     pending_save: Option<PendingSave>,
     pending_syncs: Vec<Sender<()>>,
@@ -221,63 +223,111 @@ pub(crate) struct Control {
     last_report: Instant,
 }
 
-/// Which tracks are heard, given mutes and solos.
+/// What mutes and solos leave to be heard.
+#[derive(Default)]
+struct Audibility {
+    /// Tracks whose strip is silenced.
+    muted_strips: HashSet<TrackId>,
+    /// Tracks whose own output is closed while a post-fader send from them stays open.
+    closed_outputs: HashSet<TrackId>,
+    /// Sends closed by a solo elsewhere.
+    closed_sends: HashSet<(TrackId, riddim_model::SendId)>,
+}
+
+/// Works out what is heard, given mutes and solos.
 ///
-/// With no solo anywhere, everything unmuted is heard. With a solo, a track is heard if it is
-/// soloed, if it feeds a soloed bus (by its output or a send), or if it is a bus that a soloed
-/// track plays through.
-fn audible_tracks(model: &Model) -> HashSet<TrackId> {
-    let any_solo = model.tracks.iter().any(|t| t.solo);
-    // Every bus a track's signal reaches, through its output and its sends, however far.
-    let downstream = |track: &Track| -> Vec<TrackId> {
-        let mut reached = Vec::new();
-        let mut pending: Vec<TrackId> = Vec::new();
-        let targets = |t: &Track, into: &mut Vec<TrackId>| {
-            if let TrackOutput::Bus(bus) = t.output {
-                into.push(bus);
-            }
-            into.extend(t.sends.iter().filter(|s| !s.mute).map(|s| s.target));
+/// With no solo anywhere, everything unmuted is heard. With one, solo follows the signal: a
+/// path from a track to the master is heard if it passes through a soloed track. So soloing a
+/// track keeps the buses it plays through and the returns it sends to; soloing a bus keeps
+/// what feeds it, but only on the way into that bus (soloing an effect return gives the
+/// effect alone, not the dry tracks that send to it).
+///
+/// This is decided per connection: one from `T` into `X` is open if `T` carries soloed signal
+/// (it is soloed, or something soloed plays into it) or `X` leads to a soloed track. One case
+/// is approximate: a bus that both carries a soloed track's signal and feeds a soloed bus
+/// lets its other, unsoloed inputs through to its other destinations as well.
+fn audibility(model: &Model) -> Audibility {
+    let mut result = Audibility::default();
+    result
+        .muted_strips
+        .extend(model.tracks.iter().filter(|t| t.mute).map(|t| t.id));
+    if model.master.mute {
+        result.muted_strips.insert(TrackId::MASTER);
+    }
+    if !model.tracks.iter().any(|t| t.solo) {
+        return result;
+    }
+
+    // Where a track's signal goes next: its output, then its (unmuted) sends.
+    let targets = |track: &Track| -> Vec<TrackId> {
+        let main = match track.output {
+            TrackOutput::Bus(bus) => bus,
+            TrackOutput::Master => TrackId::MASTER,
         };
-        targets(track, &mut pending);
-        while let Some(bus) = pending.pop() {
-            if reached.contains(&bus) {
-                continue;
-            }
-            reached.push(bus);
-            if let Some(next) = model.track(bus) {
-                targets(next, &mut pending);
-            }
-        }
-        reached
+        std::iter::once(main)
+            .chain(track.sends.iter().filter(|s| !s.mute).map(|s| s.target))
+            .collect()
     };
-    let mut solo_path: HashSet<TrackId> = HashSet::new();
-    if any_solo {
-        for track in model.tracks.iter().filter(|t| t.solo) {
-            solo_path.insert(track.id);
-            solo_path.extend(downstream(track));
-        }
-        // Tracks that feed a soloed bus are part of what "solo that bus" means.
-        for track in &model.tracks {
-            let chain = downstream(track);
-            if chain
-                .iter()
-                .any(|bus| model.track(*bus).is_some_and(|b| b.solo))
-            {
-                solo_path.insert(track.id);
-                solo_path.extend(chain);
+    // Tracks carrying soloed signal: the soloed ones and everything downstream of them.
+    let mut carries: HashSet<TrackId> = HashSet::new();
+    let mut pending: Vec<TrackId> = model
+        .tracks
+        .iter()
+        .filter(|t| t.solo)
+        .map(|t| t.id)
+        .collect();
+    while let Some(id) = pending.pop() {
+        if carries.insert(id) {
+            if let Some(track) = model.track(id) {
+                pending.extend(targets(track));
             }
         }
     }
-    let mut audible = HashSet::new();
-    for track in &model.tracks {
-        if !track.mute && (!any_solo || solo_path.contains(&track.id)) {
-            audible.insert(track.id);
+    // Tracks leading to a soloed one: the soloed ones and everything upstream of them. The
+    // routing has no cycles, so repeating until nothing changes ends after at most one pass
+    // per track.
+    let mut leads: HashSet<TrackId> = model
+        .tracks
+        .iter()
+        .filter(|t| t.solo)
+        .map(|t| t.id)
+        .collect();
+    loop {
+        let before = leads.len();
+        for track in &model.tracks {
+            if targets(track).iter().any(|target| leads.contains(target)) {
+                leads.insert(track.id);
+            }
+        }
+        if leads.len() == before {
+            break;
         }
     }
-    if !model.master.mute {
-        audible.insert(TrackId::MASTER);
+
+    for track in &model.tracks {
+        let open = |target: TrackId| carries.contains(&track.id) || leads.contains(&target);
+        let main_open = open(match track.output {
+            TrackOutput::Bus(bus) => bus,
+            TrackOutput::Master => TrackId::MASTER,
+        });
+        let mut post_fader_open = false;
+        for send in track.sends.iter().filter(|s| !s.mute) {
+            if !open(send.target) {
+                result.closed_sends.insert((track.id, send.id));
+            } else if !send.pre_fader {
+                post_fader_open = true;
+            }
+        }
+        if !main_open {
+            if post_fader_open {
+                // The strip has to keep running for the send; shut the output after it.
+                result.closed_outputs.insert(track.id);
+            } else {
+                result.muted_strips.insert(track.id);
+            }
+        }
     }
-    audible
+    result
 }
 
 impl Control {
@@ -318,6 +368,7 @@ impl Control {
             take_counter: 0,
             pending_save: None,
             pending_syncs: Vec::new(),
+            write_clock: None,
             last_state: TransportState::Stopped,
             last_report: Instant::now(),
             stream: setup.stream,
@@ -864,7 +915,7 @@ impl Control {
                 primed: false,
                 meter: self.meters.entry(track).or_default().clone(),
             }),
-            NodeKind::Send(..) => NodeRt::Gain(GainRt {
+            NodeKind::Send(..) | NodeKind::MainOut(..) => NodeRt::Gain(GainRt {
                 gain: StereoGain::new(self.rate / 200),
                 primed: false,
             }),
@@ -895,7 +946,7 @@ impl Control {
                 return;
             }
         };
-        let audible = audible_tracks(&self.model);
+        let heard = audibility(&self.model);
         let model = self.model.clone();
 
         let mut steps = Vec::with_capacity(plan.steps.len());
@@ -964,7 +1015,7 @@ impl Control {
                     StepParams::Strip {
                         gain: strip.map_or(1.0, |t| t.gain),
                         pan: strip.map_or(0.0, |t| t.pan),
-                        mute: !audible.contains(&track),
+                        mute: heard.muted_strips.contains(&track),
                         invert: strip.is_some_and(|t| t.invert),
                         gain_curve: curve_for(AutomationTarget::TrackGain),
                         pan_curve: curve_for(AutomationTarget::TrackPan),
@@ -975,12 +1026,18 @@ impl Control {
                     let settings = owner.and_then(|t| t.send(send));
                     StepParams::Send {
                         gain: settings.map_or(0.0, |s| s.gain),
-                        mute: settings.is_none_or(|s| s.mute),
+                        mute: settings.is_none_or(|s| s.mute)
+                            || heard.closed_sends.contains(&(track, send)),
                         curve: owner
                             .and_then(|t| t.lane_for(AutomationTarget::SendGain { send }))
                             .and_then(|lane| self.curve(track, lane)),
                     }
                 }
+                NodeKind::MainOut(track) => StepParams::Send {
+                    gain: 1.0,
+                    mute: heard.closed_outputs.contains(&track),
+                    curve: None,
+                },
                 NodeKind::Metronome => StepParams::Metronome {
                     enabled: model.metronome.enabled,
                     gain: model.metronome.gain,
@@ -1145,6 +1202,9 @@ impl Control {
     // -----------------------------------------------------------------------------------------
 
     fn now_ticks(&self) -> Ticks {
+        if let Some(at) = self.write_clock {
+            return at;
+        }
         self.map
             .samples_to_ticks(self.shared.position.load(Ordering::Acquire), self.rate)
     }
@@ -1213,6 +1273,8 @@ impl Control {
     /// A control produced a value: record it if its lane is being written, and start writing
     /// if the lane latches on the first movement.
     fn automation_value(&mut self, track: TrackId, target: AutomationTarget, value: f32) {
+        // Hear about any jump of the playhead first, so this value lands in the right pass.
+        self.poll_audio();
         if !self.shared.playing.load(Ordering::Acquire) {
             return;
         }
@@ -1233,11 +1295,27 @@ impl Control {
         }
         let now = self.now_ticks();
         let (low, high) = target.range();
+        let value = value.clamp(low, high);
+        // A control that sat still and then moved was heard as a flat line and then the move,
+        // not as a slow slide between the two: past this gap, hold the old value up to the
+        // new one. Closer together, values are the samples of one gesture and are joined.
+        let gesture_gap = self.rate as i64 / 10;
+        let (map, rate) = (self.map.clone(), self.rate);
         if let Some(write) = self
             .writes
             .iter_mut()
             .find(|w| w.track == track && w.target == target)
         {
+            if let Some(last) = write.points.last().copied() {
+                let apart = map.ticks_to_samples(now, rate) - map.ticks_to_samples(last.at, rate);
+                if apart > gesture_gap && last.value != value && now.0 - 1 > last.at.0 {
+                    write.points.push(riddim_model::AutomationPoint {
+                        at: Ticks(now.0 - 1),
+                        value: last.value,
+                        shape: CurveShape::Linear,
+                    });
+                }
+            }
             // Points must move forwards in time; values arriving within one tick stack up.
             let at = match write.points.last() {
                 Some(last) if now <= last.at => Ticks(last.at.0 + 1),
@@ -1245,7 +1323,7 @@ impl Control {
             };
             write.points.push(riddim_model::AutomationPoint {
                 at,
-                value: value.clamp(low, high),
+                value,
                 shape: CurveShape::Linear,
             });
         }
@@ -1336,6 +1414,27 @@ impl Control {
             ..(*old).clone()
         };
         self.apply_internal(vec![Op::ReplaceLane { track, lane }]);
+    }
+
+    /// The playhead jumped while rolling (a loop wrapped, or a locate). Automation passes do
+    /// not span a jump: what was being written ends where the playhead left, and the same
+    /// lanes carry on as new passes from where it landed.
+    fn playhead_jumped(&mut self, from: i64, to: i64) {
+        let open: Vec<(TrackId, riddim_model::LaneId)> =
+            self.writes.iter().map(|w| (w.track, w.lane)).collect();
+        if open.is_empty() {
+            return;
+        }
+        self.write_clock = Some(self.map.samples_to_ticks(from, self.rate));
+        self.finish_all_writes();
+        self.write_clock = Some(self.map.samples_to_ticks(to, self.rate));
+        for (track, lane) in open {
+            let lane = self.model.track(track).and_then(|t| t.lane(lane)).cloned();
+            if let Some(lane) = lane {
+                self.begin_write(track, &lane);
+            }
+        }
+        self.write_clock = None;
     }
 
     /// The transport started: lanes in write mode record from here.
@@ -1737,6 +1836,7 @@ impl Control {
                         .send(HostRequest::NotifyParam { slot, id, value });
                     self.emit(Event::PluginParam { slot, id, value });
                 }
+                FromAudio::Jumped { from, to } => self.playhead_jumped(from, to),
             }
         }
     }

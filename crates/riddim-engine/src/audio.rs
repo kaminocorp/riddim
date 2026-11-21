@@ -89,6 +89,12 @@ pub(crate) enum FromAudio {
         id: u32,
         value: f64,
     },
+    /// While playing, the playhead left `from` and carried on at `to`: a loop wrapped or the
+    /// transport was located.
+    Jumped {
+        from: i64,
+        to: i64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,6 +214,12 @@ impl AudioEngine {
                     }
                 }
                 ToAudio::Locate(position) => {
+                    if self.rolling == Rolling::Playing {
+                        self.reply(FromAudio::Jumped {
+                            from: self.position,
+                            to: position,
+                        });
+                    }
                     self.position = position;
                     self.discontinuity = true;
                 }
@@ -511,6 +523,10 @@ impl AudioCallback for AudioEngine {
                 done += frames;
             }
             if let Some(start) = wrap_to {
+                self.reply(FromAudio::Jumped {
+                    from: self.position,
+                    to: start,
+                });
                 self.position = start;
                 self.discontinuity = true;
             }
