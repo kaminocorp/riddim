@@ -909,3 +909,73 @@ fn a_reference_session_is_one_command() {
     assert_eq!(lonely.status.code(), Some(2));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_clap_plugin_is_checked_played_and_rendered_like_any_other() {
+    let dir = temp_dir("clap");
+    let project = dir.join("clap.json");
+    let project_arg = project.to_str().unwrap();
+    let ok = |output: Output| {
+        assert!(
+            output.status.success(),
+            "{}{}",
+            stdout(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout(&output)
+    };
+    let bundle = riddim_test_support::clapplug_bundle();
+    let synth = format!("{}#Riddim CLAP Synth", bundle.display());
+    let delay = format!("{}#Riddim CLAP Delay", bundle.display());
+
+    // The conformance run, on a `.clap` named by its path.
+    let checked = ok(riddim(&["check", &synth]));
+    assert!(checked.contains("=> passed"), "{checked}");
+
+    ok(riddim(&[
+        "session",
+        "new",
+        project_arg,
+        "--instrument",
+        &synth,
+        "--sequence",
+        "--insert",
+        &delay,
+    ]));
+    let info = ok(riddim(&["session", "info", project_arg]));
+    assert!(info.contains("(clap:dev.riddim.test.clap-synth"), "{info}");
+    assert!(info.contains("(clap:dev.riddim.test.clap-delay"), "{info}");
+
+    // It renders, the same bytes each time, and it plays on a device.
+    let render = |name: &str| {
+        let out = dir.join(name);
+        let text = ok(riddim(&[
+            "session",
+            "render",
+            project_arg,
+            "--out",
+            out.to_str().unwrap(),
+            "--seconds",
+            "2",
+        ]));
+        assert!(text.contains("rendered 2.00 s"), "{text}");
+        std::fs::read(out).unwrap()
+    };
+    let first = render("one.wav");
+    assert!(first == render("two.wav"), "two renders differ");
+    assert!(
+        first[44..].iter().any(|&byte| byte != 0),
+        "the render is silent"
+    );
+    let text = ok(riddim(&[
+        "session",
+        "play",
+        project_arg,
+        "--null-device",
+        "--seconds",
+        "1",
+    ]));
+    assert_eq!(text.matches("plugin loaded").count(), 2, "{text}");
+    assert!(text.contains("audio-thread heap operations 0"), "{text}");
+    std::fs::remove_dir_all(&dir).ok();
+}

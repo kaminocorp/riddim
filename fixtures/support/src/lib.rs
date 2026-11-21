@@ -43,6 +43,18 @@ pub mod ids {
     pub const COMMAND_ABORT: f64 = 6.0 / 8.0;
     /// Make every later `process` call hang.
     pub const COMMAND_HANG: f64 = 7.0 / 8.0;
+
+    /// The CLAP fixture plugins (`fixtures/clapplug`).
+    pub const CLAP_SYNTH_ID: &str = "dev.riddim.test.clap-synth";
+    pub const CLAP_DELAY_ID: &str = "dev.riddim.test.clap-delay";
+    /// Their gain parameters: a plain range of 0 to [`CLAP_GAIN_MAX`], 1 by default.
+    pub const CLAP_SYNTH_GAIN: u32 = 100;
+    pub const CLAP_DELAY_GAIN: u32 = 7;
+    pub const CLAP_GAIN_MAX: f64 = 2.0;
+    /// How many samples the CLAP delay delays by, and reports.
+    pub const CLAP_DELAY_LATENCY: u32 = 32;
+    /// A held key of the CLAP synth sounds at this amplitude times its velocity.
+    pub const CLAP_SYNTH_AMPLITUDE: f64 = 0.25;
 }
 
 fn workspace_root() -> PathBuf {
@@ -67,6 +79,8 @@ fn fixture_libraries() -> &'static Vec<(String, PathBuf)> {
             "riddim-testplug",
             "-p",
             "riddim-crashplug",
+            "-p",
+            "riddim-clapplug",
             "-p",
             "riddim-plugin",
             "--bin",
@@ -125,8 +139,8 @@ fn fixture_libraries() -> &'static Vec<(String, PathBuf)> {
     })
 }
 
-/// Wraps a built fixture library in a `.vst3` bundle and returns the bundle path.
-fn vst3_bundle(krate: &str, bundle_name: &str) -> PathBuf {
+/// The dynamic library cargo built for a fixture crate.
+fn fixture_library(krate: &str) -> PathBuf {
     let wanted = krate.replace('-', "_");
     let library = fixture_libraries()
         .iter()
@@ -138,6 +152,53 @@ fn vst3_bundle(krate: &str, bundle_name: &str) -> PathBuf {
         "fixture library missing: {}",
         library.display()
     );
+    library
+}
+
+/// The `Info.plist` of a macOS plugin bundle whose executable is `bundle_name`.
+fn bundle_plist(bundle_name: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\"><dict>\n\
+         <key>CFBundleExecutable</key><string>{bundle_name}</string>\n\
+         <key>CFBundleIdentifier</key><string>dev.riddim.test.{bundle_name}</string>\n\
+         <key>CFBundleName</key><string>{bundle_name}</string>\n\
+         <key>CFBundlePackageType</key><string>BNDL</string>\n\
+         <key>CFBundleVersion</key><string>1.0.0</string>\n\
+         </dict></plist>\n"
+    )
+}
+
+/// Makes a `.clap` of a built fixture library and returns its path: a bundle on macOS, the
+/// library itself under that name everywhere else.
+fn clap_bundle(krate: &str, bundle_name: &str) -> PathBuf {
+    let library = fixture_library(krate);
+    let bytes = std::fs::read(&library).unwrap();
+    let directory = library
+        .parent()
+        .expect("library directory")
+        .join("test-bundles");
+    let bundle = directory.join(format!("{bundle_name}.clap"));
+    if cfg!(target_os = "macos") {
+        let contents = bundle.join("Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        write_if_changed(
+            &contents.join("Info.plist"),
+            bundle_plist(bundle_name).as_bytes(),
+        );
+        write_if_changed(&contents.join("MacOS").join(bundle_name), &bytes);
+    } else {
+        std::fs::create_dir_all(&directory).unwrap();
+        write_if_changed(&bundle, &bytes);
+    }
+    bundle
+}
+
+/// Wraps a built fixture library in a `.vst3` bundle and returns the bundle path.
+fn vst3_bundle(krate: &str, bundle_name: &str) -> PathBuf {
+    let library = fixture_library(krate);
 
     let bundle = library
         .parent()
@@ -146,18 +207,7 @@ fn vst3_bundle(krate: &str, bundle_name: &str) -> PathBuf {
         .join(format!("{bundle_name}.vst3"));
     let contents = bundle.join("Contents");
     let binary = if cfg!(target_os = "macos") {
-        let plist = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
-             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-             <plist version=\"1.0\"><dict>\n\
-             <key>CFBundleExecutable</key><string>{bundle_name}</string>\n\
-             <key>CFBundleIdentifier</key><string>dev.riddim.test.{bundle_name}</string>\n\
-             <key>CFBundleName</key><string>{bundle_name}</string>\n\
-             <key>CFBundlePackageType</key><string>BNDL</string>\n\
-             <key>CFBundleVersion</key><string>1.0.0</string>\n\
-             </dict></plist>\n"
-        );
+        let plist = bundle_plist(bundle_name);
         std::fs::create_dir_all(contents.join("MacOS")).unwrap();
         write_if_changed(&contents.join("Info.plist"), plist.as_bytes());
         contents.join("MacOS").join(bundle_name)
@@ -259,6 +309,14 @@ pub fn testplug_bundle() -> PathBuf {
     static BUNDLE: OnceLock<PathBuf> = OnceLock::new();
     BUNDLE
         .get_or_init(|| vst3_bundle("riddim-testplug", "RiddimTest"))
+        .clone()
+}
+
+/// The `.clap` holding the CLAP test synth and delay.
+pub fn clapplug_bundle() -> PathBuf {
+    static BUNDLE: OnceLock<PathBuf> = OnceLock::new();
+    BUNDLE
+        .get_or_init(|| clap_bundle("riddim-clapplug", "RiddimTestClap"))
         .clone()
 }
 

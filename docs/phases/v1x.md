@@ -12,6 +12,7 @@ GitHub Actions could still not start jobs on this repository when this was writt
 |---|---|---|
 | CLAP host | `crates/riddim-plugin/src/format/clap.rs` | Run on Linux against Surge XT 1.3.4 (CLAP). Editor **never opened**. macOS **never run** |
 | CLAP scanning and resolution | `riddim-plugin` (`scan`), `riddim-cli` | Run on Linux |
+| CLAP fixture plugins: a synth and a delay with latency, on the C ABI directly (D74) | `fixtures/clapplug` | Loaded by every test run on Linux. macOS **never run** (the `.clap` there is a bundle) |
 | Bridge: child process, shared memory, control protocol | `crates/riddim-plugin/src/bridge.rs`, `src/bin/riddim-bridge.rs` | Tested on Linux. macOS **never run** |
 | Bridged slots in the model and the engine; crash handling | `riddim-model`, `riddim-engine` | Tested on Linux |
 | `riddim-render` | `crates/riddim/src/bin/riddim-render.rs` | Tested on Linux |
@@ -29,6 +30,8 @@ The headless renderer and the stability promise have no exit criteria in the vis
 
 ## What the tests actually establish
 
+- **The CLAP host and a plugin written against the bare C ABI agree** (the fixtures share no code with the host): notes and parameter changes land on their sample, a parameter's plain range is mapped to 0 to 1 and back, state survives save, restore and save bit for bit and another plugin's state is refused, latency is read when CLAP allows it, a block larger than promised never reaches the plugin, and nothing on the host's side of `process` touches the heap.
+- **In the engine a CLAP plugin's latency is compensated to the sample**: two tracks of the CLAP synth, one through the CLAP delay with its polarity flipped, cancel to exactly zero. Its state is saved with the project and restored; a bounce through CLAP plugins is the same bytes each time and with render threads; and the same project with its CLAP plugins bridged plays the same samples.
 - **A CLAP plugin is a plugin like any other to the engine.** The demo song (an instrument, an effect return fed by a send, fader automation, a second output and both sidechains routed) plays, saves, reopens and bounces through Surge XT's CLAP builds exactly as through its VST3 builds.
 - **A bridged plugin is indistinguishable from the same plugin in process**, apart from where it runs: the same buses, parameters, parameter text, state bytes, events and audio, bit for bit; an effect's latency and a change to it cross the bridge; a project renders and bounces to the same bytes with its plugins bridged, in process, or mixed, and the saved project differs only in the `bridged` flags.
 - **A bridged plugin that dies costs only itself.** See the exit criteria.
@@ -57,11 +60,12 @@ Run on the Linux build machine (x86-64, 16 cores, Rust 1.100.0) with `scripts/ci
 - **Surge XT's CLAP build returns an error from `process` unless its first output port has one or two channels.** That is what a port-splitting helper of mine was handing it: zero channels per port, because a slice's length was read after the slice had been moved out. The conformance run failed on the first block, which is what it is for.
 - **Mutual recursion on the control thread.** Writing automation from parameter changes reported by the audio thread called back into the function that drains the audio thread's messages; with a plugin that reports a parameter every block, the stack ran out. Found by an existing CLI test within a minute of the change.
 - **RealtimeSanitizer caught the CLAP host calling the plugin unguarded.** The VST3 and Audio Unit hosts exempt the plugin's own `process` from the real-time checks (its allocations are its own affair); the CLAP host did not, and Surge XT allocates in `process`. The first full sanitizer run with a CLAP plugin stopped on it.
+- **The CLAP fixture found a contract breach in the CLAP host on its first run.** A block larger than the plugin was activated for was handed to the plugin, and for an effect the host indexed past its own input buffers first: a panic on the audio thread. The engine never sends such a block (it splits them), so this could not be heard; the VST3 host already refused them. Fixed, with a test for an instrument and for an effect.
+- **The scan cache could blocklist a healthy plugin** (D75), a phase 3 bug. Two processes sharing the cache file: one reads it while the other is mid-probe, and later writes its stale copy of the "being probed" mark over the other's result. Found because the new CLAP test in the CLI suite runs its commands alongside fourteen other tests' processes on one cache file; it failed about one run in two until this was fixed.
 - **Environment variables are a poor way to configure a test.** The bridge executable was first found through `RIDDIM_BRIDGE` alone, and tests running in parallel set it under each other. It is now a field of the engine configuration, with the variable as a fallback.
 
 ## Known gaps
 
-- **No CLAP fixture plugin** (D68): without `RIDDIM_TEST_CLAP` the test run never loads a CLAP plugin. CI therefore only compiles the CLAP host.
 - **CLAP `stop_processing` is called off the audio thread** (D68).
 - **CLAP extensions not used**: tail, render (offline mode is not announced to CLAP plugins), thread-check, voice-info, note names, presets, timers and file descriptors (which some Linux plugin editors need).
 - **A bridged plugin has no editor** (D69). On macOS this needs a window owned by the child.

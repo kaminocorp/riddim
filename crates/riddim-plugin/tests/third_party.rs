@@ -2,8 +2,9 @@
 //!
 //! Set `RIDDIM_TEST_VST3` to one or more `.vst3` bundle paths (separated by `;`), and
 //! `RIDDIM_TEST_CLAP` to `.clap` files likewise, to run them.
-//! CI points it at Surge XT; on a developer machine it can point at anything installed. Without
-//! the variable the tests pass vacuously and say so.
+//! `scripts/ci.sh` passes whatever the variables hold on to these tests (Surge XT on the build
+//! machine); CI itself sets neither. Without them the tests pass vacuously and say so: the
+//! plugins loaded in every run are the fixtures, in `vst3_host.rs` and `clap_host.rs`.
 
 use riddim_plugin::check::{self, Options, Verdict};
 use riddim_plugin::scan::{ScanOutcome, ScanTarget, Scanner};

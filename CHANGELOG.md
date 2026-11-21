@@ -14,9 +14,17 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 - **`riddim-render`**: a headless renderer. A model as JSON in, a WAV and a line of JSON out.
 - **A stability policy** ([`docs/api/stability.md`](docs/api/stability.md)) and the checks behind it: golden schema-1 project and ops files that must keep loading with nothing lost. `Event`, `EngineError` and `Status` are marked non-exhaustive.
 - `riddim session new --bridged`; `EngineConfig::bridge_executable`; `RIDDIM_TEST_CLAP` for the third-party tests.
+- `riddim session new --copies N --looped`: the instrument track with its material and inserts, N times over, looping. Four copies with five inserts is the shape of the reference session (4 instruments, 20 effects), so the hour at 64 frames can be tried with whatever plugins are installed.
+- `scripts/ci-clean.sh`: the CI job in a clean Ubuntu 24.04 container on two cores, for when Actions cannot run it.
+- **CLAP fixture plugins** (`fixtures/clapplug`: a synth and a delay with latency, written against the CLAP C ABI directly) and the tests that use them, so that every test run loads CLAP plugins: host tests, the conformance run, the engine (latency compensated to the sample, state saved with the project, bounce, bridged) and the CLI.
 
 #### Changed
 - A parameter change a plugin makes on its audio side is written into automation when its lane is being written (this is how a CLAP editor's moves arrive).
+- The `peak dsp load` in the CLI's summary after playing or recording is the worst of the whole run (it was the last second's), with the number of seconds that had a block over its time.
+
+#### Fixed
+- **A healthy plugin could end up on the scan blocklist when two Riddim processes ran at once.** A process that read the scan cache while another was probing a plugin later wrote its stale copy of the "being probed" mark over the other's finished result; the plugin then read as having crashed its host. A process now writes only the entries it changed itself. (Present since the cache was added in phase 3.)
+- The CLAP host passed a block larger than the plugin was activated for on to the plugin, and for an effect indexed past its own input buffers (a panic on the audio thread). Such a block is now refused and silenced, as the VST3 host does. The engine never sends one; the CLAP fixture found it.
 
 #### Verified
 - On Linux: Surge XT's CLAP builds pass every step of the conformance run, and the demo song plays, saves, reopens, bounces and reroutes through them; a bridged fixture plugin has the same buses, parameters, state, events and audio (bit for bit) as in process; a project with bridged plugins bounces to the same bytes; a bridged plugin that aborts, and one that hangs, cost only themselves while a timer-driven device keeps running.

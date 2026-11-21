@@ -424,9 +424,14 @@ pub struct ScanCache {
     version: u32,
     #[serde(default)]
     entries: std::collections::BTreeMap<String, CacheEntry>,
-    /// Bundles this process took out of the cache, so merging on save does not bring them back.
+    /// Bundles this process took out of the cache since it last read or wrote the file, so
+    /// that merging with the file does not bring them back.
     #[serde(skip)]
     forgotten: std::collections::BTreeSet<String>,
+    /// Bundles whose entry this process wrote since it last read or wrote the file. Only these
+    /// are this process's to say; everything else is whatever the file says now.
+    #[serde(skip)]
+    changed: std::collections::BTreeSet<String>,
 }
 
 impl Default for ScanCache {
@@ -441,6 +446,7 @@ impl ScanCache {
             version: CACHE_VERSION,
             entries: Default::default(),
             forgotten: Default::default(),
+            changed: Default::default(),
         }
     }
 
@@ -475,19 +481,40 @@ impl ScanCache {
         Self::read(path).unwrap_or_default()
     }
 
-    /// Writes the cache, replacing the file in one step.
+    /// Brings this cache up to date with the file: what the file says now, with this
+    /// process's own changes since it last read or wrote the file laid over it.
     ///
-    /// Entries another process added to the file since this cache was loaded are kept, so two
-    /// hosts scanning at once do not undo each other's work. (There is no lock: for a bundle
-    /// both of them touched, the later writer wins, which costs at most a repeated scan.)
-    pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
-        if let Some(on_disk) = Self::read(path) {
-            for (key, entry) in on_disk.entries {
-                if !self.forgotten.contains(&key) {
-                    self.entries.entry(key).or_insert(entry);
-                }
+    /// Only entries this process wrote, and bundles it forgot, are its to say. Everything
+    /// else it holds is a copy of what the file said at some earlier moment, and another host
+    /// may have moved on since: finished a probe whose mark we read while it was running,
+    /// taken a bundle off the blocklist, scanned something new. Writing such a copy back
+    /// would undo that. (A probe mark is the case that hurts: the copy says "being probed by
+    /// process N", N has since finished and exited, and the bundle reads as having taken N
+    /// down with it.)
+    pub fn refresh(&mut self, path: &Path) {
+        let Some(on_disk) = Self::read(path) else {
+            return;
+        };
+        let mut entries = on_disk.entries;
+        for key in &self.forgotten {
+            entries.remove(key);
+        }
+        for key in &self.changed {
+            if let Some(entry) = self.entries.get(key) {
+                entries.insert(key.clone(), entry.clone());
             }
         }
+        self.entries = entries;
+    }
+
+    /// Writes the cache, replacing the file in one step.
+    ///
+    /// The file is read first and this process's changes are laid over what it says now (see
+    /// [`ScanCache::refresh`]), so two hosts scanning at once do not undo each other's work.
+    /// (There is no lock: two hosts saving in the same instant can still lose one entry,
+    /// which costs a repeated scan. For a bundle both of them probed, the later writer wins.)
+    pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        self.refresh(path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -496,7 +523,11 @@ impl ScanCache {
             &temporary,
             serde_json::to_string_pretty(self).expect("the cache serialises"),
         )?;
-        std::fs::rename(&temporary, path)
+        std::fs::rename(&temporary, path)?;
+        // The file now says what we had to say.
+        self.changed.clear();
+        self.forgotten.clear();
+        Ok(())
     }
 
     fn key(path: &Path) -> String {
@@ -525,6 +556,7 @@ impl ScanCache {
         if let Some(stamp) = FileStamp::of(path) {
             let key = Self::key(path);
             self.forgotten.remove(&key);
+            self.changed.insert(key.clone());
             self.entries.insert(key, CacheEntry { stamp, outcome });
         }
     }
@@ -547,6 +579,7 @@ impl ScanCache {
     pub fn forget(&mut self, path: &Path) -> bool {
         let key = Self::key(path);
         let known = self.entries.remove(&key).is_some();
+        self.changed.remove(&key);
         self.forgotten.insert(key);
         known
     }
@@ -580,6 +613,11 @@ impl Scanner {
         cache_file: Option<&Path>,
         mut progress: impl FnMut(&ScanTarget, &ScanOutcome, bool),
     ) -> ScanReport {
+        // Start from what the file says now: a host that has been running for a while may
+        // hold marks of probes that other hosts have long since finished.
+        if let Some(file) = cache_file {
+            cache.refresh(file);
+        }
         let mut report = ScanReport::default();
         let mut settle = |target: &ScanTarget, outcome: ScanOutcome, cached: bool| {
             progress(target, &outcome, cached);
@@ -714,6 +752,100 @@ mod tests {
         let line = serde_json::to_string(&message).unwrap();
         assert!(!line.contains('\n'));
         assert_eq!(serde_json::from_str::<ScanMessage>(&line).unwrap(), message);
+    }
+
+    /// A process id that belongs to nothing: a child that has exited and been waited for.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_of_another_hosts_probe_mark_is_never_written_back_over_its_result() {
+        let dir = std::env::temp_dir().join(format!("riddim-scan-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cache.json");
+        let bundle = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        };
+        let (slow, other, third) = (
+            bundle("slow.clap"),
+            bundle("other.clap"),
+            bundle("third.clap"),
+        );
+        let found = || CachedOutcome::Plugins { plugins: vec![] };
+        let blocked = || CachedOutcome::Blocked {
+            reason: "it crashed".into(),
+        };
+
+        // Host A marks a bundle as being probed and saves, as `scan_cached` does. (Its
+        // process id here is one that will be gone by the time anyone asks.)
+        let mut a = ScanCache::load(&file);
+        a.store(&slow, CachedOutcome::Probing { pid: dead_pid() });
+        a.save(&file).unwrap();
+        // Host B starts at that moment and reads the file, mark and all.
+        let mut b = ScanCache::load(&file);
+        // A finishes its probe, records what it found, and exits.
+        a.store(&slow, found());
+        a.save(&file).unwrap();
+        // B records something about another bundle and saves.
+        b.store(&other, blocked());
+        b.save(&file).unwrap();
+
+        // A's result is still what the file says: B's copy of the mark did not replace it,
+        // so the bundle is not taken for one that took its host down.
+        let now = ScanCache::load(&file);
+        assert_eq!(now.lookup(&slow), Some(found()));
+        assert_eq!(now.lookup(&other), Some(blocked()));
+        assert_eq!(now.blocked().len(), 1);
+        // And B, having saved, knows it too.
+        assert_eq!(b.lookup(&slow), Some(found()));
+
+        // The same for a bundle taken off the blocklist: a host holding an older copy of the
+        // entry does not put it back.
+        let mut c = ScanCache::load(&file);
+        let mut d = ScanCache::load(&file);
+        assert!(c.forget(&other));
+        c.save(&file).unwrap();
+        d.store(&third, found());
+        d.save(&file).unwrap();
+        let now = ScanCache::load(&file);
+        assert_eq!(now.lookup(&other), None, "a forgotten bundle came back");
+        assert_eq!(now.lookup(&third), Some(found()));
+        assert_eq!(now.len(), 2);
+
+        // A long-running host catches up when it next scans or refreshes, without saving.
+        let mut e = ScanCache::load(&file);
+        let mut f = ScanCache::load(&file);
+        e.store(&other, blocked());
+        e.save(&file).unwrap();
+        assert_eq!(f.lookup(&other), None);
+        f.refresh(&file);
+        assert_eq!(f.lookup(&other), Some(blocked()));
+
+        // What a host has changed and not yet saved survives its own refresh.
+        f.store(&third, blocked());
+        assert!(f.forget(&slow));
+        f.refresh(&file);
+        assert_eq!(f.lookup(&third), Some(blocked()));
+        assert_eq!(f.lookup(&slow), None);
+
+        // A mark whose owner really is gone, with nothing after it, still blocks.
+        let mut g = ScanCache::load(&file);
+        g.store(&slow, CachedOutcome::Probing { pid: dead_pid() });
+        g.save(&file).unwrap();
+        assert!(matches!(
+            ScanCache::load(&file).lookup(&slow),
+            Some(CachedOutcome::Blocked { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

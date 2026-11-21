@@ -810,6 +810,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "riddim-clapplug"
+version = "0.1.0"
+dependencies = [
+ "clap-sys",
+]
+
+[[package]]
 name = "riddim-cli"
 version = "0.1.0"
 dependencies = [

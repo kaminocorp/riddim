@@ -571,6 +571,7 @@ impl PluginInstance for ClapInstance {
             notes_as_midi: self.notes_as_midi,
             gestures: gesture_tx,
             sample_rate: config.sample_rate,
+            max_block: config.max_block.max(1) as usize,
         }))
     }
 
@@ -880,6 +881,8 @@ struct ClapProcessor {
     notes_as_midi: bool,
     gestures: spsc::Producer<Gesture>,
     sample_rate: f64,
+    /// The largest block the plugin was activated for.
+    max_block: usize,
 }
 
 /// Hands out a slice in consecutive pieces of the given sizes.
@@ -961,6 +964,14 @@ impl ClapProcessor {
 impl PluginProcessor for ClapProcessor {
     fn process(&mut self, context: &mut ProcessContext<'_>) -> OurStatus {
         let frames = context.frames;
+        if frames > self.max_block {
+            // More frames than the plugin was activated for: it was promised it would never
+            // see that, so it does not.
+            for channel in context.outputs.iter_mut() {
+                channel.fill(0.0);
+            }
+            return OurStatus::Failed;
+        }
         self.events_in.clear();
         for event in context.events_in {
             self.push_input(event);
