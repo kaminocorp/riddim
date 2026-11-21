@@ -23,7 +23,7 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 - The `peak dsp load` in the CLI's summary after playing or recording is the worst of the whole run (it was the last second's), with the number of seconds that had a block over its time.
 
 #### Fixed
-- **A healthy plugin could end up on the scan blocklist when two Riddim processes ran at once.** A process that read the scan cache while another was probing a plugin later wrote its stale copy of the "being probed" mark over the other's finished result; the plugin then read as having crashed its host. A process now writes only the entries it changed itself. (Present since the cache was added in phase 3.)
+- The scan cache could blocklist a healthy plugin when two Riddim processes ran at once: found here, fixed on the phase 3 branch, where it came from (see that section).
 - The CLAP host passed a block larger than the plugin was activated for on to the plugin, and for an effect indexed past its own input buffers (a panic on the audio thread). Such a block is now refused and silenced, as the VST3 host does. The engine never sends one; the CLAP fixture found it.
 
 #### Verified
