@@ -423,3 +423,76 @@ fn a_project_sounds_the_same_after_save_and_reopen() {
     reopened.capture_plugin_states().unwrap();
     assert_eq!(reopened.model().to_json(), saved_json);
 }
+
+#[test]
+fn an_external_main_thread_loads_one_plugin_per_pump() {
+    // An application that pumps the plugin host from its UI thread must get a turn between
+    // one plugin load and the next, however many were asked for at once.
+    let dir = temp_dir("pump");
+    let mut config = riddim_engine::EngineConfig::manual(&dir);
+    config.main_thread = riddim_engine::MainThreadMode::External;
+    let mut engine = Engine::start(config).unwrap();
+    let mut main = engine
+        .take_main_thread()
+        .expect("external mode hands out the main thread");
+    let events = engine.subscribe();
+    engine.apply(vec![
+        add_track(0, 10, TrackKind::Instrument),
+        add_track(1, 20, TrackKind::Audio),
+        add_track(2, 30, TrackKind::Audio),
+        Op::InsertPlugin {
+            track: TrackId(10),
+            index: 0,
+            slot: fixture_slot(11, ids::SYNTH_UID),
+        },
+        Op::InsertPlugin {
+            track: TrackId(20),
+            index: 0,
+            slot: fixture_slot(21, ids::GAIN_UID),
+        },
+        Op::InsertPlugin {
+            track: TrackId(30),
+            index: 0,
+            slot: fixture_slot(31, ids::DELAY_UID),
+        },
+    ]);
+    // Wait for the edit itself, without pumping: nothing can load yet.
+    wait_for(&events, "the edit", |e| {
+        matches!(e, Event::Applied { .. }).then_some(())
+    });
+    // (No `engine.sync()` here: it waits for plugins to finish loading, which is exactly what
+    // an unpumped main thread prevents.)
+    let loaded_within = |wait: std::time::Duration| {
+        let deadline = std::time::Instant::now() + wait;
+        let mut count = 0;
+        loop {
+            while let Ok(event) = events.try_recv() {
+                if matches!(event, Event::PluginLoaded { .. }) {
+                    count += 1;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return count;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let settle = std::time::Duration::from_millis(250);
+    assert_eq!(
+        loaded_within(settle),
+        0,
+        "nothing loads until the main thread is pumped"
+    );
+    for turn in 1..=3 {
+        assert!(main.pump());
+        assert_eq!(
+            loaded_within(settle),
+            1,
+            "pump {turn} should have loaded exactly one plugin"
+        );
+    }
+    assert!(main.pump());
+    assert_eq!(loaded_within(settle), 0);
+    drop(engine);
+    while main.pump() {}
+}
