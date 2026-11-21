@@ -31,6 +31,7 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 - **CLAP fixture plugins** (`fixtures/clapplug`: a synth and a delay with latency, written against the CLAP C ABI directly) and the tests that use them, so that every test run loads CLAP plugins: host tests, the conformance run, the engine (latency compensated to the sample, state saved with the project, bounce, bridged) and the CLI.
 
 #### Changed
+- **A plugin's first block no longer runs on the audio thread.** After a plugin is activated, the thread that loaded it gives it one block of silence and resets it before the audio thread gets it, so whatever the plugin does once in its first block is not a dropout. With four Surge XT instruments at 64 frames the worst block at start-up went from about 254% of its time to about 47%. A bridged plugin that is slow over its first block is no longer taken for hung: that block is given thirty seconds. Not done for offline renders. `EngineConfig::warm_up_plugins` (on by default; `"warm_up_plugins"` in the C API's configuration, `--no-warm-up` on the command line) turns it off. *Not tried with any commercial plugin.*
 - A parameter change a plugin makes on its audio side is written into automation when its lane is being written (this is how a CLAP editor's moves arrive).
 - The `peak dsp load` in the CLI's summary after playing or recording is the worst of the whole run (it was the last second's), with the number of seconds that had a block over its time.
 

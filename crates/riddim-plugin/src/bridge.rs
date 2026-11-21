@@ -660,6 +660,7 @@ impl PluginInstance for BridgedInstance {
             shared,
             stream,
             dead: self.dead.clone(),
+            patience,
         }))
     }
 
@@ -804,7 +805,13 @@ struct BridgedProcessor {
     shared: Shared,
     stream: UnixStream,
     dead: Arc<AtomicBool>,
+    /// How long a block is waited for.
+    patience: Duration,
 }
+
+/// How long a plugin's first block is waited for when nothing is waiting on it: as long as
+/// a block of an offline render.
+const FIRST_BLOCK_PATIENCE: Duration = Duration::from_secs(30);
 
 impl BridgedProcessor {
     /// Hands the block to the child and waits for it to come back. False if it did not.
@@ -818,6 +825,19 @@ impl BridgedProcessor {
 }
 
 impl PluginProcessor for BridgedProcessor {
+    fn first_block(&mut self, context: &mut ProcessContext<'_>) -> ProcessStatus {
+        // A plugin may take far longer over its first block than over any other, and live
+        // that would look like a hang. Nothing is waiting this time.
+        let wait = |stream: &UnixStream, patience: Duration| {
+            let _ = stream.set_read_timeout(Some(patience));
+            let _ = stream.set_write_timeout(Some(patience));
+        };
+        wait(&self.stream, self.patience.max(FIRST_BLOCK_PATIENCE));
+        let status = self.process(context);
+        wait(&self.stream, self.patience);
+        status
+    }
+
     fn process(&mut self, context: &mut ProcessContext<'_>) -> ProcessStatus {
         let frames = context.frames.min(self.shared.layout.max_block);
         let silence = |context: &mut ProcessContext<'_>| {

@@ -119,7 +119,8 @@ pub struct RiddimStatus {
 ///   "midi_input": true,
 ///   "offline": false,             // tell plugins this is an offline render
 ///   "render_threads": null,       // extra render threads; null picks for the device
-///   "bridge_executable": null     // where riddim-bridge is, for bridged plugin slots
+///   "bridge_executable": null,    // where riddim-bridge is, for bridged plugin slots
+///   "warm_up_plugins": true       // run each plugin's first block off the audio thread
 /// }
 /// ```
 #[derive(Deserialize)]
@@ -156,6 +157,14 @@ struct Config {
     /// null: `$RIDDIM_BRIDGE`, then beside the running program.
     #[serde(default)]
     bridge_executable: Option<PathBuf>,
+    /// Give each plugin one block of silence on the loading thread before the audio thread
+    /// gets it. Absent: true.
+    #[serde(default = "yes")]
+    warm_up_plugins: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_device() -> String {
@@ -217,6 +226,7 @@ fn engine_config(json: &str) -> Result<EngineConfig, String> {
         parallel_from: riddim::PARALLEL_FROM_STEPS,
         streaming: Default::default(),
         bridge_executable: config.bridge_executable,
+        warm_up_plugins: config.warm_up_plugins,
     })
 }
 

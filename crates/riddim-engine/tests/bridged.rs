@@ -194,6 +194,66 @@ fn a_crashing_plugin_does_not_take_the_session_down() {
 }
 
 #[test]
+fn a_bridged_plugin_that_is_slow_over_its_first_block_is_not_given_up_on() {
+    // The fixture takes 150 ms over the first block of each activation. Live, the bridge
+    // gives a plugin 100 ms for a block before it calls it hung. The first block is given
+    // to the plugin where it was loaded, with nothing waiting for it, and has to be given
+    // the time it needs.
+    let dir = temp_dir("bridged-slow-first");
+    let mut config = config(&dir);
+    config.device = DeviceConfig::Null(NullConfig {
+        buffer_frames: 128,
+        ..NullConfig::default()
+    });
+    let engine = Engine::start(config).unwrap();
+    let events = engine.subscribe();
+    engine
+        .apply_wait(vec![
+            media(&dir, 1, RATE, vec![vec![0.5; 480_000]]),
+            add_track(0, 20, TrackKind::Audio),
+            Op::AddClip {
+                track: TrackId(20),
+                clip: audio_clip(21, 1, 0, 480_000),
+            },
+            Op::InsertPlugin {
+                track: TrackId(20),
+                index: 0,
+                slot: slot(22, ids::SLOW_UID, true),
+            },
+        ])
+        .unwrap();
+    loaded(&events, 1);
+    engine.sync();
+    // Told to halve what it is given. A plugin given up on is taken out of the mix, and the
+    // track is heard at full level (or, before that is noticed, not at all).
+    engine.set_param(SlotId(22), ids::GAIN_GAIN, 0.25);
+    engine.sync();
+    engine.transport(TransportCommand::Play);
+    let mut heard = Vec::new();
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(600);
+    while std::time::Instant::now() < until {
+        match events.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Event::PluginCrashed { slot, .. }) => {
+                panic!("the plugin in {slot:?} was given up on")
+            }
+            Ok(Event::Meters { tracks }) => heard.extend(
+                tracks
+                    .iter()
+                    .filter(|(track, _)| *track == TrackId(20))
+                    .map(|(_, peaks)| peaks[0]),
+            ),
+            _ => {}
+        }
+    }
+    let last = *heard.last().expect("no meters arrived");
+    assert!(
+        (last - 0.25).abs() < 0.01,
+        "the track is heard at {last}, not at half its level: {heard:?}"
+    );
+    assert_eq!(engine.status().rt_violations, 0);
+}
+
+#[test]
 fn a_bridge_that_is_not_there_fails_the_plugin_not_the_engine() {
     let dir = temp_dir("bridged-missing");
     let mut config = EngineConfig::manual(&dir);

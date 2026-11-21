@@ -55,6 +55,8 @@ pub struct DeviceOptions {
     /// Change to this buffer size a few seconds into playing, to show that it can be done
     /// on the fly.
     pub switch_buffer: Option<u32>,
+    /// Run each plugin's first block off the audio thread.
+    pub warm_up: bool,
 }
 
 impl DeviceOptions {
@@ -229,6 +231,7 @@ impl Running {
             dir,
             midi_input,
             options.render_threads,
+            options.warm_up,
         )?;
         running.switch_buffer = options.switch_buffer;
         Ok(running)
@@ -239,6 +242,7 @@ impl Running {
         dir: &Path,
         midi_input: bool,
         render_threads: Option<usize>,
+        warm_up_plugins: bool,
     ) -> Result<Running, String> {
         // The manual device is only ever used for rendering.
         let process_mode = match device {
@@ -258,6 +262,7 @@ impl Running {
             parallel_from: riddim::PARALLEL_FROM_STEPS,
             streaming: Default::default(),
             bridge_executable: None,
+            warm_up_plugins,
         };
         let mut engine = Engine::start(config).map_err(|e| e.to_string())?;
         let main = engine

@@ -202,6 +202,14 @@ pub trait PluginProcessor: Send {
     /// Renders one block.
     fn process(&mut self, context: &mut ProcessContext<'_>) -> ProcessStatus;
 
+    /// Renders the first block after activation, when the host chooses to give the plugin
+    /// one before the audio thread has the processor: once, on the thread that activated the
+    /// plugin, with nothing waiting for the result. An implementation with a deadline of its
+    /// own for a block has no use for it here.
+    fn first_block(&mut self, context: &mut ProcessContext<'_>) -> ProcessStatus {
+        self.process(context)
+    }
+
     /// Clears voices, delay lines and tails, as after a transport jump.
     fn reset(&mut self) {}
 

@@ -71,6 +71,10 @@ pub struct EngineConfig {
     /// The `riddim-bridge` executable, for plugin slots marked to run in a process of their
     /// own. `None` looks in `$RIDDIM_BRIDGE` and then beside the running program.
     pub bridge_executable: Option<PathBuf>,
+    /// Give every plugin one block of silence on the thread that loads it, before the audio
+    /// thread gets it, so that whatever it does once in its first block is not done there.
+    /// On unless a plugin turns out to mind; never done when `process_mode` is `Offline`.
+    pub warm_up_plugins: bool,
 }
 
 /// The default for [`EngineConfig::parallel_from`].
@@ -96,6 +100,7 @@ impl EngineConfig {
             parallel_from: PARALLEL_FROM_STEPS,
             streaming: Default::default(),
             bridge_executable: None,
+            warm_up_plugins: true,
         }
     }
 }
@@ -126,7 +131,12 @@ impl std::fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 /// The channel ends and the bridge path a [`MainThread`] is made from.
-type MainThreadParts = (Receiver<HostRequest>, Sender<HostReply>, Option<PathBuf>);
+type MainThreadParts = (
+    Receiver<HostRequest>,
+    Sender<HostReply>,
+    Option<PathBuf>,
+    bool,
+);
 
 /// A snapshot of what the engine is doing.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
@@ -301,16 +311,22 @@ impl Engine {
             // thread, and an `Engine` holding one could not be handed to another thread or
             // kept in an application's shared state.
             MainThreadMode::External => (
-                Some((host_rx, host_reply_tx, config.bridge_executable.clone())),
+                Some((
+                    host_rx,
+                    host_reply_tx,
+                    config.bridge_executable.clone(),
+                    config.warm_up_plugins,
+                )),
                 None,
             ),
             MainThreadMode::Internal => {
                 let bridge = config.bridge_executable.clone();
+                let warm_up = config.warm_up_plugins;
                 let thread = std::thread::Builder::new()
                     .name("riddim-plugin-host".into())
                     .spawn(move || {
                         // Plugin instances are created on, and never leave, this thread.
-                        let mut main = MainThread::new(host_rx, host_reply_tx, bridge);
+                        let mut main = MainThread::new(host_rx, host_reply_tx, bridge, warm_up);
                         while main.pump() {
                             std::thread::sleep(Duration::from_millis(2));
                         }
@@ -572,8 +588,8 @@ impl Engine {
     /// to another thread. The `Engine` itself can be (it is `Send`), so an application can
     /// take this on its main thread and keep the engine wherever its commands are handled.
     pub fn take_main_thread(&mut self) -> Option<MainThread> {
-        let (requests, replies, bridge) = self.main_thread.take()?;
-        Some(MainThread::new(requests, replies, bridge))
+        let (requests, replies, bridge, warm_up) = self.main_thread.take()?;
+        Some(MainThread::new(requests, replies, bridge, warm_up))
     }
 }
 

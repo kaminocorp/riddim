@@ -68,6 +68,7 @@ Run on the Linux build machine (x86-64, 8 cores and 16 threads, Rust 1.100.0) wi
 - **The scan cache could blocklist a healthy plugin** (D75), a phase 3 bug. Two processes sharing the cache file: one reads it while the other is mid-probe, and later writes its stale copy of the "being probed" mark over the other's result. Found because the new CLAP test in the CLI suite runs its commands alongside fourteen other tests' processes on one cache file; it failed about one run in two until this was fixed.
 - **A stand-in for phase 4's reference session was run from this branch** (four Surge XT instruments and twenty Surge XT effects at 64 frames for an hour, on a timer): the engine's share of a block is small, and the dropouts that session has on this machine are Surge XT reading the processor's hardware random number generator on every note. The account is in [`p4-v1.md`](p4-v1.md), under "A stand-in for the reference session".
 - **Environment variables are a poor way to configure a test.** The bridge executable was first found through `RIDDIM_BRIDGE` alone, and tests running in parallel set it under each other. It is now a field of the engine configuration, with the variable as a fallback.
+- **A plugin's first block is no longer run on the audio thread** (D84), closing a gap the phase 4 notes left open. It showed in the reference-session stand-in as the one block over its time in the first second of every run. Three 20-second runs each way of that session (four Surge XT instruments, twenty Surge XT effects, 64 frames, a timer for a device, the hardware random source swapped as in the phase 4 notes): before, the worst block was 252% to 257% of its time, at the start, with 4 xruns each run; after, 46% to 48%, with 0, 0 and 1. A fixture that takes 150 ms over the first block of each activation holds this in the tests: the audio callback's block counter is watched while it loads and joins a playing session at 64 frames. The same fixture, bridged, used to be given up on as hung when it joined (the bridge allows a block 100 ms live); its first block now gets thirty seconds, since nothing is waiting for it. **Not tried with any commercial plugin, or on a Mac**; `--no-warm-up` on the command line and `EngineConfig::warm_up_plugins` put things back as they were.
 
 ## Known gaps
 
@@ -132,3 +133,13 @@ $R session render bridged.json -o cli.wav --seconds 8
 Good: `riddim-render` prints one line of JSON with `"frames":384000` and an empty `missing_plugins`, and `render.wav` sounds like `cli.wav`. (The CLI's project file is the engine's model JSON, so `riddim-render` reads it directly.)
 
 **5. Kontakt, bridged**, when it is installed: step 2 with `--instrument` naming Kontakt and `--buffer 128`, a full instrument loaded, for several minutes. Good: `xruns 0`. That is the bridge's first exit criterion.
+
+**6. The first block, off the audio thread** (D84)
+
+```sh
+$R session new first.json --instrument "Surge XT" --sequence --looped --copies 4
+$R session play first.json --buffer 64 --seconds 20
+$R session play first.json --buffer 64 --seconds 20 --no-warm-up
+```
+
+Good: both play the same thing, and the first reports `xruns 0` with a `peak dsp load` under 100%. The second is how it was before; if it shows a peak over 100% `at 0:00` or `0:01` that the first does not, the warm-up is doing its job. If a plugin misbehaves in the first run and not in the second (silence, a wrong sound, a crash), that plugin minds being given its first block on the loading thread: please say which.

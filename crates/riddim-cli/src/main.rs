@@ -163,6 +163,10 @@ struct DeviceArgs {
     /// Change to this buffer size a few seconds in, while running.
     #[arg(long, value_name = "FRAMES")]
     switch_buffer: Option<u32>,
+    /// Let each plugin's first block run on the audio thread, instead of giving it one block
+    /// of silence where it was loaded. For finding out whether a plugin minds the latter.
+    #[arg(long)]
+    no_warm_up: bool,
 }
 
 impl DeviceArgs {
@@ -175,6 +179,7 @@ impl DeviceArgs {
             capture: false,
             render_threads: self.render_threads,
             switch_buffer: self.switch_buffer,
+            warm_up: !self.no_warm_up,
         }
     }
 }

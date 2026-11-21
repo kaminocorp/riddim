@@ -17,6 +17,8 @@ pub mod ids {
     /// The gain plugin again, taking 400 ms to initialise.
     pub const SLOW_UID: &str = "52444D54534C4F5753494E4700000001";
     pub const SLOW_LOAD_MS: u64 = 400;
+    /// How long the slow loader takes over its first block after each activation.
+    pub const SLOW_FIRST_BLOCK_MS: u64 = 150;
 
     pub const SYNTH_GAIN: u32 = 100;
     pub const SYNTH_MOD: u32 = 101;
