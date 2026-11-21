@@ -11,7 +11,10 @@ fn dags() -> impl Strategy<Value = GraphSpec> {
     (2usize..24).prop_flat_map(|count| {
         let nodes = prop::collection::vec((0u32..3, 0u32..3, 0u32..500, any::<bool>()), count);
         let ranks = Just((0..count).collect::<Vec<usize>>()).prop_shuffle();
-        let edges = prop::collection::vec((0..count, 0..count, 0usize..4, 0usize..4, any::<bool>()), 0..80);
+        let edges = prop::collection::vec(
+            (0..count, 0..count, 0usize..4, 0usize..4, any::<bool>()),
+            0..80,
+        );
         (nodes, ranks, edges).prop_map(|(nodes, rank, raw_edges)| {
             let nodes: Vec<NodeSpec> = nodes
                 .into_iter()
@@ -22,7 +25,11 @@ fn dags() -> impl Strategy<Value = GraphSpec> {
                     event_output,
                 })
                 .collect();
-            let mut spec = GraphSpec { nodes, edges: Vec::new(), event_edges: Vec::new() };
+            let mut spec = GraphSpec {
+                nodes,
+                edges: Vec::new(),
+                event_edges: Vec::new(),
+            };
             for (a, b, from_port, to_port, as_event) in raw_edges {
                 if rank[a] == rank[b] {
                     continue;
@@ -32,7 +39,8 @@ fn dags() -> impl Strategy<Value = GraphSpec> {
                     if spec.nodes[from].event_output {
                         spec.event_edges.push(EventEdge { from, to });
                     }
-                } else if !spec.nodes[from].outputs.is_empty() && !spec.nodes[to].inputs.is_empty() {
+                } else if !spec.nodes[from].outputs.is_empty() && !spec.nodes[to].inputs.is_empty()
+                {
                     spec.edges.push(Edge {
                         from,
                         from_port: from_port % spec.nodes[from].outputs.len(),

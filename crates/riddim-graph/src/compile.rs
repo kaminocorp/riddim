@@ -58,12 +58,18 @@ pub enum GraphError {
 impl fmt::Display for GraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GraphError::DanglingEdge(edge) => write!(f, "edge {edge:?} names a missing node or port"),
-            GraphError::DanglingEventEdge(edge) => write!(f, "event edge {edge:?} names a missing node"),
+            GraphError::DanglingEdge(edge) => {
+                write!(f, "edge {edge:?} names a missing node or port")
+            }
+            GraphError::DanglingEventEdge(edge) => {
+                write!(f, "event edge {edge:?} names a missing node")
+            }
             GraphError::NoEventOutput(edge) => {
                 write!(f, "node {} has no event output to connect from", edge.from)
             }
-            GraphError::Cycle(nodes) => write!(f, "the graph has a feedback loop through nodes {nodes:?}"),
+            GraphError::Cycle(nodes) => {
+                write!(f, "the graph has a feedback loop through nodes {nodes:?}")
+            }
         }
     }
 }
@@ -142,8 +148,14 @@ pub fn compile(spec: &GraphSpec) -> Result<Plan, GraphError> {
     edges.sort_unstable();
     edges.dedup();
     for edge in &edges {
-        let ok = spec.nodes.get(edge.from).is_some_and(|n| edge.from_port < n.outputs.len())
-            && spec.nodes.get(edge.to).is_some_and(|n| edge.to_port < n.inputs.len());
+        let ok = spec
+            .nodes
+            .get(edge.from)
+            .is_some_and(|n| edge.from_port < n.outputs.len())
+            && spec
+                .nodes
+                .get(edge.to)
+                .is_some_and(|n| edge.to_port < n.inputs.len());
         if !ok {
             return Err(GraphError::DanglingEdge(*edge));
         }
@@ -163,7 +175,10 @@ pub fn compile(spec: &GraphSpec) -> Result<Plan, GraphError> {
     // Distinct upstream nodes per node, across both kinds of edge.
     let mut upstream: Vec<BTreeSet<NodeIndex>> = vec![BTreeSet::new(); node_count];
     let mut downstream: Vec<BTreeSet<NodeIndex>> = vec![BTreeSet::new(); node_count];
-    let pairs = edges.iter().map(|e| (e.from, e.to)).chain(event_edges.iter().map(|e| (e.from, e.to)));
+    let pairs = edges
+        .iter()
+        .map(|e| (e.from, e.to))
+        .chain(event_edges.iter().map(|e| (e.from, e.to)));
     for (from, to) in pairs {
         upstream[to].insert(from);
         downstream[from].insert(to);
@@ -171,8 +186,7 @@ pub fn compile(spec: &GraphSpec) -> Result<Plan, GraphError> {
 
     // Kahn's algorithm, always taking the ready node with the lowest index: deterministic.
     let mut pending: Vec<usize> = upstream.iter().map(BTreeSet::len).collect();
-    let mut ready: BTreeSet<NodeIndex> =
-        (0..node_count).filter(|&n| pending[n] == 0).collect();
+    let mut ready: BTreeSet<NodeIndex> = (0..node_count).filter(|&n| pending[n] == 0).collect();
     let mut order = Vec::with_capacity(node_count);
     while let Some(node) = ready.pop_first() {
         order.push(node);
@@ -208,7 +222,11 @@ pub fn compile(spec: &GraphSpec) -> Result<Plan, GraphError> {
     for &node in &order {
         let spec_node = &spec.nodes[node];
         let incoming: Vec<&Edge> = edges.iter().filter(|e| e.to == node).collect();
-        let input_latency = incoming.iter().map(|e| output_latency[e.from]).max().unwrap_or(0);
+        let input_latency = incoming
+            .iter()
+            .map(|e| output_latency[e.from])
+            .max()
+            .unwrap_or(0);
         output_latency[node] = input_latency + spec_node.latency;
 
         let inputs = spec_node
@@ -233,10 +251,16 @@ pub fn compile(spec: &GraphSpec) -> Result<Plan, GraphError> {
             .outputs
             .iter()
             .enumerate()
-            .map(|(port, &channels)| OutputPlan { first_buffer: first_buffer[node][port], channels })
+            .map(|(port, &channels)| OutputPlan {
+                first_buffer: first_buffer[node][port],
+                channels,
+            })
             .collect();
-        let event_sources =
-            event_edges.iter().filter(|e| e.to == node).map(|e| step_of_node[e.from]).collect();
+        let event_sources = event_edges
+            .iter()
+            .filter(|e| e.to == node)
+            .map(|e| step_of_node[e.from])
+            .collect();
 
         steps.push(Step {
             node,
@@ -266,11 +290,21 @@ mod tests {
     use super::*;
 
     fn node(inputs: &[u32], outputs: &[u32], latency: u32) -> NodeSpec {
-        NodeSpec { inputs: inputs.to_vec(), outputs: outputs.to_vec(), latency, event_output: false }
+        NodeSpec {
+            inputs: inputs.to_vec(),
+            outputs: outputs.to_vec(),
+            latency,
+            event_output: false,
+        }
     }
 
     fn edge(from: NodeIndex, to: NodeIndex) -> Edge {
-        Edge { from, from_port: 0, to, to_port: 0 }
+        Edge {
+            from,
+            from_port: 0,
+            to,
+            to_port: 0,
+        }
     }
 
     #[test]
@@ -278,12 +312,19 @@ mod tests {
         // source -> plugin(latency 64) -> mix
         //        `-------------------->´
         let spec = GraphSpec {
-            nodes: vec![node(&[], &[2], 0), node(&[2], &[2], 64), node(&[2], &[2], 0)],
+            nodes: vec![
+                node(&[], &[2], 0),
+                node(&[2], &[2], 64),
+                node(&[2], &[2], 0),
+            ],
             edges: vec![edge(0, 1), edge(1, 2), edge(0, 2)],
             event_edges: vec![],
         };
         let plan = compile(&spec).unwrap();
-        assert_eq!(plan.steps.iter().map(|s| s.node).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            plan.steps.iter().map(|s| s.node).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         assert_eq!(plan.buffer_count, 6);
         assert_eq!(plan.max_latency, 64);
 
@@ -305,14 +346,22 @@ mod tests {
         let mut spec = GraphSpec {
             nodes: vec![
                 node(&[2], &[2], 0), // 0: strip, fed by 2
-                NodeSpec { inputs: vec![], outputs: vec![], latency: 0, event_output: true }, // 1: notes
+                NodeSpec {
+                    inputs: vec![],
+                    outputs: vec![],
+                    latency: 0,
+                    event_output: true,
+                }, // 1: notes
                 node(&[], &[2], 10), // 2: instrument, fed events by 1
             ],
             edges: vec![edge(2, 0)],
             event_edges: vec![EventEdge { from: 1, to: 2 }],
         };
         let plan = compile(&spec).unwrap();
-        assert_eq!(plan.steps.iter().map(|s| s.node).collect::<Vec<_>>(), vec![1, 2, 0]);
+        assert_eq!(
+            plan.steps.iter().map(|s| s.node).collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
         assert_eq!(plan.steps[1].event_sources, vec![0]);
         assert_eq!(plan.steps[1].dependencies, 1);
         assert_eq!(plan.steps[2].input_latency, 10);
@@ -324,17 +373,47 @@ mod tests {
     #[test]
     fn errors() {
         let two = vec![node(&[2], &[2], 0), node(&[2], &[2], 0)];
-        let cyclic = GraphSpec { nodes: two.clone(), edges: vec![edge(0, 1), edge(1, 0)], event_edges: vec![] };
+        let cyclic = GraphSpec {
+            nodes: two.clone(),
+            edges: vec![edge(0, 1), edge(1, 0)],
+            event_edges: vec![],
+        };
         assert_eq!(compile(&cyclic), Err(GraphError::Cycle(vec![0, 1])));
 
-        let dangling = GraphSpec { nodes: two.clone(), edges: vec![edge(0, 7)], event_edges: vec![] };
-        assert!(matches!(compile(&dangling), Err(GraphError::DanglingEdge(_))));
-        let bad_port = Edge { from: 0, from_port: 3, to: 1, to_port: 0 };
-        let dangling = GraphSpec { nodes: two.clone(), edges: vec![bad_port], event_edges: vec![] };
-        assert!(matches!(compile(&dangling), Err(GraphError::DanglingEdge(_))));
+        let dangling = GraphSpec {
+            nodes: two.clone(),
+            edges: vec![edge(0, 7)],
+            event_edges: vec![],
+        };
+        assert!(matches!(
+            compile(&dangling),
+            Err(GraphError::DanglingEdge(_))
+        ));
+        let bad_port = Edge {
+            from: 0,
+            from_port: 3,
+            to: 1,
+            to_port: 0,
+        };
+        let dangling = GraphSpec {
+            nodes: two.clone(),
+            edges: vec![bad_port],
+            event_edges: vec![],
+        };
+        assert!(matches!(
+            compile(&dangling),
+            Err(GraphError::DanglingEdge(_))
+        ));
 
-        let silent = GraphSpec { nodes: two, edges: vec![], event_edges: vec![EventEdge { from: 0, to: 1 }] };
-        assert!(matches!(compile(&silent), Err(GraphError::NoEventOutput(_))));
+        let silent = GraphSpec {
+            nodes: two,
+            edges: vec![],
+            event_edges: vec![EventEdge { from: 0, to: 1 }],
+        };
+        assert!(matches!(
+            compile(&silent),
+            Err(GraphError::NoEventOutput(_))
+        ));
         assert_eq!(compile(&GraphSpec::default()).unwrap(), Plan::default());
     }
 }

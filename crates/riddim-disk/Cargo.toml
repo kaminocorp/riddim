@@ -1,0 +1,17 @@
+[package]
+name = "riddim-disk"
+description = "Disk I/O for Riddim: WAV reading and incremental writing, the capture (butler) thread, resampling on import, and Standard MIDI Files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+riddim-rt.workspace = true
+riddim-time.workspace = true
+midly.workspace = true
+
+[lints]
+workspace = true

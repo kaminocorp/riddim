@@ -70,7 +70,12 @@ impl ModelGraph {
     }
 
     fn connect(&mut self, from: NodeIndex, to: NodeIndex, to_port: usize) {
-        self.spec.edges.push(Edge { from, from_port: 0, to, to_port });
+        self.spec.edges.push(Edge {
+            from,
+            from_port: 0,
+            to,
+            to_port,
+        });
     }
 }
 
@@ -102,13 +107,23 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
             TrackKind::Audio => {
                 audio = Some(graph.add(
                     NodeKind::Source(track.id),
-                    NodeSpec { inputs: vec![], outputs: vec![STRIP_CHANNELS], latency: 0, event_output: false },
+                    NodeSpec {
+                        inputs: vec![],
+                        outputs: vec![STRIP_CHANNELS],
+                        latency: 0,
+                        event_output: false,
+                    },
                 ));
             }
             TrackKind::Instrument => {
                 events = Some(graph.add(
                     NodeKind::Source(track.id),
-                    NodeSpec { inputs: vec![], outputs: vec![], latency: 0, event_output: true },
+                    NodeSpec {
+                        inputs: vec![],
+                        outputs: vec![],
+                        latency: 0,
+                        event_output: true,
+                    },
                 ));
             }
             TrackKind::Bus | TrackKind::Master => {
@@ -119,7 +134,9 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
         }
 
         for slot in &track.plugins {
-            let Some(ports) = plugins.get(&slot.id) else { continue };
+            let Some(ports) = plugins.get(&slot.id) else {
+                continue;
+            };
             let node = graph.add(
                 NodeKind::Plugin(track.id, slot.id),
                 NodeSpec {
@@ -133,7 +150,10 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
                 graph.connect(source, node, 0);
             }
             if let (Some(source), true) = (events, ports.takes_events) {
-                graph.spec.event_edges.push(EventEdge { from: source, to: node });
+                graph.spec.event_edges.push(EventEdge {
+                    from: source,
+                    to: node,
+                });
             }
             if !ports.outputs.is_empty() {
                 audio = Some(node);
@@ -154,11 +174,21 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
     // Pass 2: routing between tracks, and the way out.
     let metronome = graph.add(
         NodeKind::Metronome,
-        NodeSpec { inputs: vec![], outputs: vec![STRIP_CHANNELS], latency: 0, event_output: false },
+        NodeSpec {
+            inputs: vec![],
+            outputs: vec![STRIP_CHANNELS],
+            latency: 0,
+            event_output: false,
+        },
     );
     let output = graph.add(
         NodeKind::Output,
-        NodeSpec { inputs: vec![STRIP_CHANNELS], outputs: vec![], latency: 0, event_output: false },
+        NodeSpec {
+            inputs: vec![STRIP_CHANNELS],
+            outputs: vec![],
+            latency: 0,
+            event_output: false,
+        },
     );
     for (_, strip, destination) in strips {
         match destination {
@@ -167,7 +197,10 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
             Some(TrackOutput::Bus(bus)) => {
                 // The model guarantees outputs name existing buses; fall back to the master
                 // rather than drop the signal if that ever fails to hold.
-                let target = bus_inputs.get(&bus).copied().unwrap_or(bus_inputs[&TrackId::MASTER]);
+                let target = bus_inputs
+                    .get(&bus)
+                    .copied()
+                    .unwrap_or(bus_inputs[&TrackId::MASTER]);
                 graph.connect(strip, target, 0);
             }
         }
@@ -185,26 +218,53 @@ mod tests {
     fn slot(id: u64) -> PluginSlot {
         PluginSlot {
             id: SlotId(id),
-            plugin: PluginRef { format: "vst3".into(), uid: "X".into(), name: String::new(), path: None },
+            plugin: PluginRef {
+                format: "vst3".into(),
+                uid: "X".into(),
+                name: String::new(),
+                path: None,
+            },
             state: None,
             bypass: false,
         }
     }
 
     fn effect(latency: u32) -> PluginPorts {
-        PluginPorts { inputs: vec![2], outputs: vec![2], latency, takes_events: false, emits_events: false }
+        PluginPorts {
+            inputs: vec![2],
+            outputs: vec![2],
+            latency,
+            takes_events: false,
+            emits_events: false,
+        }
     }
 
     fn instrument() -> PluginPorts {
-        PluginPorts { inputs: vec![], outputs: vec![2], latency: 0, takes_events: true, emits_events: false }
+        PluginPorts {
+            inputs: vec![],
+            outputs: vec![2],
+            latency: 0,
+            takes_events: true,
+            emits_events: false,
+        }
     }
 
     fn session() -> Model {
         let mut model = Model::new();
-        for (index, (id, kind)) in
-            [(1, TrackKind::Audio), (2, TrackKind::Instrument), (3, TrackKind::Bus)].into_iter().enumerate()
+        for (index, (id, kind)) in [
+            (1, TrackKind::Audio),
+            (2, TrackKind::Instrument),
+            (3, TrackKind::Bus),
+        ]
+        .into_iter()
+        .enumerate()
         {
-            model.apply(&Op::AddTrack { index, track: Track::new(TrackId(id), "t", kind) }).unwrap();
+            model
+                .apply(&Op::AddTrack {
+                    index,
+                    track: Track::new(TrackId(id), "t", kind),
+                })
+                .unwrap();
         }
         model
     }
@@ -222,37 +282,95 @@ mod tests {
             ]
         );
         let plan = compile(&graph.spec).unwrap();
-        assert_eq!(plan.steps.last().unwrap().node, graph.index_of(NodeKind::Output).unwrap());
-        assert_eq!(plan.steps.last().unwrap().inputs[0].sources.len(), 2, "master strip and metronome");
+        assert_eq!(
+            plan.steps.last().unwrap().node,
+            graph.index_of(NodeKind::Output).unwrap()
+        );
+        assert_eq!(
+            plan.steps.last().unwrap().inputs[0].sources.len(),
+            2,
+            "master strip and metronome"
+        );
     }
 
     #[test]
     fn chains_and_routing() {
         let mut model = session();
-        model.apply(&Op::InsertPlugin { track: TrackId(2), index: 0, slot: slot(10) }).unwrap();
-        model.apply(&Op::InsertPlugin { track: TrackId(1), index: 0, slot: slot(11) }).unwrap();
-        model.apply(&Op::InsertPlugin { track: TrackId(1), index: 1, slot: slot(12) }).unwrap(); // not loaded
         model
-            .apply(&Op::SetTrack { id: TrackId(1), change: TrackChange::Output(TrackOutput::Bus(TrackId(3))) })
+            .apply(&Op::InsertPlugin {
+                track: TrackId(2),
+                index: 0,
+                slot: slot(10),
+            })
+            .unwrap();
+        model
+            .apply(&Op::InsertPlugin {
+                track: TrackId(1),
+                index: 0,
+                slot: slot(11),
+            })
+            .unwrap();
+        model
+            .apply(&Op::InsertPlugin {
+                track: TrackId(1),
+                index: 1,
+                slot: slot(12),
+            })
+            .unwrap(); // not loaded
+        model
+            .apply(&Op::SetTrack {
+                id: TrackId(1),
+                change: TrackChange::Output(TrackOutput::Bus(TrackId(3))),
+            })
             .unwrap();
         let plugins = HashMap::from([(SlotId(10), instrument()), (SlotId(11), effect(256))]);
         let graph = build(&model, &plugins);
-        let index = |kind| graph.index_of(kind).unwrap_or_else(|| panic!("no node {kind:?}"));
-        assert!(graph.index_of(NodeKind::Plugin(TrackId(1), SlotId(12))).is_none());
+        let index = |kind| {
+            graph
+                .index_of(kind)
+                .unwrap_or_else(|| panic!("no node {kind:?}"))
+        };
+        assert!(graph
+            .index_of(NodeKind::Plugin(TrackId(1), SlotId(12)))
+            .is_none());
 
-        let has_edge = |from, to| graph.spec.edges.iter().any(|e| e.from == index(from) && e.to == index(to));
+        let has_edge = |from, to| {
+            graph
+                .spec
+                .edges
+                .iter()
+                .any(|e| e.from == index(from) && e.to == index(to))
+        };
         // Audio track: source -> effect -> strip -> bus.
-        assert!(has_edge(NodeKind::Source(TrackId(1)), NodeKind::Plugin(TrackId(1), SlotId(11))));
-        assert!(has_edge(NodeKind::Plugin(TrackId(1), SlotId(11)), NodeKind::Strip(TrackId(1))));
-        assert!(has_edge(NodeKind::Strip(TrackId(1)), NodeKind::BusInput(TrackId(3))));
+        assert!(has_edge(
+            NodeKind::Source(TrackId(1)),
+            NodeKind::Plugin(TrackId(1), SlotId(11))
+        ));
+        assert!(has_edge(
+            NodeKind::Plugin(TrackId(1), SlotId(11)),
+            NodeKind::Strip(TrackId(1))
+        ));
+        assert!(has_edge(
+            NodeKind::Strip(TrackId(1)),
+            NodeKind::BusInput(TrackId(3))
+        ));
         // Instrument track: events into the instrument, its audio to the strip, strip to master.
         assert!(graph.spec.event_edges.contains(&EventEdge {
             from: index(NodeKind::Source(TrackId(2))),
             to: index(NodeKind::Plugin(TrackId(2), SlotId(10))),
         }));
-        assert!(has_edge(NodeKind::Plugin(TrackId(2), SlotId(10)), NodeKind::Strip(TrackId(2))));
-        assert!(has_edge(NodeKind::Strip(TrackId(2)), NodeKind::BusInput(TrackId::MASTER)));
-        assert!(has_edge(NodeKind::Strip(TrackId(3)), NodeKind::BusInput(TrackId::MASTER)));
+        assert!(has_edge(
+            NodeKind::Plugin(TrackId(2), SlotId(10)),
+            NodeKind::Strip(TrackId(2))
+        ));
+        assert!(has_edge(
+            NodeKind::Strip(TrackId(2)),
+            NodeKind::BusInput(TrackId::MASTER)
+        ));
+        assert!(has_edge(
+            NodeKind::Strip(TrackId(3)),
+            NodeKind::BusInput(TrackId::MASTER)
+        ));
         assert!(has_edge(NodeKind::Strip(TrackId::MASTER), NodeKind::Output));
         assert!(has_edge(NodeKind::Metronome, NodeKind::Output));
 
@@ -263,12 +381,24 @@ mod tests {
         let master_in = step(NodeKind::BusInput(TrackId::MASTER));
         assert_eq!(master_in.input_latency, 256);
         let delay_from = |kind| {
-            master_in.inputs[0].sources.iter().find(|s| s.edge.from == index(kind)).unwrap().delay
+            master_in.inputs[0]
+                .sources
+                .iter()
+                .find(|s| s.edge.from == index(kind))
+                .unwrap()
+                .delay
         };
         assert_eq!(delay_from(NodeKind::Strip(TrackId(2))), 256);
         assert_eq!(delay_from(NodeKind::Strip(TrackId(3))), 0);
         let out = step(NodeKind::Output);
-        assert_eq!(out.inputs[0].sources.iter().map(|s| s.delay).collect::<Vec<_>>(), vec![0, 256]);
+        assert_eq!(
+            out.inputs[0]
+                .sources
+                .iter()
+                .map(|s| s.delay)
+                .collect::<Vec<_>>(),
+            vec![0, 256]
+        );
         assert_eq!(plan.max_latency, 256);
     }
 
@@ -278,6 +408,8 @@ mod tests {
         let graph = build(&model, &HashMap::new());
         let plan = compile(&graph.spec).unwrap();
         let strip = graph.index_of(NodeKind::Strip(TrackId(2))).unwrap();
-        assert!(plan.steps[plan.step_of_node[strip]].inputs[0].sources.is_empty());
+        assert!(plan.steps[plan.step_of_node[strip]].inputs[0]
+            .sources
+            .is_empty());
     }
 }

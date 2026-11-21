@@ -33,7 +33,10 @@ impl Meter {
     pub fn new(numerator: u16, denominator: u16) -> Option<Meter> {
         let valid =
             (1..=64).contains(&numerator) && denominator.is_power_of_two() && denominator <= 64;
-        valid.then_some(Meter { numerator, denominator })
+        valid.then_some(Meter {
+            numerator,
+            denominator,
+        })
     }
 
     /// Length of one beat of this meter (one denominator note).

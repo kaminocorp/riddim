@@ -19,6 +19,8 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
+    # Public-domain dedication (midly).
+    "Unlicense",
     # File-level copyleft: fine for unmodified dependencies (vision §6.2).
     "MPL-2.0",
 ]

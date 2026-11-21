@@ -5,6 +5,7 @@ members = [
     "crates/riddim-time",
     "crates/riddim-model",
     "crates/riddim-graph",
+    "crates/riddim-disk",
     "crates/riddim-plugin",
     "crates/riddim-io",
     "crates/riddim-cli",
@@ -26,6 +27,7 @@ riddim-rt = { path = "crates/riddim-rt" }
 riddim-time = { path = "crates/riddim-time" }
 riddim-model = { path = "crates/riddim-model" }
 riddim-graph = { path = "crates/riddim-graph" }
+riddim-disk = { path = "crates/riddim-disk" }
 riddim-plugin = { path = "crates/riddim-plugin" }
 riddim-io = { path = "crates/riddim-io" }
 riddim-test-support = { path = "fixtures/support" }
@@ -38,6 +40,7 @@ libloading = "0.9"
 crossbeam-queue = "0.3"
 clap = { version = "4", features = ["derive"] }
 proptest = "1"
+midly = { version = "0.5", default-features = false, features = ["std", "alloc"] }
 
 # macOS system frameworks (only built on macOS).
 objc2 = "0.6"
