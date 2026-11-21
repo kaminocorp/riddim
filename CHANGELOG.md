@@ -17,7 +17,7 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 - **`riddim`**: the public Rust API (commands, queries, events) and file import helpers.
 - **`riddim-ffi`**: C ABI v0 with a generated header (`crates/riddim-ffi/include/riddim.h`).
 - **`riddim-cli`**: `play` and `render` now run the engine and accept MIDI files; new `session new|info|play|record|render` and `loopback` (measures recording alignment through a cable).
-- **RealtimeSanitizer**: `scripts/rtsan.sh` and a CI job run the real-time sections under LLVM's RTSan, with a self-check that the sanitizer is active.
+- **RealtimeSanitizer**: `scripts/rtsan.sh` (part of `scripts/ci.sh`) runs the real-time sections under LLVM's RTSan, with a self-check that the sanitizer is active.
 
 #### Changed
 - The phase 1 spike player is gone; `riddim play` is the engine.
@@ -32,7 +32,7 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 ### Phase 1: hosting spike
 
 #### Added
-- **Workspace** with a pinned toolchain, `cargo-deny` dependency policy, and GitHub Actions for formatting, lints (host and Apple Silicon targets), tests, a third-party plugin run, and an on-request macOS run.
+- **Workspace** with a pinned toolchain, a `cargo-deny` dependency policy, one lean GitHub Actions job (format, lints, tests), and `scripts/ci.sh` for the fuller local run (Apple Silicon type-check, third-party plugins, licences).
 - **`riddim-rt`**: real-time section guard with a counting allocator (`guard`), deferred drop (`garbage`), wait-free SPSC queues (re-exported `rtrb`), denormal flushing, linear smoothing, atomic floats, and allocation-free planar buffer views.
 - **`riddim-plugin`**:
   - The format-agnostic contract: `PluginDescriptor`, `PluginInstance` (control side), `PluginProcessor` (audio side), sample-timestamped events, transport info, opaque versioned `StateBlob`.

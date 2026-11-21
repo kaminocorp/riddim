@@ -4,7 +4,7 @@ Completion notes for phase 2 of the vision (the second row of §5): the engine t
 
 **Where it stands (2026-11-21):** the engine is written and everything that can run without a Mac passes, on a deterministic simulated device. **Nothing here has run on a Mac or on real audio hardware.** The phase's first exit criterion (Phil records a take over an instrument in Whiplash, saves, reopens and hears it identically) cannot be met from here: it needs a Mac, real hardware and Whiplash. A terminal stand-in for that flow exists (`riddim session`) and is what the Mac checklist below asks to be run.
 
-Still true from phase 1: GitHub Actions cannot start jobs on this repository (billing), so the checks are run locally and recorded here; and the commercial plugins have not been bought, so Surge XT stands in for the instrument.
+Still true from phase 1: GitHub Actions could not start jobs on this repository (billing), and CI is deliberately one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded here; and the commercial plugins have not been bought, so Surge XT stands in for the instrument.
 
 ## What was built
 
@@ -26,7 +26,7 @@ Still true from phase 1: GitHub Actions cannot start jobs on this repository (bi
 |---|---|---|
 | 1 | Whiplash v0's exit: Phil records a take over the instrument, saves, reopens and hears it identically | **Not met**, and cannot be from here. What exists: the same flow from a terminal (`riddim session new / record / play / render`), run on Linux with Surge XT through a simulated cable. With deterministic plugins a saved and reopened project renders bit for bit the same (tested). Mac checklist steps 4 to 6 |
 | 2 | Recorded audio lands within ±1 sample of a loopback-calibrated position | **Met in simulation, exactly** (0 samples) for round-trip latencies of 128, 300, 777 and 1024 frames, including punch-in while rolling and after a count-in. On real hardware it depends on the device reporting its latency truthfully; `riddim loopback` measures it. Mac checklist step 2 |
-| 3 | Zero allocations on the audio thread under the CI RealtimeSanitizer run | **Met locally.** The engine, host, I/O and disk test suites pass under RealtimeSanitizer, with a self-check proving the sanitizer is live. Every engine test also asserts zero heap operations on the audio path with our own counting allocator. The CI job exists but has not run (billing) |
+| 3 | Zero allocations on the audio thread under the CI RealtimeSanitizer run | **Met locally.** The engine, host, I/O and disk test suites pass under RealtimeSanitizer, with a self-check proving the sanitizer is live. Every engine test also asserts zero heap operations on the audio path with our own counting allocator. It runs locally as part of `scripts/ci.sh`; it is not a CI job, because Actions minutes are a hard budget (D12) |
 | 4 | Ops round-trip: apply → inverse → apply restores an identical model (property test) | **Met.** 400 random edit histories per run; also checked through the engine |
 | 5 | 60 minutes of continuous recording on 8 tracks with no dropped buffers, and `kill -9` mid-take keeps everything up to the last flush | **Met as far as it can be without a clock.** An hour of timeline on eight tracks, fast-forwarded, loses no frame (172,799,744 frames per track, all accounted for). A recording process killed with `SIGKILL` leaves a readable take holding everything that reached the file. A real-time hour on real disks is Mac checklist step 7 |
 

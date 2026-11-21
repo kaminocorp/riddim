@@ -1,12 +1,22 @@
 name: CI
 
+# GitHub Actions minutes are a hard budget for this organisation, so this is deliberately the
+# only workflow, with one Linux job, and it only runs for pull requests that are ready for
+# review and touch something other than documentation.
+#
+# Everything else is run locally with scripts/ci.sh before pushing: the type-check of the
+# macOS-only code, RealtimeSanitizer, the third-party plugin run and the licence check.
+# Verification on macOS itself is manual (see the checklists in docs/phases/).
+
 on:
   pull_request:
-  push:
-    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
@@ -17,95 +27,19 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  lint:
-    name: fmt + clippy (Linux and macOS targets)
+  check:
+    name: fmt, clippy, test
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      # rust-toolchain.toml pins the toolchain, its components and the macOS target.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # rust-toolchain.toml pins the toolchain and its components.
       - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: lint
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: rustfmt
         run: cargo fmt --all --check
-      - name: clippy (host)
+      - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # macOS-only code (CoreAudio, CoreMIDI, Audio Units, editor windows) cannot be built on
-      # this runner, but it can be type-checked and linted for the Apple Silicon target.
-      - name: clippy (aarch64-apple-darwin, type-check only)
-        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
-
-  test:
-    name: tests (Linux)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test
-      - name: Build
-        run: cargo build --workspace --all-targets
-      - name: Test
+      - name: test
         run: cargo test --workspace
-
-  rtsan:
-    name: RealtimeSanitizer (real-time sections)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: rtsan
-          workspaces: ". -> target/rtsan"
-      # Every real-time section runs as an RTSan context: allocation, locks and blocking system
-      # calls inside one stop the test. A self-check in riddim-rt fails the run if the sanitizer
-      # is not actually active.
-      - name: Tests under RealtimeSanitizer
-        run: scripts/rtsan.sh
-
-  third-party:
-    name: third-party plugins (Surge XT on Linux)
-    runs-on: ubuntu-24.04
-    env:
-      SURGE_VERSION: "1.3.4"
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test
-      - name: Cache Surge XT
-        id: surge
-        uses: actions/cache@v4
-        with:
-          path: ~/thirdparty/surge
-          key: surge-xt-linux-${{ env.SURGE_VERSION }}
-      - name: Download Surge XT
-        if: steps.surge.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/thirdparty/surge
-          curl --fail --location --retry 5 --retry-delay 10 --silent --show-error \
-            --output /tmp/surge.tar.gz \
-            "https://github.com/surge-synthesizer/releases-xt/releases/download/${SURGE_VERSION}/surge-xt-linux-${SURGE_VERSION}-pluginsonly.tar.gz"
-          tar -xzf /tmp/surge.tar.gz -C ~/thirdparty/surge
-      - name: Runtime libraries Surge XT links against
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libasound2t64 libfreetype6 libfontconfig1
-      - name: Conformance run against Surge XT
-        run: |
-          export RIDDIM_TEST_VST3="$HOME/thirdparty/surge/Surge XT.vst3;$HOME/thirdparty/surge/Surge XT Effects.vst3"
-          cargo test -p riddim-plugin --test third_party -- --nocapture
-
-  licenses:
-    name: dependency licences and sources
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: --all-features
