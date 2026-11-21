@@ -1,0 +1,361 @@
+{
+  "loop_enabled": true,
+  "loop_range": {
+    "end": {
+      "beats": 43545600
+    },
+    "start": {
+      "beats": 14515200
+    }
+  },
+  "master": {
+    "automation": [],
+    "clips": [],
+    "events_from": null,
+    "gain": 1.0,
+    "id": 0,
+    "input": {
+      "type": "none"
+    },
+    "invert": false,
+    "kind": "master",
+    "monitor": false,
+    "mute": false,
+    "name": "Master",
+    "output": {
+      "type": "master"
+    },
+    "pan": 0.0,
+    "plugins": [],
+    "record_armed": false,
+    "sends": [],
+    "solo": false
+  },
+  "media": [
+    {
+      "channels": 2,
+      "frames": 480000,
+      "id": 1,
+      "path": "takes/vocal.wav",
+      "sample_rate": 48000
+    }
+  ],
+  "metronome": {
+    "count_in_bars": 2,
+    "enabled": true,
+    "gain": 0.5
+  },
+  "punch_enabled": false,
+  "punch_range": {
+    "end": {
+      "time": 2822400000
+    },
+    "start": {
+      "beats": 29030400
+    }
+  },
+  "schema": 1,
+  "tempo_map": {
+    "meters": [
+      {
+        "at": 0,
+        "meter": {
+          "denominator": 4,
+          "numerator": 4
+        }
+      }
+    ],
+    "tempos": [
+      {
+        "at": 0,
+        "tempo": 141120000
+      },
+      {
+        "at": 58060800,
+        "tempo": 176400000
+      }
+    ]
+  },
+  "tracks": [
+    {
+      "automation": [
+        {
+          "id": 60,
+          "mode": "touch",
+          "points": [
+            {
+              "at": 0,
+              "shape": "linear",
+              "value": 0.0
+            },
+            {
+              "at": 14515200,
+              "shape": "hold",
+              "value": 1.0
+            }
+          ],
+          "target": {
+            "type": "track_gain"
+          }
+        },
+        {
+          "id": 62,
+          "mode": "write",
+          "points": [],
+          "target": {
+            "send": 13,
+            "type": "send_gain"
+          }
+        }
+      ],
+      "clips": [
+        {
+          "content": {
+            "fade_in": 480,
+            "fade_out": 960,
+            "gain": 0.5,
+            "length": 96000,
+            "media": 1,
+            "offset": 96000,
+            "type": "audio"
+          },
+          "id": 11,
+          "muted": false,
+          "name": "Verse",
+          "start": {
+            "time": 282240000
+          },
+          "take": {
+            "group": 500,
+            "number": 2
+          }
+        }
+      ],
+      "events_from": null,
+      "gain": 0.8,
+      "id": 10,
+      "input": {
+        "channels": 2,
+        "first_channel": 0,
+        "type": "audio"
+      },
+      "invert": true,
+      "kind": "audio",
+      "monitor": true,
+      "mute": false,
+      "name": "Lead vocal",
+      "output": {
+        "type": "master"
+      },
+      "pan": -0.25,
+      "plugins": [],
+      "record_armed": true,
+      "sends": [
+        {
+          "gain": 0.25,
+          "id": 13,
+          "mute": false,
+          "pre_fader": true,
+          "target": 40
+        }
+      ],
+      "solo": false
+    },
+    {
+      "automation": [],
+      "clips": [
+        {
+          "content": {
+            "events": [
+              {
+                "at": 0,
+                "data": [
+                  185,
+                  7,
+                  100
+                ],
+                "len": 3
+              }
+            ],
+            "length": 14515200,
+            "notes": [
+              {
+                "channel": 9,
+                "key": 36,
+                "length": 907200,
+                "start": 1814400,
+                "velocity": 110
+              }
+            ],
+            "type": "midi"
+          },
+          "id": 21,
+          "muted": false,
+          "name": "Beat",
+          "start": {
+            "beats": 14515200
+          },
+          "take": null
+        }
+      ],
+      "events_from": null,
+      "gain": 1.0,
+      "id": 20,
+      "input": {
+        "type": "midi"
+      },
+      "invert": false,
+      "kind": "instrument",
+      "monitor": false,
+      "mute": false,
+      "name": "Drums",
+      "output": {
+        "type": "master"
+      },
+      "pan": 0.0,
+      "plugins": [
+        {
+          "bridged": false,
+          "bypass": false,
+          "id": 23,
+          "outputs": [
+            {
+              "bus": 1,
+              "target": 50
+            }
+          ],
+          "plugin": {
+            "format": "vst3",
+            "name": "Drum Sampler",
+            "path": "/Library/Audio/Plug-Ins/VST3/Drum Sampler.vst3",
+            "uid": "00000000000000000000000000000017"
+          },
+          "sidechain": null,
+          "state": "AQID+vv8"
+        }
+      ],
+      "record_armed": false,
+      "sends": [],
+      "solo": false
+    },
+    {
+      "automation": [],
+      "clips": [],
+      "events_from": 20,
+      "gain": 1.0,
+      "id": 30,
+      "input": {
+        "type": "none"
+      },
+      "invert": false,
+      "kind": "instrument",
+      "monitor": false,
+      "mute": false,
+      "name": "Bass",
+      "output": {
+        "type": "master"
+      },
+      "pan": 0.0,
+      "plugins": [],
+      "record_armed": false,
+      "sends": [],
+      "solo": false
+    },
+    {
+      "automation": [],
+      "clips": [],
+      "events_from": null,
+      "gain": 1.0,
+      "id": 50,
+      "input": {
+        "type": "none"
+      },
+      "invert": false,
+      "kind": "bus",
+      "monitor": false,
+      "mute": false,
+      "name": "Drum room",
+      "output": {
+        "id": 40,
+        "type": "bus"
+      },
+      "pan": 0.0,
+      "plugins": [],
+      "record_armed": false,
+      "sends": [],
+      "solo": false
+    },
+    {
+      "automation": [
+        {
+          "id": 61,
+          "mode": "latch",
+          "points": [
+            {
+              "at": 7257600,
+              "shape": "linear",
+              "value": 0.5
+            }
+          ],
+          "target": {
+            "param": 7,
+            "slot": 41,
+            "type": "plugin_param"
+          }
+        }
+      ],
+      "clips": [],
+      "events_from": null,
+      "gain": 1.0,
+      "id": 40,
+      "input": {
+        "type": "none"
+      },
+      "invert": false,
+      "kind": "bus",
+      "monitor": false,
+      "mute": false,
+      "name": "Reverb",
+      "output": {
+        "type": "master"
+      },
+      "pan": 0.0,
+      "plugins": [
+        {
+          "bridged": true,
+          "bypass": false,
+          "id": 42,
+          "outputs": [],
+          "plugin": {
+            "format": "vst3",
+            "name": "Compressor",
+            "path": "/Library/Audio/Plug-Ins/VST3/Compressor.vst3",
+            "uid": "0000000000000000000000000000002A"
+          },
+          "sidechain": {
+            "pre_fader": true,
+            "source": 10
+          },
+          "state": "AQID+vv8"
+        },
+        {
+          "bridged": false,
+          "bypass": true,
+          "id": 41,
+          "outputs": [],
+          "plugin": {
+            "format": "vst3",
+            "name": "Plate",
+            "path": "/Library/Audio/Plug-Ins/VST3/Plate.vst3",
+            "uid": "00000000000000000000000000000029"
+          },
+          "sidechain": null,
+          "state": "CQgH"
+        }
+      ],
+      "record_armed": false,
+      "sends": [],
+      "solo": false
+    }
+  ]
+}

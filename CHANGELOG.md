@@ -6,6 +6,24 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 
 ## [Unreleased]
 
+### v1.x
+
+#### Added
+- **CLAP hosting** on `clack-host`: scanning, instantiation, audio and note ports, parameters, sample-offset events both ways, transport, state, latency, and an editor through the `gui` extension (*the editor is unverified*). `.clap` files are scanned and cached with everything else.
+- **The out-of-process bridge**: a plugin slot marked `bridged` runs in a `riddim-bridge` child process. Shared memory for audio and events, a socket hand-off per block, JSON for everything else. A plugin that crashes or hangs is taken out of the mix (`plugin_crashed`) and the session carries on. Unix only; no editor for bridged plugins yet.
+- **`riddim-render`**: a headless renderer. A model as JSON in, a WAV and a line of JSON out.
+- **A stability policy** ([`docs/api/stability.md`](docs/api/stability.md)) and the checks behind it: golden schema-1 project and ops files that must keep loading with nothing lost. `Event`, `EngineError` and `Status` are marked non-exhaustive.
+- `riddim session new --bridged`; `EngineConfig::bridge_executable`; `RIDDIM_TEST_CLAP` for the third-party tests.
+
+#### Changed
+- A parameter change a plugin makes on its audio side is written into automation when its lane is being written (this is how a CLAP editor's moves arrive).
+
+#### Verified
+- On Linux: Surge XT's CLAP builds pass every step of the conformance run, and the demo song plays, saves, reopens, bounces and reroutes through them; a bridged fixture plugin has the same buses, parameters, state, events and audio (bit for bit) as in process; a project with bridged plugins bounces to the same bytes; a bridged plugin that aborts, and one that hangs, cost only themselves while a timer-driven device keeps running.
+
+#### Not verified
+- Anything on a Mac: CLAP hosting, CLAP editors, and the bridge on macOS have never run. Kontakt bridged at 128 frames (the bridge's first exit criterion) needs Kontakt. See [`docs/phases/v1x.md`](docs/phases/v1x.md).
+
 ### Phase 4: v1
 
 #### Added

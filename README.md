@@ -5,7 +5,7 @@ Riddim is a native audio engine written in Rust. It handles playback, recording,
 **Status:** under construction, phase by phase. See the [changelog](CHANGELOG.md) for what exists, and the per-phase notes in [`docs/phases/`](docs/phases/) for what has actually been run and on what. The design is in the vision: [`docs/visions/riddim.md`](docs/visions/riddim.md). Decisions taken along the way are in [`docs/decisions.md`](docs/decisions.md).
 
 - **Platform:** macOS first (CoreAudio, Apple Silicon); Windows later. Everything platform-neutral also builds and is tested on Linux.
-- **Plugin formats:** AU and VST3 for v1, then CLAP.
+- **Plugin formats:** VST3, AU and CLAP, in process or (opt-in per plugin) each in a process of its own.
 - **Architecture:** real-time safe by design, and deterministic in offline render.
 - **First client:** [Whiplash](https://github.com/hejijunhao/whiplash), through a defined command/query/event API with a C ABI.
 
@@ -19,13 +19,13 @@ Riddim is a native audio engine written in Rust. It handles playback, recording,
 | `crates/riddim-model` | The engine model and the edit ops that change it |
 | `crates/riddim-graph` | Render-plan compilation: order, latency compensation, schedule |
 | `crates/riddim-time` | Integer time: superclock, beat ticks, tempo and meter map |
-| `crates/riddim-plugin` | Plugin hosting: the format-agnostic contract, VST3 and Audio Unit hosts, the out-of-process scanner |
+| `crates/riddim-plugin` | Plugin hosting: the format-agnostic contract, VST3, Audio Unit and CLAP hosts, the out-of-process scanner and bridge |
 | `crates/riddim-io` | Audio and MIDI device I/O |
 | `crates/riddim-disk` | WAV and MIDI files, the capture thread |
 | `crates/riddim-rt` | Real-time building blocks and the guard that tests them |
 | `crates/riddim-cli` | `riddim`, a headless tool for exercising all of the above |
 | `fixtures/` | Test plugins and test support; never shipped |
-| `docs/` | Vision, decisions, per-phase notes, the event reference (`docs/api/events.md`) |
+| `docs/` | Vision, decisions, per-phase notes, the event reference and stability policy (`docs/api/`) |
 
 ## Building
 
@@ -57,7 +57,7 @@ cargo run -p riddim-cli -- session record song.json --punch 4:8      # replace t
 cargo run -p riddim-cli -- session play mix.json --switch-buffer 256 --render-threads 4
 ```
 
-`riddim --help` lists the commands.
+`riddim --help` lists the commands. `riddim-render model.json --out mix.wav` bounces a project with no device or terminal.
 
 ## Licence
 

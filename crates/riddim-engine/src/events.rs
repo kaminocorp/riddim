@@ -15,8 +15,12 @@ pub enum TransportState {
 /// An event from the engine. Subscribe with [`Engine::subscribe`](crate::Engine::subscribe).
 ///
 /// Events serialise as JSON objects tagged with `"event"`, which is how they cross the C ABI.
+///
+/// More kinds of event will be added over time, and existing ones may gain fields: match with
+/// a wildcard arm, and ignore what you do not know.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "event")]
+#[non_exhaustive]
 pub enum Event {
     /// A batch of ops was applied. `inverses` undo it, applied first to last.
     Applied {

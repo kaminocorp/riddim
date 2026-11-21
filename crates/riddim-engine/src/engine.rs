@@ -105,6 +105,7 @@ pub const MIN_BUFFER_FRAMES: u32 = 16;
 pub const MAX_BUFFER_FRAMES: u32 = 4096;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EngineError {
     Device(String),
     Io(std::io::Error),
@@ -126,6 +127,7 @@ impl std::error::Error for EngineError {}
 
 /// A snapshot of what the engine is doing.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Status {
     pub transport: TransportState,
     pub position_samples: i64,

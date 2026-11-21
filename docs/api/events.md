@@ -2,7 +2,7 @@
 
 Everything the engine tells its client. In Rust these are the variants of `riddim::Event`, received from `Engine::subscribe()`. Across the C ABI each is a JSON object returned by `riddim_poll_event`, tagged with `"event"`; the names and fields below are those JSON names. Positions are in samples at the session's sample rate unless a field says otherwise.
 
-One test (`crates/riddim-engine/tests/events.rs`) produces every event that can be staged without a failing disk or device and checks its tag; the three it cannot stage (`xrun`, `recording_overflow`, `plugin_editor_resize`) are checked for their JSON shape, and the first two are produced by other tests.
+One test (`crates/riddim-engine/tests/events.rs`) produces every event that can be staged without a failing disk, device or plugin process and checks its tag. Of the rest, `xrun`, `recording_overflow` and `plugin_editor_resize` are checked there for their JSON shape; `recording_overflow`, `playback_starved` under a slow disk and `plugin_crashed` are produced by the stress, streaming and bridge tests; `plugin_editor_resize` has never been produced, because no test plugin has an editor.
 
 Events arrive in the order the engine sent them. The periodic ones are not sent while nobody is subscribed.
 
@@ -34,6 +34,7 @@ Events arrive in the order the engine sent them. The periodic ones are not sent 
 |---|---|---|
 | `plugin_loaded` | `track`, `slot`, `latency`, `parameters` | A plugin finished loading and is in the mix |
 | `plugin_failed` | `track`, `slot`, `error` | A plugin could not be loaded (or restarted). Its slot stays in the model, state and all; the track plays without it |
+| `plugin_crashed` | `track`, `slot` | A plugin running in a process of its own (a bridged slot) crashed or stopped answering. It is out of the mix and the session carries on; removing the slot and inserting it again starts a fresh one |
 | `plugin_restarted` | `track`, `slot`, `latency` | A loaded plugin was taken out of the mix for a moment and activated again: its outputs or sidechain were routed, the buffer size changed, or it asked for it. Its settings are intact |
 | `plugin_param` | `slot`, `id`, `value` | A parameter changed from the plugin's editor or by the plugin itself (normalised 0 to 1) |
 | `plugin_gesture` | `slot`, `id`, `down` | A control in the plugin's editor was grabbed or let go. (This is also what starts and ends touch automation for it) |
@@ -62,4 +63,4 @@ Not everything is an event. `Engine::status()` (`riddim_status`) is a snapshot t
 
 ## Stability
 
-The C ABI is version 0 (`riddim_abi_version`) and may still change. What is meant to hold from here on: event names and the meaning of existing fields do not change; events and fields may be added, so a client should ignore what it does not know.
+The C ABI is version 0 (`riddim_abi_version`) and may still change. What is meant to hold from a 1.0 on: event names and the meaning of existing fields do not change; events and fields may be added, so a client should ignore what it does not know. See [`stability.md`](stability.md).
