@@ -7,7 +7,7 @@ Completion notes for phase 1 of the vision (§4.5 and the first row of §5).
 Two things changed the target during the phase:
 
 - Phil has not bought the four commercial plugins yet (his note of 2026-11-21). The phase was built and tested against **free plugins** instead: Riddim's own test plugins, Surge XT 1.3.4, and (once a Mac runs them) Apple's built-in Audio Units. Wherever the vision says "Kontakt/Noire", read "Surge XT" for now.
-- **GitHub Actions cannot start any job on this repository**: every job ends at once with "recent account payments have failed or your spending limit needs to be increased". The workflows are in place and correct as far as can be told without running them; until billing is sorted, the same checks are run locally with `scripts/ci.sh` and the results are recorded here. This also means the macOS workflow, which would have run the Audio Unit host against Apple's units on a real Mac, has not run.
+- **GitHub Actions could not start any job on this repository** when the phase was done: every job ended at once with "recent account payments have failed or your spending limit needs to be increased". CI is also deliberately small (one Linux job; Actions minutes are a hard budget, see decision D12) and never runs on macOS. So the checks are run locally with `scripts/ci.sh` and the results are recorded here, and the Audio Unit host, the editor windows and the CoreAudio code have not run anywhere yet: that is what the Mac checklist below is for.
 
 ## What was built
 
