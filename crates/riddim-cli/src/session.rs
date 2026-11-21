@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use riddim::files::wav::{self, SampleFormat};
 use riddim::files::AudioData;
 use riddim::model::{
-    Clip, ClipContent, ClipId, LoopRange, Metronome, Model, Note, Op, PluginSlot, SlotId, Track,
-    TrackChange, TrackId, TrackInput, TrackKind,
+    AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Clip, ClipContent, ClipId,
+    CurveShape, LaneId, LoopRange, Metronome, Model, Note, Op, PluginSlot, Send, SendId, SlotId,
+    Track, TrackChange, TrackId, TrackInput, TrackKind,
 };
 use riddim::plugins::{plugin_ref, PluginDescriptor};
 use riddim::time::{Position, Ticks};
@@ -28,6 +29,12 @@ pub const INSTRUMENT_TRACK: TrackId = TrackId(1);
 pub const INSTRUMENT_SLOT: SlotId = SlotId(2);
 pub const INSTRUMENT_CLIP: ClipId = ClipId(3);
 pub const AUDIO_TRACK: TrackId = TrackId(4);
+pub const EFFECT_BUS: TrackId = TrackId(1000);
+pub const EFFECT_SLOT: SlotId = SlotId(1001);
+pub const EFFECT_SEND: SendId = SendId(1002);
+pub const FADE_LANE: LaneId = LaneId(1003);
+/// Insert effects on the instrument track are numbered from here.
+pub const INSERT_SLOT: SlotId = SlotId(1010);
 
 /// Where the audio comes from and goes to.
 #[derive(Clone, Copy, Debug)]
@@ -339,38 +346,38 @@ pub fn fingerprint(audio: &[Vec<f32>]) -> u64 {
     hash
 }
 
-/// Renders `seconds` of a model offline (as fast as the machine goes) and returns the audio.
-pub fn render_model(
-    model: Model,
-    dir: &Path,
+/// Bounces `seconds` of a model offline to `out` and returns a description of the result.
+#[allow(clippy::too_many_arguments)]
+pub fn bounce_model(
+    model: &Model,
+    media: &Path,
+    out: &Path,
     rate: f64,
     buffer: u32,
     seconds: f64,
-) -> Result<Vec<Vec<f32>>, String> {
-    let device = DeviceOptions {
-        rate,
-        buffer,
-        null_device: true,
-        loopback: None,
-        capture: false,
+    tail_seconds: f64,
+    tracks: Option<Vec<TrackId>>,
+) -> Result<(riddim::BounceResult, u64), String> {
+    let request = riddim::BounceRequest {
+        path: out.to_path_buf(),
+        start: Position::START,
+        end: Position::Time(riddim::time::samples_to_superclock(
+            (seconds * rate) as i64,
+            rate as u32,
+        )),
+        tail_seconds,
+        sample_rate: rate as u32,
+        block_frames: buffer,
+        format: SampleFormat::Float32,
+        media_dir: media.to_path_buf(),
+        tracks,
     };
-    let mut running = Running::start(device.config(true), dir, false)?;
-    running.engine.load(model)?;
-    running.settle()?;
-    running
-        .engine
-        .transport(TransportCommand::Locate(Position::START));
-    running.engine.transport(TransportCommand::Play);
-    running.engine.sync();
-    let audio = running.engine.run((seconds * rate) as usize);
-    let status = running.engine.status();
-    if status.rt_violations > 0 {
-        eprintln!(
-            "warning: {} heap operation(s) on the audio path",
-            status.rt_violations
-        );
+    let result = riddim::bounce(model, &request)?;
+    for missing in &result.missing_plugins {
+        eprintln!("warning: rendered without a plugin: {missing}");
     }
-    Ok(audio)
+    let audio = wav::read(out).map_err(|e| e.to_string())?;
+    Ok((result, fingerprint(&audio.channels)))
 }
 
 fn write_wav(path: &Path, rate: f64, audio: Vec<Vec<f32>>) -> Result<(), String> {
@@ -407,21 +414,26 @@ pub fn render(context: &Context, spec: &str, options: RenderOptions) -> CommandR
             looped,
         )?)
         .map_err(|(_, e)| e.to_string())?;
-    let dir = std::env::temp_dir().join(format!("riddim-render-{}", std::process::id()));
-    let audio = render_model(model, &dir, options.rate, options.buffer, options.seconds)?;
-    let _ = std::fs::remove_dir_all(&dir);
-    let peak = audio.iter().flatten().fold(0.0f32, |m, s| m.max(s.abs()));
-    let print = fingerprint(&audio);
-    write_wav(&options.out, options.rate, audio)?;
+    let media = std::env::temp_dir();
+    let (result, print) = bounce_model(
+        &model,
+        &media,
+        &options.out,
+        options.rate,
+        options.buffer,
+        options.seconds,
+        0.0,
+        None,
+    )?;
     println!(
         "rendered {:.2} s of {} to {} (peak {:.4}, fingerprint {:016x})",
         options.seconds,
         descriptor.name,
         options.out.display(),
-        peak,
+        result.peak,
         print
     );
-    Ok(peak > 0.0)
+    Ok(result.peak > 0.0 && result.missing_plugins.is_empty())
 }
 
 pub struct PlayOptions {
@@ -609,6 +621,12 @@ pub struct NewOptions {
     /// How many armed audio tracks to create on that input.
     pub audio_tracks: u8,
     pub count_in: u8,
+    /// Effects to insert on the instrument track, in order.
+    pub inserts: Vec<String>,
+    /// An effect to put on a bus of its own, fed by a send from the instrument track.
+    pub send_effect: Option<String>,
+    /// Automate the instrument's fader from silence to full over this many beats.
+    pub fade_in: Option<u32>,
 }
 
 /// `riddim session new`: writes a project with an instrument track and an armed audio track.
@@ -630,6 +648,76 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
         apply(
             &mut model,
             instrument_ops(&descriptor, None, &material, false)?,
+        )?;
+    }
+    let effect_slot = |id: SlotId, spec: &str| -> Result<PluginSlot, String> {
+        Ok(PluginSlot {
+            id,
+            plugin: plugin_ref(&context.resolve(spec)?),
+            state: None,
+            bypass: false,
+        })
+    };
+    let wants_mixing =
+        !options.inserts.is_empty() || options.send_effect.is_some() || options.fade_in.is_some();
+    if wants_mixing && options.instrument.is_none() {
+        return Err("--insert, --send-effect and --fade-in need an --instrument track".into());
+    }
+    for (n, spec) in options.inserts.iter().enumerate() {
+        apply(
+            &mut model,
+            vec![Op::InsertPlugin {
+                track: INSTRUMENT_TRACK,
+                index: n + 1,
+                slot: effect_slot(SlotId(INSERT_SLOT.0 + n as u64), spec)?,
+            }],
+        )?;
+    }
+    if let Some(spec) = &options.send_effect {
+        let index = model.tracks.len();
+        apply(
+            &mut model,
+            vec![
+                Op::AddTrack {
+                    index,
+                    track: Track::new(EFFECT_BUS, "Effect return", TrackKind::Bus),
+                },
+                Op::InsertPlugin {
+                    track: EFFECT_BUS,
+                    index: 0,
+                    slot: effect_slot(EFFECT_SLOT, spec)?,
+                },
+                Op::AddSend {
+                    track: INSTRUMENT_TRACK,
+                    index: 0,
+                    send: Send {
+                        id: EFFECT_SEND,
+                        target: EFFECT_BUS,
+                        gain: 0.5,
+                        pre_fader: false,
+                        mute: false,
+                    },
+                },
+            ],
+        )?;
+    }
+    if let Some(beats) = options.fade_in.filter(|beats| *beats > 0) {
+        let point = |beat: i64, value: f32| AutomationPoint {
+            at: Ticks::from_beats(beat),
+            value,
+            shape: CurveShape::Linear,
+        };
+        apply(
+            &mut model,
+            vec![Op::AddLane {
+                track: INSTRUMENT_TRACK,
+                lane: AutomationLane {
+                    id: FADE_LANE,
+                    target: AutomationTarget::TrackGain,
+                    mode: AutomationMode::Read,
+                    points: std::sync::Arc::new(vec![point(0, 0.0), point(beats as i64, 1.0)]),
+                },
+            }],
         )?;
     }
     if let Some((first_channel, channels)) = options.audio_input {
@@ -709,6 +797,25 @@ pub fn session_info(project: &Path) -> CommandResult {
                     .map_or(String::new(), |s| format!(", {} bytes of state", s.len()))
             );
         }
+        for send in &track.sends {
+            println!(
+                "      send {} to track {} at gain {:.2} ({}-fader){}",
+                send.id.0,
+                send.target.0,
+                send.gain,
+                if send.pre_fader { "pre" } else { "post" },
+                if send.mute { ", muted" } else { "" }
+            );
+        }
+        for lane in &track.automation {
+            println!(
+                "      automation {} of {:?}: {} point(s), {:?}",
+                lane.id.0,
+                lane.target,
+                lane.points.len(),
+                lane.mode
+            );
+        }
         for clip in &track.clips {
             match &clip.content {
                 ClipContent::Audio { media, length, .. } => {
@@ -733,6 +840,7 @@ pub fn session_play(
     device: DeviceOptions,
     seconds: Option<f64>,
     editor: bool,
+    save: bool,
 ) -> CommandResult {
     let model = load_project(project)?;
     crate::ui::init()?;
@@ -754,6 +862,15 @@ pub fn session_play(
     };
     interact(&mut running, seconds, window, |_| {});
     running.engine.transport(TransportCommand::Stop);
+    if save {
+        // What was changed in the plugins' editors lives only in the plugins until now.
+        running.capture_states()?;
+        save_project(project, &running.engine.model())?;
+        println!(
+            "saved {} with the plugins' current settings",
+            project.display()
+        );
+    }
     Ok(print_summary(&running))
 }
 
@@ -845,24 +962,53 @@ pub fn session_record(
     Ok(print_summary(&running) && takes > 0)
 }
 
+pub struct SessionRenderOptions {
+    pub out: PathBuf,
+    pub seconds: f64,
+    pub rate: f64,
+    pub buffer: u32,
+    /// Extra time after the end, for reverb and release tails.
+    pub tail: f64,
+    /// Render only these tracks (a stem). Empty: the whole mix.
+    pub stem: Vec<u64>,
+}
+
 /// `riddim session render`: the project, offline, to a WAV, with a fingerprint of the audio.
-pub fn session_render(
-    project: &Path,
-    out: &Path,
-    seconds: f64,
-    rate: f64,
-    buffer: u32,
-) -> CommandResult {
+pub fn session_render(project: &Path, options: SessionRenderOptions) -> CommandResult {
     let model = load_project(project)?;
-    let audio = render_model(model, &media_dir(project), rate, buffer, seconds)?;
-    let peak = audio.iter().flatten().fold(0.0f32, |m, s| m.max(s.abs()));
-    let print = fingerprint(&audio);
-    write_wav(out, rate, audio)?;
+    for id in &options.stem {
+        if model.track(TrackId(*id)).is_none() {
+            return Err(format!("the project has no track {id}"));
+        }
+    }
+    let tracks = (!options.stem.is_empty()).then(|| {
+        options
+            .stem
+            .iter()
+            .map(|id| TrackId(*id))
+            .collect::<Vec<_>>()
+    });
+    let what = match &tracks {
+        Some(tracks) => format!("a stem of {} track(s)", tracks.len()),
+        None => "the mix".to_string(),
+    };
+    let (result, print) = bounce_model(
+        &model,
+        &media_dir(project),
+        &options.out,
+        options.rate,
+        options.buffer,
+        options.seconds,
+        options.tail,
+        tracks,
+    )?;
     println!(
-        "rendered {seconds:.2} s to {} (peak {peak:.4}, fingerprint {print:016x})",
-        out.display()
+        "rendered {:.2} s of {what} to {} (peak {:.4}, fingerprint {print:016x})",
+        result.frames as f64 / options.rate,
+        options.out.display(),
+        result.peak
     );
-    Ok(true)
+    Ok(result.missing_plugins.is_empty())
 }
 
 /// `riddim loopback`: measures where recorded audio lands relative to where it was played.

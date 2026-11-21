@@ -2,37 +2,73 @@
 
 use std::path::{Path, PathBuf};
 
-use riddim_plugin::scan::{default_targets, ScanOutcome, ScanTarget, Scanner};
+use riddim_plugin::scan::{default_targets, ScanCache, ScanOutcome, ScanTarget, Scanner};
 use riddim_plugin::{PluginDescriptor, PluginFormat, PluginId, PluginKind};
 
-/// Scans one bundle out of process.
-pub fn scan_bundle(scanner: &Scanner, path: &Path) -> Result<Vec<PluginDescriptor>, String> {
-    let target = ScanTarget {
-        format: PluginFormat::Vst3,
-        path: Some(path.to_path_buf()),
-    };
-    match scanner.scan(&target) {
-        ScanOutcome::Ok(plugins) => Ok(plugins),
-        ScanOutcome::Failed(why) => Err(format!("{}: {why}", path.display())),
-        ScanOutcome::Crashed(why) => {
-            Err(format!("{}: the scanner crashed ({why})", path.display()))
+/// Scans `targets` through the on-disk cache, reporting what did not scan on stderr.
+///
+/// Bundles that have not changed since the last run are not loaded again, and bundles on the
+/// blocklist are not touched. `rescan` ignores what is cached (and gives blocked bundles another
+/// chance).
+pub fn scan_targets(
+    scanner: &Scanner,
+    targets: &[ScanTarget],
+    rescan: bool,
+) -> Vec<PluginDescriptor> {
+    let cache_file = ScanCache::default_path();
+    let mut cache = ScanCache::load(&cache_file);
+    if rescan {
+        for target in targets {
+            if let Some(path) = &target.path {
+                cache.forget(path);
+            }
         }
-        ScanOutcome::TimedOut => Err(format!("{}: the scanner timed out", path.display())),
     }
-}
-
-/// Scans everything in the default locations plus `extra_dirs`, reporting failures on stderr.
-pub fn scan_everything(scanner: &Scanner, extra_dirs: &[PathBuf]) -> Vec<PluginDescriptor> {
-    let targets = default_targets(extra_dirs);
-    let report = scanner.scan_all(&targets, |_, _| {});
+    let report = scanner.scan_cached(targets, &mut cache, Some(&cache_file), |_, _, _| {});
+    if let Err(error) = cache.save(&cache_file) {
+        eprintln!(
+            "warning: could not save the scan cache to {}: {error}",
+            cache_file.display()
+        );
+    }
     for (target, outcome) in &report.failures {
         let what = target
             .path
             .as_ref()
             .map_or_else(|| target.format.to_string(), |p| p.display().to_string());
-        eprintln!("warning: {what} did not scan: {outcome:?}");
+        let why = match outcome {
+            ScanOutcome::Failed(why) => why.clone(),
+            ScanOutcome::Crashed(why) => format!("the scanner crashed ({why})"),
+            ScanOutcome::TimedOut => "the scanner timed out".to_string(),
+            ScanOutcome::Ok(_) => continue,
+        };
+        eprintln!("warning: {what} did not scan: {why}");
     }
     report.plugins
+}
+
+/// Scans one bundle (out of process, or from the cache).
+pub fn scan_bundle(scanner: &Scanner, path: &Path) -> Result<Vec<PluginDescriptor>, String> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let target = ScanTarget {
+        format: PluginFormat::Vst3,
+        path: Some(path.clone()),
+    };
+    let plugins = scan_targets(scanner, &[target], false);
+    if plugins.is_empty() {
+        Err(format!("{} has no usable plugins", path.display()))
+    } else {
+        Ok(plugins)
+    }
+}
+
+/// Scans everything in the default locations plus `extra_dirs`.
+pub fn scan_everything(
+    scanner: &Scanner,
+    extra_dirs: &[PathBuf],
+    rescan: bool,
+) -> Vec<PluginDescriptor> {
+    scan_targets(scanner, &default_targets(extra_dirs), rescan)
 }
 
 /// Finds the plugin the user means.
@@ -72,13 +108,13 @@ pub fn resolve(
                 path: None,
             });
         }
-        return scan_everything(scanner, extra_dirs)
+        return scan_everything(scanner, extra_dirs, false)
             .into_iter()
             .find(|d| d.id == id)
             .ok_or_else(|| format!("no installed plugin has the id {id}"));
     }
 
-    pick_one(scan_everything(scanner, extra_dirs), spec, spec)
+    pick_one(scan_everything(scanner, extra_dirs, false), spec, spec)
 }
 
 fn pick_one(

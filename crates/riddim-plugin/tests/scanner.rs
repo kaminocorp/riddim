@@ -146,7 +146,8 @@ fn the_cache_spares_good_bundles_and_blocklists_bad_ones() {
     // Second run, from the file, with a scanner that cannot possibly run: nothing is probed,
     // and the answers are the same. That is the cache doing all the work.
     let mut reloaded = ScanCache::load(&cache_file);
-    assert_eq!(reloaded, cache);
+    assert_eq!(reloaded.len(), cache.len());
+    assert_eq!(reloaded.blocked(), cache.blocked());
     let no_scanner = Scanner::new("/nonexistent/riddim-scan");
     let mut from_cache = Vec::new();
     let report = no_scanner.scan_cached(&targets, &mut reloaded, None, |_, _, cached| {
@@ -195,37 +196,94 @@ fn the_cache_spares_good_bundles_and_blocklists_bad_ones() {
 }
 
 #[test]
-fn a_scan_interrupted_by_the_host_dying_leaves_the_culprit_blocked() {
-    // The pedal: the cache file is written *before* a bundle is probed, with that bundle
-    // marked as blocked. Simulate the host being killed mid-scan by reading the file the
-    // progress callback sees right after the probe of the first bundle started... which is
-    // exactly the state on disk while the second is being probed.
-    let dir = std::env::temp_dir().join(format!("riddim-scan-pedal-{}", std::process::id()));
+fn a_host_that_dies_mid_scan_leaves_the_culprit_blocked() {
+    let dir = std::env::temp_dir().join(format!("riddim-scan-mark-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let cache_file = dir.join("cache.json");
     let hang = scanner()
         .with_env("RIDDIM_CRASHPLUG_MODE", "hang")
         .with_timeout(Duration::from_millis(1500));
-    let targets = [vst3(crashplug_bundle())];
+    let bundle = crashplug_bundle();
+    let targets = [vst3(bundle.clone())];
 
+    // While the scanner hangs, the file on disk already says who is probing the bundle.
     let file = cache_file.clone();
     let watcher = std::thread::spawn(move || {
-        // While the scanner hangs, the file on disk already blames the bundle.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let cache = ScanCache::load(&file);
-            if let Some((_, reason)) = cache.blocked().first() {
-                return reason.clone();
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            if text.contains("\"probing\"") {
+                return text;
             }
-            assert!(Instant::now() < deadline, "the pedal was never written");
+            assert!(Instant::now() < deadline, "the mark was never written");
             std::thread::sleep(Duration::from_millis(20));
         }
     });
     let mut cache = ScanCache::new();
     hang.scan_cached(&targets, &mut cache, Some(&cache_file), |_, _, _| {});
-    assert_eq!(watcher.join().unwrap(), "the scan did not finish");
-    // Once the scan does come back (timed out), the reason is the real one.
+    let during = watcher.join().unwrap();
+    let mine = format!("\"pid\": {}", std::process::id());
+    assert!(during.contains(&mine), "{during}");
+
+    // The mark of a live process (this one) blocks nothing: another host running at the same
+    // time just scans the bundle itself.
+    let marked = dir.join("during.json");
+    std::fs::write(&marked, &during).unwrap();
+    let live = ScanCache::load(&marked);
+    assert!(live.lookup(&bundle).is_none());
+    assert!(live.blocked().is_empty());
+
+    // The same mark from a process that no longer exists is a blocked bundle. (Process ids
+    // stop well short of this one on every system we run on.)
+    std::fs::write(&marked, during.replace(&mine, "\"pid\": 2147483646")).unwrap();
+    let mut dead = ScanCache::load(&marked);
+    let blocked = dead.blocked();
+    assert_eq!(blocked.len(), 1);
+    assert!(blocked[0].1.contains("did not finish"), "{}", blocked[0].1);
+    let no_scanner = Scanner::new("/nonexistent/riddim-scan");
+    let mut from_cache = Vec::new();
+    let report = no_scanner.scan_cached(&targets, &mut dead, None, |_, _, cached| {
+        from_cache.push(cached)
+    });
+    assert_eq!(
+        from_cache,
+        vec![true],
+        "the orphaned bundle must not be probed"
+    );
+    assert_eq!(report.failures.len(), 1);
+
+    // Once the scan does come back (timed out), the reason on disk is the real one.
     assert!(ScanCache::load(&cache_file).blocked()[0].1.contains("hung"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn two_hosts_saving_the_same_cache_keep_each_others_results() {
+    let dir = std::env::temp_dir().join(format!("riddim-scan-merge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cache_file = dir.join("cache.json");
+    let good = [vst3(testplug_bundle())];
+    let bad = [vst3(crashplug_bundle())];
+
+    // Both start from the same (empty) file, then each scans something different and saves.
+    let mut first = ScanCache::load(&cache_file);
+    let mut second = ScanCache::load(&cache_file);
+    scanner().scan_cached(&good, &mut first, Some(&cache_file), |_, _, _| {});
+    scanner().scan_cached(&bad, &mut second, Some(&cache_file), |_, _, _| {});
+    let merged = ScanCache::load(&cache_file);
+    assert_eq!(
+        merged.len(),
+        2,
+        "the second save must not drop what the first one wrote"
+    );
+    assert!(merged.lookup(&testplug_bundle()).is_some());
+
+    // But something deliberately forgotten stays forgotten through a save.
+    let mut third = ScanCache::load(&cache_file);
+    assert!(third.forget(&crashplug_bundle()));
+    third.save(&cache_file).unwrap();
+    assert_eq!(ScanCache::load(&cache_file).len(), 1);
     std::fs::remove_dir_all(&dir).ok();
 }

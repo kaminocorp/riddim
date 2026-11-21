@@ -128,6 +128,33 @@ uint64_t riddim_load_model(struct RiddimEngine *engine, const char *model_json);
 // main thread keeps pumping, or the plugins cannot answer.
 int32_t riddim_capture_plugin_states(struct RiddimEngine *engine);
 
+// Tells the engine that a control is being held (`down` = 1) or was released (0). This is
+// what drives touch and latch automation for faders, pans and sends. `target_json` names the
+// control the way automation lanes do, for example `{"type":"track_gain"}` or
+// `{"type":"send_gain","send":3}`. Returns 1 on success.
+int32_t riddim_touch(struct RiddimEngine *engine,
+                     uint64_t track,
+                     const char *target_json,
+                     int32_t down);
+
+// Renders a model to a WAV file, offline, and returns a JSON description of the result (the
+// caller frees it), or NULL on failure.
+//
+// `model_json` is a whole model, as `riddim_model_json` returns it; call
+// `riddim_capture_plugin_states` first so that it carries the plugins' current settings.
+// `request_json` says what to render:
+//
+// ```json
+// { "path": "/tmp/mix.wav", "media_dir": "/path/to/project/media",
+//   "start": {"beats": 0}, "end": {"beats": 58060800},
+//   "tail_seconds": 2.0, "sample_rate": 48000, "block_frames": 512,
+//   "format": "float32", "tracks": null }
+// ```
+//
+// The bounce runs in an engine of its own with its own plugin instances, independent of any
+// live engine, and this call blocks until it is finished: call it from a worker thread.
+char *riddim_bounce(const char *model_json, const char *request_json);
+
 // The next pending event as JSON, or NULL if there is none. The caller frees the string.
 // Call it until it returns NULL, a few dozen times a second.
 char *riddim_poll_event(struct RiddimEngine *engine);

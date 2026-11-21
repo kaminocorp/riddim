@@ -106,6 +106,30 @@ int main(int argc, char **argv) {
     CHECK(93, riddim_play_note(engine, 7, 0, 60, 1.0f) == 1);
     CHECK(94, riddim_status(NULL, &status) == 0);
 
+    /* Touching a fader: valid targets are accepted, nonsense is refused. */
+    CHECK(95, riddim_touch(engine, 7, "{\"type\":\"track_gain\"}", 1) == 1);
+    CHECK(96, riddim_touch(engine, 7, "{\"type\":\"track_gain\"}", 0) == 1);
+    CHECK(97, riddim_touch(engine, 7, "{\"type\":\"volume\"}", 1) == 0);
+    CHECK(98, strlen(riddim_last_error()) > 0);
+
+    /* Bounce one second of the project to a file, offline, in an engine of its own. */
+    char *project = riddim_model_json(engine);
+    CHECK(100, project != NULL);
+    char request[1024];
+    snprintf(request, sizeof request,
+             "{\"path\":\"%s/bounce.wav\",\"media_dir\":\"%s\",\"end\":{\"time\":282240000},"
+             "\"sample_rate\":48000,\"block_frames\":256}",
+             argv[1], argv[1]);
+    char *bounced = riddim_bounce(project, request);
+    CHECK(101, bounced != NULL);
+    CHECK(102, strstr(bounced, "\"frames\":48000") != NULL);
+    CHECK(103, strstr(bounced, "\"missing_plugins\":[]") != NULL);
+    riddim_string_free(bounced);
+    CHECK(104, riddim_bounce(project, "{\"path\":\"x.wav\"}") == NULL);
+    CHECK(105, strstr(riddim_last_error(), "bounce request") != NULL);
+    CHECK(106, riddim_bounce(NULL, request) == NULL);
+    riddim_string_free(project);
+
     riddim_engine_free(engine);
     riddim_engine_free(NULL);
     riddim_string_free(NULL);

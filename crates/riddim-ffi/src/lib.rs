@@ -17,12 +17,13 @@ use std::ptr;
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
-use riddim::model::{Model, Op, SlotId, TrackId};
+use riddim::files::wav::SampleFormat;
+use riddim::model::{AutomationTarget, Model, Op, SlotId, TrackId};
 use riddim::plugins::EventBody;
 use riddim::time::{samples_to_superclock, Position};
 use riddim::{
-    DeviceConfig, Engine, EngineConfig, Event, MainThread, MainThreadMode, NullConfig,
-    TransportCommand, TransportState,
+    BounceRequest, DeviceConfig, Engine, EngineConfig, Event, MainThread, MainThreadMode,
+    NullConfig, TransportCommand, TransportState,
 };
 use serde::Deserialize;
 
@@ -433,6 +434,144 @@ pub unsafe extern "C" fn riddim_capture_plugin_states(engine: *mut RiddimEngine)
         Err(message) => {
             set_error(message);
             0
+        }
+    }
+}
+
+/// Tells the engine that a control is being held (`down` = 1) or was released (0). This is
+/// what drives touch and latch automation for faders, pans and sends. `target_json` names the
+/// control the way automation lanes do, for example `{"type":"track_gain"}` or
+/// `{"type":"send_gain","send":3}`. Returns 1 on success.
+#[no_mangle]
+pub unsafe extern "C" fn riddim_touch(
+    engine: *mut RiddimEngine,
+    track: u64,
+    target_json: *const c_char,
+    down: i32,
+) -> i32 {
+    clear_error();
+    let Some(handle) = (unsafe { handle(engine) }) else {
+        return 0;
+    };
+    let target = unsafe { text(target_json, "the target") }.and_then(|json| {
+        serde_json::from_str::<AutomationTarget>(json)
+            .map_err(|e| format!("the target is not valid: {e}"))
+    });
+    match target {
+        Ok(target) => {
+            handle
+                .engine
+                .lock()
+                .unwrap()
+                .touch(TrackId(track), target, down != 0);
+            1
+        }
+        Err(message) => {
+            set_error(message);
+            0
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BounceSpec {
+    /// The WAV file to write.
+    path: PathBuf,
+    #[serde(default = "start_position")]
+    start: Position,
+    end: Position,
+    #[serde(default)]
+    tail_seconds: f64,
+    #[serde(default = "default_rate")]
+    sample_rate: f64,
+    #[serde(default = "default_bounce_block")]
+    block_frames: u32,
+    /// "float32" (the default), "pcm24" or "pcm16".
+    #[serde(default = "default_format")]
+    format: String,
+    /// Where relative media paths in the model are relative to.
+    media_dir: PathBuf,
+    /// Track ids to render as a stem. Absent or null: the whole mix.
+    #[serde(default)]
+    tracks: Option<Vec<TrackId>>,
+}
+
+fn start_position() -> Position {
+    Position::START
+}
+fn default_bounce_block() -> u32 {
+    512
+}
+fn default_format() -> String {
+    "float32".into()
+}
+
+fn run_bounce(model_json: &str, request_json: &str) -> Result<String, String> {
+    let model = Model::from_json(model_json)?;
+    let spec: BounceSpec = serde_json::from_str(request_json)
+        .map_err(|e| format!("the bounce request is not valid: {e}"))?;
+    let format = match spec.format.as_str() {
+        "float32" => SampleFormat::Float32,
+        "pcm24" => SampleFormat::Pcm24,
+        "pcm16" => SampleFormat::Pcm16,
+        other => return Err(format!("unknown sample format '{other}'")),
+    };
+    let result = riddim::bounce(
+        &model,
+        &BounceRequest {
+            path: spec.path,
+            start: spec.start,
+            end: spec.end,
+            tail_seconds: spec.tail_seconds,
+            sample_rate: spec.sample_rate as u32,
+            block_frames: spec.block_frames,
+            format,
+            media_dir: spec.media_dir,
+            tracks: spec.tracks,
+        },
+    )?;
+    Ok(serde_json::json!({
+        "path": result.path,
+        "frames": result.frames,
+        "peak": result.peak,
+        "latency_trimmed": result.latency_trimmed,
+        "missing_plugins": result.missing_plugins,
+    })
+    .to_string())
+}
+
+/// Renders a model to a WAV file, offline, and returns a JSON description of the result (the
+/// caller frees it), or NULL on failure.
+///
+/// `model_json` is a whole model, as `riddim_model_json` returns it; call
+/// `riddim_capture_plugin_states` first so that it carries the plugins' current settings.
+/// `request_json` says what to render:
+///
+/// ```json
+/// { "path": "/tmp/mix.wav", "media_dir": "/path/to/project/media",
+///   "start": {"beats": 0}, "end": {"beats": 58060800},
+///   "tail_seconds": 2.0, "sample_rate": 48000, "block_frames": 512,
+///   "format": "float32", "tracks": null }
+/// ```
+///
+/// The bounce runs in an engine of its own with its own plugin instances, independent of any
+/// live engine, and this call blocks until it is finished: call it from a worker thread.
+#[no_mangle]
+pub unsafe extern "C" fn riddim_bounce(
+    model_json: *const c_char,
+    request_json: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let result = unsafe { text(model_json, "the model") }.and_then(|model| {
+        unsafe { text(request_json, "the bounce request") }
+            .and_then(|request| run_bounce(model, request))
+    });
+    match result {
+        Ok(json) => owned(json),
+        Err(message) => {
+            set_error(message);
+            ptr::null_mut()
         }
     }
 }

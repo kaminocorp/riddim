@@ -350,6 +350,37 @@ pub enum CachedOutcome {
     Blocked {
         reason: String,
     },
+    /// A host process started probing the bundle and has not reported back. While that
+    /// process is alive this means nothing (it may be mid-scan); once it is gone, the bundle
+    /// took its host down with it and counts as blocked.
+    Probing {
+        pid: u32,
+    },
+}
+
+/// The reason given for a bundle whose probe never came back.
+const UNFINISHED: &str = "the scan did not finish (the host exited while probing it)";
+
+/// Whether a process with this id exists.
+fn process_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const ESRCH: i32 = 3;
+        // SAFETY: signal 0 delivers nothing; it only asks whether the process can be signalled.
+        let result = unsafe { kill(pid as i32, 0) };
+        // A failure other than "no such process" (not permitted, say) still means it exists.
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,11 +394,20 @@ struct CacheEntry {
 ///
 /// Keyed by bundle path. An entry is only trusted while the bundle's [`FileStamp`] is
 /// unchanged, so installing an update gets a plugin rescanned (and a blocked one retried).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanCache {
     version: u32,
     #[serde(default)]
     entries: std::collections::BTreeMap<String, CacheEntry>,
+    /// Bundles this process took out of the cache, so merging on save does not bring them back.
+    #[serde(skip)]
+    forgotten: std::collections::BTreeSet<String>,
+}
+
+impl Default for ScanCache {
+    fn default() -> ScanCache {
+        ScanCache::new()
+    }
 }
 
 impl ScanCache {
@@ -375,6 +415,7 @@ impl ScanCache {
         ScanCache {
             version: CACHE_VERSION,
             entries: Default::default(),
+            forgotten: Default::default(),
         }
     }
 
@@ -397,17 +438,31 @@ impl ScanCache {
         base.join("riddim").join("plugin-scan.json")
     }
 
-    /// Reads a cache file. A missing, unreadable or outdated file gives an empty cache.
-    pub fn load(path: &Path) -> ScanCache {
+    fn read(path: &Path) -> Option<ScanCache> {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<ScanCache>(&text).ok())
             .filter(|cache| cache.version == CACHE_VERSION)
-            .unwrap_or_else(ScanCache::new)
+    }
+
+    /// Reads a cache file. A missing, unreadable or outdated file gives an empty cache.
+    pub fn load(path: &Path) -> ScanCache {
+        Self::read(path).unwrap_or_default()
     }
 
     /// Writes the cache, replacing the file in one step.
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    ///
+    /// Entries another process added to the file since this cache was loaded are kept, so two
+    /// hosts scanning at once do not undo each other's work. (There is no lock: for a bundle
+    /// both of them touched, the later writer wins, which costs at most a repeated scan.)
+    pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        if let Some(on_disk) = Self::read(path) {
+            for (key, entry) in on_disk.entries {
+                if !self.forgotten.contains(&key) {
+                    self.entries.entry(key).or_insert(entry);
+                }
+            }
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -424,15 +479,28 @@ impl ScanCache {
     }
 
     /// The cached outcome for `path`, if the bundle has not changed since.
-    pub fn lookup(&self, path: &Path) -> Option<&CachedOutcome> {
+    ///
+    /// A probe that a dead process left unfinished reads as [`CachedOutcome::Blocked`]; one
+    /// that a live process is still running reads as not cached.
+    pub fn lookup(&self, path: &Path) -> Option<CachedOutcome> {
         let entry = self.entries.get(&Self::key(path))?;
-        (FileStamp::of(path) == Some(entry.stamp)).then_some(&entry.outcome)
+        if FileStamp::of(path) != Some(entry.stamp) {
+            return None;
+        }
+        match &entry.outcome {
+            CachedOutcome::Probing { pid } if process_alive(*pid) => None,
+            CachedOutcome::Probing { .. } => Some(CachedOutcome::Blocked {
+                reason: UNFINISHED.into(),
+            }),
+            settled => Some(settled.clone()),
+        }
     }
 
     fn store(&mut self, path: &Path, outcome: CachedOutcome) {
         if let Some(stamp) = FileStamp::of(path) {
-            self.entries
-                .insert(Self::key(path), CacheEntry { stamp, outcome });
+            let key = Self::key(path);
+            self.forgotten.remove(&key);
+            self.entries.insert(key, CacheEntry { stamp, outcome });
         }
     }
 
@@ -442,18 +510,20 @@ impl ScanCache {
             .iter()
             .filter_map(|(path, entry)| match &entry.outcome {
                 CachedOutcome::Blocked { reason } => Some((PathBuf::from(path), reason.clone())),
-                CachedOutcome::Plugins { .. } => None,
+                CachedOutcome::Probing { pid } if !process_alive(*pid) => {
+                    Some((PathBuf::from(path), UNFINISHED.to_string()))
+                }
+                CachedOutcome::Probing { .. } | CachedOutcome::Plugins { .. } => None,
             })
             .collect()
     }
 
     /// Takes a bundle off the blocklist (and out of the cache) so it is scanned again.
     pub fn forget(&mut self, path: &Path) -> bool {
-        self.entries.remove(&Self::key(path)).is_some()
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
+        let key = Self::key(path);
+        let known = self.entries.remove(&key).is_some();
+        self.forgotten.insert(key);
+        known
     }
 
     pub fn len(&self) -> usize {
@@ -473,8 +543,11 @@ impl Scanner {
     /// A bundle whose scan crashes, hangs or fails goes on the blocklist.
     ///
     /// If `cache_file` is given, the cache is saved before each bundle is probed, with that
-    /// bundle marked as blocked, and again after: so even if this process is killed while a
-    /// plugin hangs the scanner, the plugin responsible is not probed on the next start.
+    /// bundle marked as being probed by this process, and again after. So if this process dies
+    /// while a plugin has the scanner stuck, the next start finds the mark, sees that its
+    /// owner is gone, and does not probe that plugin again.
+    ///
+    /// `progress` is told, for each target, the outcome and whether it came from the cache.
     pub fn scan_cached(
         &self,
         targets: &[ScanTarget],
@@ -483,39 +556,39 @@ impl Scanner {
         mut progress: impl FnMut(&ScanTarget, &ScanOutcome, bool),
     ) -> ScanReport {
         let mut report = ScanReport::default();
+        let mut settle = |target: &ScanTarget, outcome: ScanOutcome, cached: bool| {
+            progress(target, &outcome, cached);
+            match outcome {
+                ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
+                other => report.failures.push((target.clone(), other)),
+            }
+        };
         for target in targets {
             // Targets without a path (the Audio Unit registry) are cheap to list and are not
             // cached.
             let Some(path) = target.path.as_deref() else {
-                let outcome = self.scan(target);
-                progress(target, &outcome, false);
-                match outcome {
-                    ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
-                    other => report.failures.push((target.clone(), other)),
-                }
+                settle(target, self.scan(target), false);
                 continue;
             };
 
-            if let Some(cached) = cache.lookup(path) {
-                let outcome = match cached {
-                    CachedOutcome::Plugins { plugins } => ScanOutcome::Ok(plugins.clone()),
-                    CachedOutcome::Blocked { reason } => {
-                        ScanOutcome::Failed(format!("on the blocklist: {reason}"))
-                    }
-                };
-                progress(target, &outcome, true);
-                match outcome {
-                    ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
-                    other => report.failures.push((target.clone(), other)),
+            match cache.lookup(path) {
+                Some(CachedOutcome::Plugins { plugins }) => {
+                    settle(target, ScanOutcome::Ok(plugins), true);
+                    continue;
                 }
-                continue;
+                Some(CachedOutcome::Blocked { reason }) => {
+                    let outcome = ScanOutcome::Failed(format!("on the blocklist: {reason}"));
+                    settle(target, outcome, true);
+                    continue;
+                }
+                Some(CachedOutcome::Probing { .. }) | None => {}
             }
 
-            // The pedal: assume the worst until the scan comes back.
+            // Leave a mark that outlives this process, in case the probe takes it down.
             cache.store(
                 path,
-                CachedOutcome::Blocked {
-                    reason: "the scan did not finish".into(),
+                CachedOutcome::Probing {
+                    pid: std::process::id(),
                 },
             );
             if let Some(file) = cache_file {
@@ -540,11 +613,7 @@ impl Scanner {
             if let Some(file) = cache_file {
                 let _ = cache.save(file);
             }
-            progress(target, &outcome, false);
-            match outcome {
-                ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
-                other => report.failures.push((target.clone(), other)),
-            }
+            settle(target, outcome, false);
         }
         report
     }

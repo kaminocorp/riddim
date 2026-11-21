@@ -44,6 +44,15 @@ enum Command {
         /// Print descriptors as JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Probe every bundle again, ignoring the cache and the blocklist.
+        #[arg(long)]
+        rescan: bool,
+        /// List the bundles that crashed, hung or failed their scan and are being skipped.
+        #[arg(long)]
+        blocklist: bool,
+        /// Take a bundle off the blocklist so it is scanned again.
+        #[arg(long, value_name = "BUNDLE")]
+        unblock: Option<PathBuf>,
     },
     /// Show a plugin's buses and parameters.
     Info {
@@ -181,6 +190,15 @@ enum SessionAction {
         /// Bars of metronome before recording starts.
         #[arg(long, default_value_t = 0)]
         count_in: u8,
+        /// Insert this effect on the instrument track (repeatable, in order).
+        #[arg(long, value_name = "PLUGIN")]
+        insert: Vec<String>,
+        /// Put this effect on a bus of its own, fed by a send from the instrument track.
+        #[arg(long, value_name = "PLUGIN")]
+        send_effect: Option<String>,
+        /// Automate the instrument's fader from silence to full over this many beats.
+        #[arg(long, value_name = "BEATS")]
+        fade_in: Option<u32>,
     },
     /// Describe a project file.
     Info { project: PathBuf },
@@ -194,6 +212,9 @@ enum SessionAction {
         /// Open the instrument's editor.
         #[arg(long)]
         editor: bool,
+        /// On exit, save the plugins' current settings back into the project.
+        #[arg(long)]
+        save: bool,
     },
     /// Play a project and record its armed tracks; the takes and plugin states are saved back.
     Record {
@@ -216,6 +237,12 @@ enum SessionAction {
         rate: f64,
         #[arg(long, default_value_t = 128)]
         block: u32,
+        /// Extra seconds after the end, for reverb and release tails.
+        #[arg(long, default_value_t = 0.0)]
+        tail: f64,
+        /// Render only this track id, as a stem (repeatable; see `session info` for ids).
+        #[arg(long, value_name = "TRACK")]
+        stem: Vec<u64>,
     },
 }
 
@@ -277,7 +304,20 @@ fn main() -> ExitCode {
         scanner: cli.scanner,
     };
     let result = match cli.command {
-        Command::Scan { json } => commands::scan(&context, json),
+        Command::Scan {
+            json,
+            rescan,
+            blocklist,
+            unblock,
+        } => commands::scan(
+            &context,
+            commands::ScanOptions {
+                json,
+                rescan,
+                blocklist,
+                unblock,
+            },
+        ),
         Command::Info { plugin, all } => commands::info(&context, &plugin, all),
         Command::Check {
             plugins,
@@ -341,6 +381,9 @@ fn main() -> ExitCode {
                 audio_input,
                 audio_tracks,
                 count_in,
+                insert,
+                send_effect,
+                fade_in,
             } => match audio_input.as_deref().map(parse_inputs).transpose() {
                 Ok(audio_input) => session::session_new(
                     &context,
@@ -352,6 +395,9 @@ fn main() -> ExitCode {
                         audio_input,
                         audio_tracks,
                         count_in,
+                        inserts: insert,
+                        send_effect,
+                        fade_in,
                     },
                 ),
                 Err(message) => Err(message),
@@ -362,7 +408,8 @@ fn main() -> ExitCode {
                 device,
                 seconds,
                 editor,
-            } => session::session_play(&project, device.options(), seconds, editor),
+                save,
+            } => session::session_play(&project, device.options(), seconds, editor, save),
             SessionAction::Record {
                 project,
                 device,
@@ -375,7 +422,19 @@ fn main() -> ExitCode {
                 seconds,
                 rate,
                 block,
-            } => session::session_render(&project, &out, seconds, rate, block),
+                tail,
+                stem,
+            } => session::session_render(
+                &project,
+                session::SessionRenderOptions {
+                    out,
+                    seconds,
+                    rate,
+                    buffer: block,
+                    tail,
+                    stem,
+                },
+            ),
         },
         Command::Loopback {
             device,

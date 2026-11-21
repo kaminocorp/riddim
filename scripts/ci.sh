@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Runs the same checks as .github/workflows/ci.yml, locally.
+# Runs what .github/workflows/ci.yml runs, and the heavier checks that are kept out of CI to
+# stay inside the Actions budget. Run it before every push.
 #
 #   scripts/ci.sh                 everything that needs no extra setup
 #   RIDDIM_TEST_VST3="/path/A.vst3;/path/B.vst3" scripts/ci.sh
-#                                 also run the third-party conformance test on those bundles
+#                                 also run the third-party conformance test on those bundles,
+#                                 and bounce a demo song through them
 #   RIDDIM_SKIP_RTSAN=1 scripts/ci.sh
 #                                 skip the RealtimeSanitizer run (it downloads a runtime the
 #                                 first time, and only exists for Linux and macOS)
@@ -35,6 +37,8 @@ cargo test --workspace
 if [ -n "${RIDDIM_TEST_VST3:-}" ]; then
     step "third-party conformance run"
     cargo test -p riddim-plugin --test third_party -- --nocapture
+    step "third-party demo song"
+    cargo test -p riddim-engine --test third_party -- --nocapture
 else
     echo "note: RIDDIM_TEST_VST3 not set; no third-party plugins were tested"
 fi

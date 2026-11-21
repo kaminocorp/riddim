@@ -6,13 +6,24 @@ use std::process::{Command, Output, Stdio};
 use riddim_test_support::{crashplug_bundle, ids, scanner_exe, testplug_bundle};
 
 fn riddim(args: &[&str]) -> Output {
+    riddim_with_cache(args, &scan_cache("shared"))
+}
+
+/// Runs the tool with its plugin scan cache in `cache` (never the user's own).
+fn riddim_with_cache(args: &[&str], cache: &std::path::Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_riddim"))
         .arg("--scanner")
         .arg(scanner_exe())
         .args(args)
+        .env("RIDDIM_SCAN_CACHE", cache)
         .stdin(Stdio::null())
         .output()
         .expect("running riddim")
+}
+
+/// A scan cache file for this test run only.
+fn scan_cache(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("riddim-cli-scan-{tag}-{}.json", std::process::id()))
 }
 
 fn stdout(output: &Output) -> String {
@@ -34,6 +45,10 @@ fn scan_lists_plugins_and_survives_a_crashing_bundle() {
     // Both fixture bundles live in the same directory: the good one and the one that aborts.
     let _ = crashplug_bundle();
     let dir = testplug_bundle().parent().unwrap().to_path_buf();
+    // A cache of its own: the other tests run at the same time and share theirs.
+    let cache = scan_cache("blocklist");
+    let _ = std::fs::remove_file(&cache);
+    let riddim = |args: &[&str]| riddim_with_cache(args, &cache);
     let output = riddim(&["--vst3-dir", dir.to_str().unwrap(), "scan", "--json"]);
     assert!(
         output.status.success(),
@@ -55,6 +70,39 @@ fn scan_lists_plugins_and_survives_a_crashing_bundle() {
         stderr.contains("RiddimCrash.vst3 did not scan"),
         "stderr was: {stderr}"
     );
+
+    // The crasher is now on the blocklist: the next scan lists the same plugins without
+    // loading it, and says why it was skipped.
+    let blocked = riddim(&["scan", "--blocklist"]);
+    assert!(
+        stdout(&blocked).contains("RiddimCrash.vst3"),
+        "{}",
+        stdout(&blocked)
+    );
+    assert!(stdout(&blocked).contains("crashed"), "{}", stdout(&blocked));
+    let second = riddim(&["--vst3-dir", dir.to_str().unwrap(), "scan", "--json"]);
+    assert_eq!(
+        stdout(&second),
+        stdout(&output),
+        "the cached scan lists the same plugins"
+    );
+    assert!(String::from_utf8_lossy(&second.stderr).contains("on the blocklist"));
+
+    // A rescan gives it another chance (it crashes again), and it can be taken off by hand.
+    let again = riddim(&[
+        "--vst3-dir",
+        dir.to_str().unwrap(),
+        "scan",
+        "--rescan",
+        "--json",
+    ]);
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("the scanner crashed"));
+    let crasher = crashplug_bundle();
+    let unblock = riddim(&["scan", "--unblock", crasher.to_str().unwrap()]);
+    assert!(unblock.status.success(), "{}", stdout(&unblock));
+    assert!(!stdout(&riddim(&["scan", "--blocklist"])).contains("RiddimCrash.vst3"));
+    let _ = std::fs::remove_file(&cache);
 }
 
 #[test]
@@ -360,6 +408,7 @@ fn killing_the_process_mid_take_keeps_what_was_recorded() {
             "--seconds",
             "60",
         ])
+        .env("RIDDIM_SCAN_CACHE", scan_cache("shared"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -447,4 +496,124 @@ fn unknown_plugins_and_bad_arguments_fail_cleanly() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("no plugin matches"));
     let output = riddim(&["check"]);
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn a_mix_with_an_insert_a_send_and_automation_bounces_to_stems() {
+    let dir = temp_dir("mix");
+    let project = dir.join("song.json");
+    let project_arg = project.to_str().unwrap();
+    let created = riddim(&[
+        "session",
+        "new",
+        project_arg,
+        "--instrument",
+        &plugin("synth"),
+        "--sequence",
+        "--insert",
+        &plugin("gain"),
+        "--send-effect",
+        &plugin("delay"),
+        "--fade-in",
+        "2",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let info = stdout(&riddim(&["session", "info", project_arg]));
+    assert!(info.contains("Effect return"), "{info}");
+    assert!(info.contains("send 1002 to track 1000"), "{info}");
+    assert!(info.contains("automation 1003"), "{info}");
+
+    let render = |name: &str, extra: &[&str]| {
+        let out = dir.join(name);
+        let mut args = vec![
+            "session",
+            "render",
+            project_arg,
+            "--out",
+            out.to_str().unwrap(),
+            "--seconds",
+            "2",
+        ];
+        args.extend_from_slice(extra);
+        let output = riddim(&args);
+        assert!(
+            output.status.success(),
+            "{}{}",
+            stdout(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (stdout(&output), std::fs::read(out).unwrap())
+    };
+    // The mix, twice: the same file, byte for byte.
+    let (text, mix) = render("mix.wav", &[]);
+    assert!(text.contains("of the mix"), "{text}");
+    let (_, again) = render("mix-again.wav", &[]);
+    assert!(mix == again, "two bounces of the same project differ");
+
+    // The instrument as a stem (it carries its share of the return with it) is the whole
+    // song here; the return alone is something else and not silent; a tail makes it longer.
+    let (text, stem) = render("synth.wav", &["--stem", "1"]);
+    assert!(text.contains("a stem of 1 track(s)"), "{text}");
+    assert!(
+        stem == mix,
+        "the only source track, soloed, should be the mix"
+    );
+    let (text, wet) = render("return.wav", &["--stem", "1000"]);
+    assert!(wet != mix);
+    assert!(!text.contains("peak 0.0000"), "{text}");
+    let (text, tail) = render("tail.wav", &["--tail", "0.5"]);
+    assert!(text.contains("rendered 2.50 s"), "{text}");
+    assert!(tail.len() > mix.len());
+
+    // Playing with --save writes the plugins' states into the project, and the project
+    // still bounces to the same file afterwards (the fixtures' default state is their state).
+    assert!(!info.contains("bytes of state"), "{info}");
+    let played = riddim(&[
+        "session",
+        "play",
+        project_arg,
+        "--null-device",
+        "--seconds",
+        "0.2",
+        "--save",
+    ]);
+    assert!(
+        played.status.success(),
+        "{}{}",
+        stdout(&played),
+        String::from_utf8_lossy(&played.stderr)
+    );
+    let info = stdout(&riddim(&["session", "info", project_arg]));
+    assert_eq!(info.matches("bytes of state").count(), 3, "{info}");
+    let (_, saved) = render("mix-saved.wav", &[]);
+    assert!(
+        saved == mix,
+        "saving the plugins' states changed the bounce"
+    );
+
+    // A stem of a track that does not exist is an error, not a silent file.
+    let bad = riddim(&[
+        "session",
+        "render",
+        project_arg,
+        "--out",
+        dir.join("bad.wav").to_str().unwrap(),
+        "--stem",
+        "77",
+    ]);
+    assert_eq!(bad.status.code(), Some(2));
+    // Mixing options without an instrument to hang them on are refused.
+    let lonely = riddim(&[
+        "session",
+        "new",
+        dir.join("lonely.json").to_str().unwrap(),
+        "--fade-in",
+        "4",
+    ]);
+    assert_eq!(lonely.status.code(), Some(2));
+    std::fs::remove_dir_all(&dir).ok();
 }

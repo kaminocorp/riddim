@@ -37,8 +37,50 @@ pub fn load_state(path: &Path) -> Result<StateBlob, String> {
     StateBlob::from_bytes(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub fn scan(context: &Context, json: bool) -> CommandResult {
-    let plugins = scan_everything(&context.scanner()?, &context.vst3_dirs);
+/// What `riddim scan` should do besides listing.
+pub struct ScanOptions {
+    pub json: bool,
+    /// Probe everything again, cached or blocked.
+    pub rescan: bool,
+    /// List the blocklist instead of scanning.
+    pub blocklist: bool,
+    /// Take this bundle off the blocklist.
+    pub unblock: Option<PathBuf>,
+}
+
+pub fn scan(context: &Context, options: ScanOptions) -> CommandResult {
+    use riddim_plugin::scan::ScanCache;
+    let cache_file = ScanCache::default_path();
+    if let Some(path) = &options.unblock {
+        let mut cache = ScanCache::load(&cache_file);
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let removed = cache.forget(&path);
+        cache.save(&cache_file).map_err(|e| e.to_string())?;
+        println!(
+            "{} {}",
+            path.display(),
+            if removed {
+                "will be scanned again next time"
+            } else {
+                "was not in the cache"
+            }
+        );
+        return Ok(removed);
+    }
+    if options.blocklist {
+        let blocked = ScanCache::load(&cache_file).blocked();
+        for (path, reason) in &blocked {
+            println!("{}\n    {reason}", path.display());
+        }
+        eprintln!(
+            "{} blocked bundle(s) in {}",
+            blocked.len(),
+            cache_file.display()
+        );
+        return Ok(true);
+    }
+    let json = options.json;
+    let plugins = scan_everything(&context.scanner()?, &context.vst3_dirs, options.rescan);
     if json {
         println!(
             "{}",
