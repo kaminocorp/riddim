@@ -97,6 +97,11 @@ pub(crate) enum ControlMsg {
     },
     /// Ask every loaded plugin for its state and store it in the model.
     CapturePluginStates(Sender<Result<Applied, String>>),
+    /// The device was re-opened with another buffer size: run at that size from now on.
+    StreamChanged {
+        info: StreamInfo,
+        max_block: usize,
+    },
     Shutdown,
 }
 
@@ -531,6 +536,21 @@ impl Control {
                 let _ = reply.send(self.load(*model));
             }
             ControlMsg::CapturePluginStates(reply) => self.capture_plugin_states(reply),
+            ControlMsg::StreamChanged { info, max_block } => {
+                self.stream = info;
+                self.max_block = max_block;
+                // New buffers of the new size go to the audio thread with the next plan, and
+                // every plugin is restarted to be told the new maximum block.
+                self.installed = (0, 0, 0);
+                self.sync_plugins();
+                self.rebuild_plan();
+                self.emit(Event::StreamChanged {
+                    sample_rate: self.stream.sample_rate,
+                    buffer_frames: self.stream.max_frames,
+                    input_latency_frames: self.stream.input_latency_frames,
+                    output_latency_frames: self.stream.output_latency_frames,
+                });
+            }
             ControlMsg::Shutdown => return false,
         }
         true

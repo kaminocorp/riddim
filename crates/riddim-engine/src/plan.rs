@@ -368,6 +368,9 @@ pub(crate) struct Buffers {
     pub scratch: Vec<Vec<f32>>,
     pub events: Vec<EventBuffer>,
     pub merged_events: EventBuffer,
+    /// The most frames these buffers can carry: the largest block the engine may run with
+    /// them.
+    pub max_block: usize,
 }
 
 /// Events per block that an event buffer can carry.
@@ -382,6 +385,7 @@ impl Buffers {
                 .map(|_| EventBuffer::with_capacity(EVENT_CAPACITY))
                 .collect(),
             merged_events: EventBuffer::with_capacity(EVENT_CAPACITY),
+            max_block,
         }
     }
 }

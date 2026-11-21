@@ -409,6 +409,9 @@ unsafe extern "C-unwind" fn overload_listener(
     0
 }
 
+/// The largest buffer size this backend will ask a device for.
+const MAX_BUFFER_FRAMES: u32 = 4096;
+
 /// An open CoreAudio device with our IOProc installed.
 pub struct CoreAudioStream {
     device: AudioObjectID,
@@ -507,8 +510,10 @@ impl CoreAudioStream {
         }
 
         // The HAL may deliver more frames than the nominal buffer size in rare cases; leave
-        // headroom rather than drop audio.
-        let max_frames = (buffer_frames as usize * 2).max(4096);
+        // headroom rather than drop audio. Sized once for the largest buffer we ever ask for
+        // (see `set_buffer_frames`), so that changing the buffer size never has to reallocate
+        // what the I/O thread may still be looking at.
+        let max_frames = (buffer_frames as usize * 2).max(2 * MAX_BUFFER_FRAMES as usize);
         let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
         // SAFETY: valid out-pointer.
         unsafe { mach_timebase_info(&mut timebase) };
@@ -609,6 +614,43 @@ impl AudioStream for CoreAudioStream {
 
     fn xruns(&self) -> u64 {
         self.xruns.load(Ordering::Relaxed)
+    }
+
+    fn set_buffer_frames(&mut self, frames: u32) -> Result<(), IoError> {
+        let was_started = self.started;
+        self.stop();
+        // SAFETY: the range is an AudioValueRange, the size a UInt32.
+        let (status, wanted, now) = unsafe {
+            let range = get::<ValueRange>(self.device, PROP_BUFFER_FRAME_SIZE_RANGE, SCOPE_GLOBAL)
+                .unwrap_or(ValueRange {
+                    minimum: 16.0,
+                    maximum: MAX_BUFFER_FRAMES as f64,
+                });
+            let wanted = frames
+                .clamp(range.minimum as u32, range.maximum as u32)
+                .min(MAX_BUFFER_FRAMES);
+            let status = set(self.device, PROP_BUFFER_FRAME_SIZE, SCOPE_GLOBAL, &wanted);
+            let now = get::<u32>(self.device, PROP_BUFFER_FRAME_SIZE, SCOPE_GLOBAL)
+                .unwrap_or(self.info.max_frames);
+            (status, wanted, now)
+        };
+        // Describe what the device is doing now, whether or not it took the new size.
+        let old = self.info.max_frames;
+        self.info.max_frames = now;
+        self.info.output_latency_frames = self.info.output_latency_frames - old + now;
+        if self.info.input_channels > 0 {
+            self.info.input_latency_frames = self.info.input_latency_frames - old + now;
+        }
+        if was_started {
+            self.start()?;
+        }
+        if status != 0 {
+            return Err(IoError::Device(
+                format!("{} refused a {wanted}-frame buffer", self.info.device_name),
+                status,
+            ));
+        }
+        Ok(())
     }
 }
 

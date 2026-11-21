@@ -106,6 +106,10 @@ pub trait AudioStream {
     fn stop(&mut self);
     /// Overloads (missed deadlines) the device has reported since the stream opened.
     fn xruns(&self) -> u64;
+    /// Changes the device's buffer size. The stream pauses for the change and carries on if
+    /// it was running; [`info`](Self::info) then describes what the device settled on, which
+    /// may be a clamped value. The callback stays the same object.
+    fn set_buffer_frames(&mut self, frames: u32) -> Result<(), IoError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

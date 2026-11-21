@@ -29,7 +29,10 @@ mod shared;
 
 pub use bounce::{bounce, BounceRequest, BounceResult};
 pub use control::{Applied, Rejected, TransportCommand};
-pub use engine::{DeviceConfig, Engine, EngineConfig, EngineError, MainThreadMode, Status};
+pub use engine::{
+    DeviceConfig, Engine, EngineConfig, EngineError, MainThreadMode, Status, MAX_BUFFER_FRAMES,
+    MIN_BUFFER_FRAMES,
+};
 pub use events::{Event, TransportState};
 pub use host::MainThread;
 pub use riddim_io::null::NullConfig;

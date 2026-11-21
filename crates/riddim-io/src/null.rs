@@ -82,6 +82,23 @@ impl Driver {
         }
     }
 
+    /// Re-shapes the buffers for another block size. What was in the loopback line is lost.
+    fn resize(&mut self, config: &NullConfig) {
+        let max_frames = config.buffer_frames.max(1) as usize;
+        for channel in self.inputs.iter_mut().chain(self.outputs.iter_mut()) {
+            channel.clear();
+            channel.resize(max_frames, 0.0);
+        }
+        let channels = self.inputs.len().min(self.outputs.len());
+        self.loopback = config.loopback_delay.map(|delay| {
+            let delay = (delay as usize).max(max_frames);
+            (vec![vec![0.0; delay + max_frames]; channels], delay)
+        });
+        // The loopback line is indexed by absolute frame; start it afresh.
+        self.frames_run = 0;
+        self.max_frames = max_frames;
+    }
+
     fn run_block(&mut self, frames: usize) {
         let frames = frames.min(self.max_frames);
         // Inputs for this block: what the output produced `delay` frames ago.
@@ -147,6 +164,7 @@ fn info_for(config: &NullConfig, name: &str) -> StreamInfo {
 pub struct ManualStream {
     driver: Driver,
     info: StreamInfo,
+    config: NullConfig,
 }
 
 impl ManualStream {
@@ -154,6 +172,7 @@ impl ManualStream {
         Self {
             info: info_for(&config, "manual"),
             driver: Driver::new(&config, Box::new(callback)),
+            config,
         }
     }
 
@@ -180,6 +199,13 @@ impl ManualStream {
 
     pub fn info(&self) -> &StreamInfo {
         &self.info
+    }
+
+    /// Changes the block size the stream runs at.
+    pub fn set_buffer_frames(&mut self, frames: u32) {
+        self.config.buffer_frames = frames.max(1);
+        self.driver.resize(&self.config);
+        self.info = info_for(&self.config, "manual");
     }
 }
 
@@ -249,6 +275,20 @@ impl AudioStream for NullStream {
 
     fn xruns(&self) -> u64 {
         0
+    }
+
+    fn set_buffer_frames(&mut self, frames: u32) -> Result<(), IoError> {
+        let was_running = self.thread.is_some();
+        self.stop();
+        self.config.buffer_frames = frames.max(1);
+        if let Some(driver) = self.driver.as_mut() {
+            driver.resize(&self.config);
+        }
+        self.info = info_for(&self.config, "null");
+        if was_running {
+            self.start()?;
+        }
+        Ok(())
     }
 }
 

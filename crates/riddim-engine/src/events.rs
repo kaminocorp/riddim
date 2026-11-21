@@ -97,6 +97,13 @@ pub enum Event {
         media: MediaId,
         error: String,
     },
+    /// The audio device now runs with these settings (after a buffer-size change).
+    StreamChanged {
+        sample_rate: f64,
+        buffer_frames: u32,
+        input_latency_frames: u32,
+        output_latency_frames: u32,
+    },
     Error {
         message: String,
     },

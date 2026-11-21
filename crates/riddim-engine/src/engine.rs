@@ -77,10 +77,16 @@ impl EngineConfig {
     }
 }
 
+/// The smallest and largest buffer sizes the engine will run at.
+pub const MIN_BUFFER_FRAMES: u32 = 16;
+pub const MAX_BUFFER_FRAMES: u32 = 4096;
+
 #[derive(Debug)]
 pub enum EngineError {
     Device(String),
     Io(std::io::Error),
+    /// The request cannot be carried out in the engine's present state.
+    Refused(&'static str),
 }
 
 impl std::fmt::Display for EngineError {
@@ -88,6 +94,7 @@ impl std::fmt::Display for EngineError {
         match self {
             EngineError::Device(why) => write!(f, "audio device: {why}"),
             EngineError::Io(e) => write!(f, "{e}"),
+            EngineError::Refused(why) => write!(f, "{why}"),
         }
     }
 }
@@ -158,7 +165,7 @@ impl Engine {
             DeviceConfig::System(c) => (c.sample_rate, c.buffer_frames),
         };
         // The plan never runs a block larger than this; bigger device blocks are split.
-        let max_block = block.max(16) as usize;
+        let max_block = block.max(MIN_BUFFER_FRAMES) as usize;
         let audio = AudioEngine::new(
             from_control,
             to_control,
@@ -364,6 +371,47 @@ impl Engine {
 
     pub fn stream_info(&self) -> &StreamInfo {
         &self.info
+    }
+
+    /// Changes the audio buffer size while the engine runs, without reopening the project.
+    ///
+    /// The device pauses for the change. The engine then runs at the size the device settled
+    /// on (which may be a clamped value: see the returned [`StreamInfo`]); every plugin is
+    /// told the new maximum block, which takes each out of the mix for a moment
+    /// ([`Event::PluginRestarted`] when it is back). Plugin settings, the transport position
+    /// and the model are untouched. Not allowed while recording.
+    pub fn set_buffer_size(&mut self, frames: u32) -> Result<StreamInfo, EngineError> {
+        if !(MIN_BUFFER_FRAMES..=MAX_BUFFER_FRAMES).contains(&frames) {
+            return Err(EngineError::Refused(
+                "the buffer size must be 16 to 4096 frames",
+            ));
+        }
+        if self.shared.recording.load(Ordering::Acquire) {
+            return Err(EngineError::Refused(
+                "the buffer size cannot change while recording",
+            ));
+        }
+        let result = match self.stream.as_mut() {
+            Some(Stream::Manual(stream)) => {
+                stream.set_buffer_frames(frames);
+                Ok(())
+            }
+            Some(Stream::Running(stream)) => stream.set_buffer_frames(frames),
+            None => return Err(EngineError::Refused("the engine has no audio stream")),
+        };
+        // Whatever the device did, follow it: on an error it may or may not have changed.
+        self.info = match self.stream.as_ref() {
+            Some(Stream::Manual(stream)) => stream.info().clone(),
+            Some(Stream::Running(stream)) => stream.info().clone(),
+            None => self.info.clone(),
+        };
+        self.send(ControlMsg::StreamChanged {
+            info: self.info.clone(),
+            max_block: (self.info.max_frames as usize).max(MIN_BUFFER_FRAMES as usize),
+        });
+        result
+            .map(|()| self.info.clone())
+            .map_err(|e| EngineError::Device(e.to_string()))
     }
 
     pub fn status(&self) -> Status {

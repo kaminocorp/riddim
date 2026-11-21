@@ -185,6 +185,9 @@ impl AudioEngine {
             match message {
                 ToAudio::SwapPlan { plan, buffers } => {
                     if let Some(buffers) = buffers {
+                        // The block size the engine runs at changes with the buffers that
+                        // were sized for it, and never apart from them.
+                        self.max_block = buffers.max_block;
                         let old = std::mem::replace(&mut self.buffers, buffers);
                         self.chute.discard(old);
                     }
