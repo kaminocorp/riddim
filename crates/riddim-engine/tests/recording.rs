@@ -468,11 +468,20 @@ fn eight_tracks_record_together_without_losing_a_frame() {
     let total = 10 * RATE as usize;
     engine.transport(TransportCommand::Record);
     engine.sync();
-    // Run in slices and let the disk thread breathe: the manual device runs far faster than
-    // real time, which a real one never would.
+    // Run in slices and let the disk set the pace: the manual device runs far faster than
+    // real time, which a real one never would. Never get more than a second of audio ahead
+    // of what has been written (the ring holds four). Sleeping a fixed time between slices
+    // instead is a bet on how soon the disk thread gets a turn, and a busy machine loses it.
     for _ in 0..100 {
         engine.run(total / 100);
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        loop {
+            // A round trip through the control thread makes the backlog figure current.
+            engine.sync();
+            if engine.status().capture_backlog < RATE as u64 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
     engine.transport(TransportCommand::Stop);
     engine.sync();
