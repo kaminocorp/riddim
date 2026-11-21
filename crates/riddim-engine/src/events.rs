@@ -81,12 +81,15 @@ pub enum Event {
         tracks: Vec<TrackId>,
         position_samples: i64,
     },
-    /// A take was written and placed on its track.
+    /// A take was written and placed on its track. `frames` is its length in frames for
+    /// audio, and the number of notes for MIDI. Loop recording gives one of these per time
+    /// round, numbered from 1 in `take`; the clips of all but one are muted.
     RecordingFinished {
         track: TrackId,
         clip: ClipId,
         media: Option<MediaId>,
         frames: u64,
+        take: Option<u32>,
     },
     /// Recorded audio was lost because the disk could not keep up.
     RecordingOverflow {

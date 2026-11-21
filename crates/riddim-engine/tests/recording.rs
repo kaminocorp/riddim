@@ -95,6 +95,7 @@ fn record_with_undo(
             clip,
             media: Some(media),
             frames,
+            ..
         } => Some((*clip, *media, *frames)),
         _ => None,
     });
@@ -370,6 +371,7 @@ fn midi_played_while_recording_becomes_a_clip_with_the_notes_in_place() {
             clip,
             media: None,
             frames,
+            ..
         } => Some((*clip, *frames)),
         _ => None,
     });

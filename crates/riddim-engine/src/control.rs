@@ -146,7 +146,59 @@ struct RecordingSession {
     output_latency: i64,
     audio: Vec<AudioTake>,
     midi_tracks: Vec<TrackId>,
+    /// Notes played live: (track, frames rolled since the take's start, what).
     midi_events: Vec<(TrackId, i64, EventBody)>,
+    /// Loop wraps since the take began: where the playhead left, and where it landed.
+    wraps: Vec<(i64, i64)>,
+    /// The punch range in samples, for a punch recording.
+    punch: Option<(i64, i64)>,
+}
+
+/// One time through the recorded stretch. A recording without a loop has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pass {
+    /// Where on the timeline this pass began.
+    timeline_start: i64,
+    /// The frames of the take it covers, counted from the take's start through every wrap.
+    rolled_start: i64,
+    rolled_end: i64,
+}
+
+/// Splits a recording into its passes: one per time round the loop.
+fn passes_of(start: i64, wraps: &[(i64, i64)], rolled_total: i64) -> Vec<Pass> {
+    let mut passes = Vec::new();
+    let (mut at, mut rolled) = (start, 0i64);
+    for &(left, landed) in wraps {
+        let length = left - at;
+        if length > 0 {
+            passes.push(Pass {
+                timeline_start: at,
+                rolled_start: rolled,
+                rolled_end: rolled + length,
+            });
+            rolled += length;
+        }
+        at = landed;
+    }
+    if rolled_total > rolled {
+        passes.push(Pass {
+            timeline_start: at,
+            rolled_start: rolled,
+            rolled_end: rolled_total,
+        });
+    }
+    passes
+}
+
+/// Which take should be the one that is heard: the newest that is not a fragment. (Stopping
+/// usually cuts the last time round short, and a few beats of it are not what anyone wants
+/// to hear in place of a whole take.)
+fn audible_take(lengths: &[i64]) -> usize {
+    let longest = lengths.iter().copied().max().unwrap_or(0);
+    lengths
+        .iter()
+        .rposition(|&length| length * 2 >= longest)
+        .unwrap_or(0)
 }
 
 /// One automation lane being written: the control is held (touch), was touched (latch), or the
@@ -1533,6 +1585,12 @@ impl Control {
             TransportCommand::Play => self.send(ToAudio::Play),
             TransportCommand::Stop => self.send(ToAudio::Stop),
             TransportCommand::Locate(position) => {
+                if self.recording.is_some() {
+                    self.emit(Event::Error {
+                        message: "the transport cannot be moved while recording".into(),
+                    });
+                    return;
+                }
                 let sample = self.map.position_to_samples(position, self.rate);
                 self.send(ToAudio::Locate(sample));
             }
@@ -1557,11 +1615,16 @@ impl Control {
             });
             return;
         }
-        let playing = self.shared.playing.load(Ordering::Acquire);
         let output_latency = self.stream.output_latency_frames as i64
             + self.shared.plan_latency.load(Ordering::Acquire) as i64;
         let round_trip = output_latency + self.stream.input_latency_frames as i64;
-
+        let punch = match (self.model.punch_enabled, self.model.punch_range) {
+            (true, Some(range)) => Some((
+                self.map.position_to_samples(range.start, self.rate),
+                self.map.position_to_samples(range.end, self.rate),
+            )),
+            _ => None,
+        };
         let mut captures = Vec::new();
         let mut audio = Vec::new();
         let mut midi_tracks = Vec::new();
@@ -1627,6 +1690,8 @@ impl Control {
             audio,
             midi_tracks,
             midi_events: Vec::new(),
+            wraps: Vec::new(),
+            punch,
         });
         // The audio thread fixes the exact start (it alone knows the position to the sample)
         // and reports it back; a little ahead of now if the transport is already rolling.
@@ -1635,21 +1700,42 @@ impl Control {
             round_trip,
             count_in_bars: self.model.metronome.count_in_bars as u32,
             punch_ahead: 2 * self.max_block as i64,
+            punch,
+            play: true,
         });
-        if !playing {
-            self.send(ToAudio::Play);
-        }
     }
 
-    fn finish_recording(&mut self, captures: Vec<CaptureRt>, stopped_at: i64) {
+    /// The audio thread would not start the recording: put away what was prepared for it.
+    fn recording_refused(&mut self, captures: Vec<CaptureRt>) {
+        drop(captures);
+        if let Some(session) = self.recording.take() {
+            for take in &session.audio {
+                let _ = self
+                    .butler
+                    .finish_capture(take.capture)
+                    .recv_timeout(Duration::from_secs(30));
+                let _ = std::fs::remove_file(&take.path);
+            }
+        }
+        self.emit(Event::Error {
+            message: "the playhead is past the punch range: there is nothing to record".into(),
+        });
+    }
+
+    fn finish_recording(&mut self, captures: Vec<CaptureRt>, rolled: i64) {
         // Dropping the sinks tells nobody anything; the butler is told explicitly below.
         drop(captures);
         let Some(session) = self.recording.take() else {
             return;
         };
+        let passes = passes_of(session.start, &session.wraps, rolled);
         let mut ops = Vec::new();
         let mut finished = Vec::new();
         let mut next_id = self.model.fresh_id();
+        let mut fresh = || {
+            next_id += 1;
+            next_id - 1
+        };
 
         for take in &session.audio {
             let result = self
@@ -1657,90 +1743,273 @@ impl Control {
                 .finish_capture(take.capture)
                 .recv_timeout(Duration::from_secs(30))
                 .unwrap_or_else(|_| Err("the disk thread did not answer".into()));
-            match result {
-                Err(error) => self.emit(Event::Error {
-                    message: format!("recording failed: {error}"),
-                }),
-                Ok(result) => {
-                    if result.frames_dropped > 0 {
-                        self.emit(Event::RecordingOverflow {
-                            track: take.track,
-                            frames_dropped: result.frames_dropped,
-                        });
-                    }
-                    if result.frames == 0 {
-                        let _ = std::fs::remove_file(&take.path);
-                        continue;
-                    }
-                    let media = MediaId(next_id);
-                    let clip = ClipId(next_id + 1);
-                    next_id += 2;
-                    ops.push(Op::AddMedia {
-                        media: Media {
-                            id: media,
-                            path: take.path.to_string_lossy().into_owned(),
-                            sample_rate: self.rate,
-                            channels: take.channels,
-                            frames: result.frames,
-                        },
+            let result = match result {
+                Err(error) => {
+                    self.emit(Event::Error {
+                        message: format!("recording failed: {error}"),
                     });
-                    ops.push(Op::AddClip {
-                        track: take.track,
-                        clip: Clip {
-                            id: clip,
-                            name: take
-                                .path
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                            // Recorded audio is anchored to audio time: it does not move if the
-                            // tempo is changed later.
-                            start: Position::Time(samples_to_superclock(session.start, self.rate)),
-                            muted: false,
-                            take: None,
-                            content: ClipContent::Audio {
-                                media,
-                                offset: 0,
-                                length: result.frames,
-                                gain: 1.0,
-                                fade_in: 0,
-                                fade_out: 0,
-                            },
-                        },
-                    });
-                    finished.push((take.track, clip, Some(media), result.frames));
+                    continue;
                 }
+                Ok(result) => result,
+            };
+            if result.frames_dropped > 0 {
+                self.emit(Event::RecordingOverflow {
+                    track: take.track,
+                    frames_dropped: result.frames_dropped,
+                });
+            }
+            // What each pass has of the file. The file's first frame is the take's first
+            // sample, and it runs on through every wrap; the tail of the last pass that had
+            // not come back through the input when recording stopped is not in it.
+            let frames = result.frames as i64;
+            let pieces: Vec<(Pass, i64)> = passes
+                .iter()
+                .map(|pass| (*pass, pass.rolled_end.min(frames) - pass.rolled_start))
+                .filter(|(_, length)| *length > 0)
+                .collect();
+            if pieces.is_empty() {
+                let _ = std::fs::remove_file(&take.path);
+                continue;
+            }
+            let media = MediaId(fresh());
+            ops.push(Op::AddMedia {
+                media: Media {
+                    id: media,
+                    path: take.path.to_string_lossy().into_owned(),
+                    sample_rate: self.rate,
+                    channels: take.channels,
+                    frames: result.frames,
+                },
+            });
+            // A punch replaces what was on the track where it lands.
+            if session.punch.is_some() {
+                let (pass, length) = pieces[0];
+                if let Some(track) = self.model.track(take.track) {
+                    ops.extend(self.make_room(
+                        track,
+                        pass.timeline_start,
+                        pass.timeline_start + length,
+                        &mut fresh,
+                    ));
+                }
+            }
+            let group = (pieces.len() > 1).then(&mut fresh);
+            let lengths: Vec<i64> = pieces.iter().map(|(_, length)| *length).collect();
+            let heard = audible_take(&lengths);
+            let name = take
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for (number, (pass, length)) in pieces.iter().enumerate() {
+                let clip = ClipId(fresh());
+                let take_mark = group.map(|group| riddim_model::Take {
+                    group,
+                    number: number as u32 + 1,
+                });
+                ops.push(Op::AddClip {
+                    track: take.track,
+                    clip: Clip {
+                        id: clip,
+                        name: match take_mark {
+                            Some(mark) => format!("{name} take {}", mark.number),
+                            None => name.clone(),
+                        },
+                        // Recorded audio is anchored to audio time: it does not move if the
+                        // tempo is changed later.
+                        start: Position::Time(samples_to_superclock(
+                            pass.timeline_start,
+                            self.rate,
+                        )),
+                        muted: number != heard,
+                        take: take_mark,
+                        content: ClipContent::Audio {
+                            media,
+                            offset: pass.rolled_start as u64,
+                            length: *length as u64,
+                            gain: 1.0,
+                            fade_in: 0,
+                            fade_out: 0,
+                        },
+                    },
+                });
+                finished.push((
+                    take.track,
+                    clip,
+                    Some(media),
+                    *length as u64,
+                    take_mark.map(|mark| mark.number),
+                ));
             }
         }
 
-        let take_end = stopped_at - session.output_latency;
+        // Notes: the player heard the timeline `output_latency` late, so what they played
+        // belongs that much earlier than the block it arrived in, and the last pass ends that
+        // much before the transport stopped (or at the punch-out).
+        let mut midi_passes = passes.clone();
+        if let Some(last) = midi_passes.last_mut() {
+            last.rolled_end -= session.output_latency;
+            if let Some((punch_in, punch_out)) = session.punch {
+                last.rolled_end = last.rolled_end.min(punch_out - punch_in.max(session.start));
+            }
+        }
+        midi_passes.retain(|pass| pass.rolled_end > pass.rolled_start);
         for track in &session.midi_tracks {
-            let Some(clip) = self.midi_take(*track, &session, take_end, ClipId(next_id)) else {
-                continue;
-            };
-            next_id += 1;
-            let notes = match &clip.content {
-                ClipContent::Midi { notes, .. } => notes.len() as u64,
-                _ => 0,
-            };
-            finished.push((*track, clip.id, None, notes));
-            self.write_midi_take(*track, &clip);
-            ops.push(Op::AddClip {
-                track: *track,
-                clip,
-            });
+            let clips: Vec<Clip> = midi_passes
+                .iter()
+                .filter_map(|pass| self.midi_take(*track, &session, pass, ClipId(fresh())))
+                .collect();
+            let group = (clips.len() > 1).then(&mut fresh);
+            let lengths: Vec<i64> = clips
+                .iter()
+                .map(|clip| match &clip.content {
+                    ClipContent::Midi { length, .. } => length.0,
+                    _ => 0,
+                })
+                .collect();
+            let heard = audible_take(&lengths);
+            for (number, mut clip) in clips.into_iter().enumerate() {
+                let take_mark = group.map(|group| riddim_model::Take {
+                    group,
+                    number: number as u32 + 1,
+                });
+                clip.take = take_mark;
+                clip.muted = number != heard;
+                let notes = match &clip.content {
+                    ClipContent::Midi { notes, .. } => notes.len() as u64,
+                    _ => 0,
+                };
+                finished.push((
+                    *track,
+                    clip.id,
+                    None,
+                    notes,
+                    take_mark.map(|mark| mark.number),
+                ));
+                self.write_midi_take(*track, &clip);
+                ops.push(Op::AddClip {
+                    track: *track,
+                    clip,
+                });
+            }
         }
 
         if !ops.is_empty() && self.apply_internal(ops) {
-            for (track, clip, media, frames) in finished {
+            for (track, clip, media, frames, take) in finished {
                 self.emit(Event::RecordingFinished {
                     track,
                     clip,
                     media,
                     frames,
+                    take,
                 });
             }
         }
+    }
+
+    /// The edits that clear the stretch `from..to` (timeline samples) of `track` of audio
+    /// clips, for a punched-in take to go there: clips are trimmed back to the edges, split
+    /// around the stretch, or removed if they lie wholly inside it. The media is not touched,
+    /// and the edits are ordinary ops, undone with the take.
+    fn make_room(
+        &self,
+        track: &Track,
+        from: i64,
+        to: i64,
+        fresh: &mut impl FnMut() -> u64,
+    ) -> Vec<Op> {
+        let rate = self.rate as i64;
+        let mut ops = Vec::new();
+        for clip in &track.clips {
+            let ClipContent::Audio {
+                media,
+                offset,
+                length,
+                gain,
+                fade_in,
+                fade_out,
+            } = clip.content
+            else {
+                continue;
+            };
+            let media_rate = self
+                .model
+                .media(media)
+                .map_or(rate, |m| m.sample_rate.max(1) as i64);
+            let start = self.map.position_to_samples(clip.start, self.rate);
+            // Timeline samples <-> frames of this clip's media.
+            let to_media = |samples: i64| riddim_time::mul_div_floor(samples, media_rate, rate);
+            let to_media_up =
+                |samples: i64| -riddim_time::mul_div_floor(-samples, media_rate, rate);
+            let end = start - riddim_time::mul_div_floor(-(length as i64), rate, media_rate);
+            if end <= from || start >= to {
+                continue;
+            }
+            let audio =
+                |offset: u64, length: u64, fade_in: u64, fade_out: u64| ClipContent::Audio {
+                    media,
+                    offset,
+                    length,
+                    gain,
+                    fade_in: fade_in.min(length),
+                    fade_out: fade_out.min(length),
+                };
+            // What is left before the stretch keeps the clip's id; what is left after it is
+            // a clip of its own unless there is nothing before.
+            let before = (start < from)
+                .then(|| to_media(from - start))
+                .filter(|kept| *kept > 0);
+            let after = (end > to).then(|| {
+                // A clip anchored to beats stays anchored to beats, on the first tick at or
+                // after the stretch's end.
+                let position = match clip.start {
+                    Position::Time(_) => Position::Time(samples_to_superclock(to, self.rate)),
+                    Position::Beats(_) => Position::Beats(
+                        self.map
+                            .superclock_to_ticks_ceil(samples_to_superclock(to, self.rate)),
+                    ),
+                };
+                let resumes = self.map.position_to_samples(position, self.rate).max(to);
+                let skipped = to_media_up(resumes - start).min(length as i64);
+                (position, skipped as u64, length - skipped as u64)
+            });
+            let after = after.filter(|(_, _, kept)| *kept > 0);
+            match (before, after) {
+                (None, None) => ops.push(Op::RemoveClip {
+                    track: track.id,
+                    clip: clip.id,
+                }),
+                (Some(kept), after) => {
+                    ops.push(Op::ReplaceClip {
+                        track: track.id,
+                        clip: Clip {
+                            content: audio(offset, kept as u64, fade_in, 0),
+                            ..(**clip).clone()
+                        },
+                    });
+                    if let Some((position, skipped, kept)) = after {
+                        ops.push(Op::AddClip {
+                            track: track.id,
+                            clip: Clip {
+                                id: ClipId(fresh()),
+                                start: position,
+                                content: audio(offset + skipped, kept, 0, fade_out),
+                                ..(**clip).clone()
+                            },
+                        });
+                    }
+                }
+                (None, Some((position, skipped, kept))) => ops.push(Op::ReplaceClip {
+                    track: track.id,
+                    clip: Clip {
+                        start: position,
+                        content: audio(offset + skipped, kept, 0, fade_out),
+                        ..(**clip).clone()
+                    },
+                }),
+            }
+        }
+        ops
     }
 
     /// Writes a MIDI take beside the audio takes as a Standard MIDI File, so the performance
@@ -1792,24 +2061,23 @@ impl Control {
         }
     }
 
-    /// Builds a MIDI clip from what was played on `track` during the session.
+    /// Builds a MIDI clip from what was played on `track` during one pass of the session.
     fn midi_take(
         &self,
         track: TrackId,
         session: &RecordingSession,
-        take_end: i64,
+        pass: &Pass,
         id: ClipId,
     ) -> Option<Clip> {
-        let start_tick = self.map.samples_to_ticks(session.start, self.rate);
+        let start_tick = self.map.samples_to_ticks(pass.timeline_start, self.rate);
+        let pass_length = pass.rolled_end - pass.rolled_start;
         let end_tick = self
             .map
-            .samples_to_ticks(take_end.max(session.start + 1), self.rate);
-        // The player heard the timeline `output_latency` late, so what they played belongs that
-        // much earlier than the block it arrived in.
-        let tick_of = |sample: i64| {
-            let heard =
-                (sample - session.output_latency).clamp(session.start, take_end.max(session.start));
-            Ticks(self.map.samples_to_ticks(heard, self.rate).0 - start_tick.0)
+            .samples_to_ticks(pass.timeline_start + pass_length.max(1), self.rate);
+        // Where in the pass a note belongs, given how far the take had rolled when it arrived.
+        let tick_of = |into_pass: i64| {
+            let sample = pass.timeline_start + into_pass.clamp(0, pass_length);
+            Ticks(self.map.samples_to_ticks(sample, self.rate).0 - start_tick.0)
         };
         let mut held: HashMap<(u8, u8), (Ticks, u8)> = HashMap::new();
         let mut notes = Vec::new();
@@ -1826,8 +2094,21 @@ impl Control {
                 }
             };
         let mut others = Vec::new();
-        for (_, sample, body) in session.midi_events.iter().filter(|(t, _, _)| *t == track) {
-            let at = tick_of(*sample);
+        let first_pass = pass.rolled_start == 0;
+        for (_, rolled, body) in session.midi_events.iter().filter(|(t, _, _)| *t == track) {
+            // Played during the count-in or the run-up to a punch-in: not part of the take.
+            if *rolled < 0 {
+                continue;
+            }
+            // (Notes played in the first moments, before the player could have heard the
+            // take's start, are kept at the start rather than thrown away.)
+            let heard = rolled - session.output_latency;
+            let heard = if first_pass { heard.max(0) } else { heard };
+            if heard < pass.rolled_start || heard >= pass.rolled_end {
+                // A note still held when its pass ends is closed there, below.
+                continue;
+            }
+            let at = tick_of(heard - pass.rolled_start);
             match *body {
                 EventBody::NoteOn {
                     channel,
@@ -1886,19 +2167,17 @@ impl Control {
                         });
                     }
                 }
-                FromAudio::RecordingEnded {
-                    captures,
-                    stopped_at,
-                } => {
-                    self.finish_recording(captures, stopped_at);
+                FromAudio::RecordingEnded { captures, rolled } => {
+                    self.finish_recording(captures, rolled);
                 }
+                FromAudio::RecordingRefused { captures } => self.recording_refused(captures),
                 FromAudio::RecordedMidi {
                     track,
-                    sample,
+                    rolled,
                     body,
                 } => {
                     if let Some(session) = self.recording.as_mut() {
-                        session.midi_events.push((track, sample, body));
+                        session.midi_events.push((track, rolled, body));
                     }
                 }
                 FromAudio::PluginParam { slot, id, value } => {
@@ -1907,7 +2186,13 @@ impl Control {
                         .send(HostRequest::NotifyParam { slot, id, value });
                     self.emit(Event::PluginParam { slot, id, value });
                 }
-                FromAudio::Jumped { from, to } => self.playhead_jumped(from, to),
+                FromAudio::Jumped { from, to } => {
+                    // While recording, the only jumps are loop wraps: each starts a new pass.
+                    if let Some(session) = self.recording.as_mut() {
+                        session.wraps.push((from, to));
+                    }
+                    self.playhead_jumped(from, to);
+                }
             }
         }
     }

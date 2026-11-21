@@ -44,11 +44,19 @@ pub(crate) enum ToAudio {
     /// later if it is already rolling), after `count_in_bars` of click if it is not. Capture
     /// starts `round_trip` samples after that point, so the first captured frame is the one
     /// played at it.
+    ///
+    /// With `punch` (a timeline range in samples), the take is confined to that range instead:
+    /// it starts at the range's start, or where the transport is if that is later, and the
+    /// recording ends by itself once the range has been captured, while the transport plays on.
+    /// Without it, an active loop keeps wrapping and every time round is a pass of the take.
     Record {
         captures: Vec<CaptureRt>,
         round_trip: i64,
         count_in_bars: u32,
         punch_ahead: i64,
+        punch: Option<(i64, i64)>,
+        /// Start the transport if it is stopped (and the recording is not refused).
+        play: bool,
     },
     /// A new bypass delay for a plugin whose latency changed (`None` for no latency).
     BypassDelay {
@@ -74,15 +82,23 @@ pub(crate) enum FromAudio {
     RecordingStarted {
         start: i64,
     },
-    /// Recording ended at this timeline sample; the sinks come back so their files can be
-    /// finished.
+    /// Recording was asked for with the playhead already past the punch range: nothing was
+    /// started, and the sinks come back unused.
+    RecordingRefused {
+        captures: Vec<CaptureRt>,
+    },
+    /// Recording ended; the sinks come back so their files can be finished. `rolled` is how
+    /// many frames the transport played from the take's start to the end of the recording
+    /// (loop wraps included; negative if it never got that far).
     RecordingEnded {
         captures: Vec<CaptureRt>,
-        stopped_at: i64,
+        rolled: i64,
     },
+    /// A note played live while recording. `rolled` counts frames from the take's start, and
+    /// keeps counting through loop wraps.
     RecordedMidi {
         track: TrackId,
-        sample: i64,
+        rolled: i64,
         body: EventBody,
     },
     PluginParam {
@@ -106,8 +122,20 @@ enum Rolling {
 
 struct Recording {
     captures: Vec<CaptureRt>,
-    capture_from: i64,
-    count_in_until: i64,
+    /// Frames the transport has played since the take's first sample was due. Negative
+    /// during a count-in or the run-up to a punch-in. Unlike the timeline position it never
+    /// goes back when a loop wraps.
+    rolled: i64,
+    /// Capture lags the take by this much: what is played at the take's start comes back
+    /// through the output and the input this many frames later.
+    round_trip: i64,
+    /// Capture this many frames and then end the recording (a punch range). `None`: until
+    /// stopped.
+    length: Option<i64>,
+    /// Click before the take starts, whatever the metronome setting.
+    count_in: bool,
+    /// Keep wrapping an active loop while recording.
+    loops: bool,
 }
 
 pub(crate) struct AudioEngine {
@@ -179,7 +207,7 @@ impl AudioEngine {
             self.shared.recording.store(false, Ordering::Release);
             self.reply(FromAudio::RecordingEnded {
                 captures: recording.captures,
-                stopped_at: self.position,
+                rolled: recording.rolled,
             });
         }
     }
@@ -220,6 +248,8 @@ impl AudioEngine {
                         self.end_recording();
                     }
                 }
+                // A recording is a stretch of time played once through: no jumping about.
+                ToAudio::Locate(_) if self.recording.is_some() => {}
                 ToAudio::Locate(position) => {
                     if self.rolling == Rolling::Playing {
                         self.reply(FromAudio::Jumped {
@@ -235,19 +265,34 @@ impl AudioEngine {
                     round_trip,
                     count_in_bars,
                     punch_ahead,
+                    punch,
+                    play,
                 } => {
                     self.end_recording();
                     let rolling = self.rolling == Rolling::Playing;
+                    let count_in = !rolling && count_in_bars > 0;
                     // The start is decided here, where the position is known exactly.
-                    let start = if rolling {
+                    let begin = if rolling {
                         self.position + punch_ahead
                     } else {
                         self.position
                     };
-                    if !rolling && count_in_bars > 0 {
+                    if punch.is_some_and(|(_, to)| begin >= to) {
+                        self.reply(FromAudio::RecordingRefused { captures });
+                        continue;
+                    }
+                    if play && !rolling {
+                        self.rolling = Rolling::Playing;
+                        self.discontinuity = true;
+                    }
+                    let (start, length) = match punch {
+                        Some((from, to)) => (begin.max(from), Some((to - begin.max(from)).max(0))),
+                        None => (begin, None),
+                    };
+                    if count_in {
                         if let Some(plan) = &self.plan {
                             let map = &plan.tempo_map;
-                            let tick = map.samples_to_ticks(start, self.sample_rate);
+                            let tick = map.samples_to_ticks(self.position, self.sample_rate);
                             let bar = map.meter_at(tick).ticks_per_bar();
                             let from = riddim_time::Ticks(tick.0 - count_in_bars as i64 * bar);
                             self.position = map.ticks_to_samples(from, self.sample_rate);
@@ -256,8 +301,11 @@ impl AudioEngine {
                     }
                     self.recording = Some(Recording {
                         captures,
-                        capture_from: start + round_trip,
-                        count_in_until: start,
+                        rolled: self.position - start,
+                        round_trip,
+                        length,
+                        count_in,
+                        loops: punch.is_none(),
                     });
                     self.shared.recording.store(true, Ordering::Release);
                     self.reply(FromAudio::RecordingStarted { start });
@@ -340,7 +388,10 @@ impl AudioEngine {
         let force_click = self
             .recording
             .as_ref()
-            .is_some_and(|r| self.position < r.count_in_until);
+            .is_some_and(|r| r.count_in && r.rolled < 0);
+        // Where this segment starts in the take, for stamping notes played live.
+        let rolled = self.recording.as_ref().map_or(0, |r| r.rolled);
+        let segment_start = self.position;
         let ctx = BlockCtx {
             frames,
             sample_rate: self.sample_rate,
@@ -370,7 +421,7 @@ impl AudioEngine {
                     body,
                 } => FromAudio::RecordedMidi {
                     track,
-                    sample,
+                    rolled: rolled + (sample - segment_start),
                     body,
                 },
             };
@@ -402,13 +453,19 @@ impl AudioEngine {
         if self.rolling != Rolling::Playing {
             return;
         }
-        let segment_end = self.position + frames as i64;
-        if segment_end <= recording.capture_from {
+        // The window to capture, in frames rolled: from `round_trip` on, for `length` frames
+        // if the take has an end.
+        let window_end = recording.length.map(|length| recording.round_trip + length);
+        let skip = (recording.round_trip - recording.rolled).clamp(0, frames as i64);
+        let mut count = frames as i64 - skip;
+        if let Some(end) = window_end {
+            count = count.min(end - (recording.rolled + skip));
+        }
+        if count <= 0 {
             return;
         }
-        let skip = (recording.capture_from - self.position).max(0) as usize;
-        let start = offset + skip;
-        let count = frames - skip;
+        let start = offset + skip as usize;
+        let count = count as usize;
         for capture in recording.captures.iter_mut() {
             let mut channels: [&[f32]; 2] = [&[], &[]];
             let width = capture.channels.min(2);
@@ -451,7 +508,8 @@ impl AudioCallback for AudioEngine {
         while done < block.frames {
             let mut frames = (block.frames - done).min(self.max_block);
             let mut wrap_to = None;
-            if self.rolling == Rolling::Playing && self.recording.is_none() {
+            let may_loop = self.recording.as_ref().is_none_or(|r| r.loops);
+            if self.rolling == Rolling::Playing && may_loop {
                 if let Some((start, end)) = self.plan.as_ref().and_then(|p| p.loop_range) {
                     if self.position >= end {
                         // Located past the loop: play on without wrapping.
@@ -467,6 +525,18 @@ impl AudioCallback for AudioEngine {
                 self.discontinuity = false;
                 if self.rolling == Rolling::Playing {
                     self.position += frames as i64;
+                    let mut punched_out = false;
+                    if let Some(recording) = self.recording.as_mut() {
+                        recording.rolled += frames as i64;
+                        punched_out = recording.length.is_some_and(|length| {
+                            recording.rolled >= recording.round_trip + length
+                        });
+                    }
+                    if punched_out {
+                        // Everything in the punch range is captured: the recording is over,
+                        // and the transport plays on.
+                        self.end_recording();
+                    }
                 }
                 self.continuous += frames as i64;
                 done += frames;
