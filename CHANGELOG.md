@@ -6,6 +6,29 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 
 ## [Unreleased]
 
+### Phase 2: engine core ("tape")
+
+#### Added
+- **`riddim-time`**: integer time. Superclock and beat ticks, exact sample conversions, a tempo and meter map with bar/beat arithmetic.
+- **`riddim-model`**: the engine model (tracks, clips, media, plugin slots, routing, loop and metronome settings) and the edit ops that change it. Every op is validated, applies atomically, and returns its exact inverse. JSON with a schema version.
+- **`riddim-graph`**: a pure compiler from nodes and edges to a deterministic render plan with latency-compensation delays and a parallel schedule, and the mapping from a model to its graph.
+- **`riddim-disk`**: an incremental WAV/RF64 writer whose file is valid after every flush; a reader that recovers interrupted recordings; the capture ("butler") thread; a resampler for import; Standard MIDI Files.
+- **`riddim-engine`**: the engine. A control thread that owns the model and compiles a plan per edit; an audio callback with transport, looping, a single-threaded plan executor, clip and MIDI playback, live MIDI, metronome and count-in; recording of audio and MIDI with latency-corrected placement; a plugin host on a main thread that is engine-owned or app-pumped; a mixer with ramps, balance, mute, solo-in-place, buses and meters.
+- **`riddim`**: the public Rust API (commands, queries, events) and file import helpers.
+- **`riddim-ffi`**: C ABI v0 with a generated header (`crates/riddim-ffi/include/riddim.h`).
+- **`riddim-cli`**: `play` and `render` now run the engine and accept MIDI files; new `session new|info|play|record|render` and `loopback` (measures recording alignment through a cable).
+- **RealtimeSanitizer**: `scripts/rtsan.sh` and a CI job run the real-time sections under LLVM's RTSan, with a self-check that the sanitizer is active.
+
+#### Changed
+- The phase 1 spike player is gone; `riddim play` is the engine.
+- `Status`/`RiddimStatus` report the recording backlog (frames waiting for the disk).
+
+#### Verified
+- On Linux, on the deterministic manual device: sample-accurate clip, MIDI and metronome timing; looping; mixing; plugin latency compensation; save, reopen and bit-identical render; recording placed exactly on the sample through a simulated loopback at several latencies; a take surviving `kill -9`; an hour of timeline on eight tracks with no frame lost; the whole suite under RealtimeSanitizer; a C program driving the engine through the header.
+
+#### Not verified
+- Anything on a Mac or on real audio hardware. See [`docs/phases/p2-engine-core.md`](docs/phases/p2-engine-core.md).
+
 ### Phase 1: hosting spike
 
 #### Added

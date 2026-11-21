@@ -410,6 +410,37 @@ fn killing_the_process_mid_take_keeps_what_was_recorded() {
 }
 
 #[test]
+fn the_loopback_measurement_reports_zero_offset_on_an_honest_device() {
+    let output = riddim(&[
+        "loopback",
+        "--null-device",
+        "--loopback",
+        "777",
+        "--seconds",
+        "2",
+    ]);
+    let text = stdout(&output);
+    assert!(
+        output.status.success(),
+        "{text}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("reported latency 388 in + 389 out = 777 frames"),
+        "{text}"
+    );
+    assert!(
+        text.contains("offset from where they were played: 0 to 0 samples"),
+        "{text}"
+    );
+
+    // With no cable (a silent input) it says so instead of inventing a number.
+    let silent = riddim(&["loopback", "--null-device", "--seconds", "1"]);
+    assert_eq!(silent.status.code(), Some(1));
+    assert!(stdout(&silent).contains("no clicks came back"));
+}
+
+#[test]
 fn unknown_plugins_and_bad_arguments_fail_cleanly() {
     let output = riddim(&["info", &plugin("no-such-plugin")]);
     assert_eq!(output.status.code(), Some(2));

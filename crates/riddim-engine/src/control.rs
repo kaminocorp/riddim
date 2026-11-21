@@ -107,6 +107,7 @@ struct PluginEntry {
 struct AudioTake {
     track: TrackId,
     capture: CaptureId,
+    stats: Arc<riddim_disk::capture::CaptureStats>,
     path: PathBuf,
     channels: u16,
 }
@@ -1069,6 +1070,7 @@ impl Control {
                     };
                     match self.butler.start_capture(&path, spec) {
                         Ok((capture, sink)) => {
+                            let stats = sink.stats().clone();
                             captures.push(CaptureRt {
                                 sink,
                                 first_channel: first_channel as usize,
@@ -1077,6 +1079,7 @@ impl Control {
                             audio.push(AudioTake {
                                 track: track.id,
                                 capture,
+                                stats,
                                 path,
                                 channels: channels as u16,
                             });
@@ -1204,6 +1207,7 @@ impl Control {
                 _ => 0,
             };
             finished.push((*track, clip.id, None, notes));
+            self.write_midi_take(*track, &clip);
             ops.push(Op::AddClip {
                 track: *track,
                 clip,
@@ -1219,6 +1223,55 @@ impl Control {
                     frames,
                 });
             }
+        }
+    }
+
+    /// Writes a MIDI take beside the audio takes as a Standard MIDI File, so the performance
+    /// exists on disk in a form other tools can read, not only inside the project.
+    fn write_midi_take(&mut self, track: TrackId, clip: &Clip) {
+        let ClipContent::Midi {
+            length,
+            notes,
+            events,
+        } = &clip.content
+        else {
+            return;
+        };
+        self.take_counter += 1;
+        let path = self.capture_dir.join(format!(
+            "take-{:04}-track-{}.mid",
+            self.take_counter, track.0
+        ));
+        let data = riddim_disk::smf::SmfData {
+            notes: notes
+                .iter()
+                .map(|n| riddim_disk::smf::SmfNote {
+                    start: n.start,
+                    length: n.length,
+                    key: n.key,
+                    velocity: n.velocity,
+                    channel: n.channel,
+                })
+                .collect(),
+            events: events
+                .iter()
+                .map(|e| riddim_disk::smf::SmfEvent {
+                    at: e.at,
+                    data: e.data,
+                    len: e.len,
+                })
+                .collect(),
+            tempos: vec![(
+                Ticks::ZERO,
+                self.map.tempo_at(self.map.position_to_ticks(clip.start)),
+            )],
+            meters: Vec::new(),
+            length: *length,
+        };
+        if let Err(error) = std::fs::write(&path, riddim_disk::smf::write(&data)) {
+            self.emit(Event::Error {
+                message: format!("could not write {}: {error}", path.display()),
+            });
         }
     }
 
@@ -1449,6 +1502,22 @@ impl Control {
 
     /// Transport changes at once; position and meters about thirty times a second.
     fn report(&mut self) {
+        // How far the disk is behind the slowest take: the figure behind a "disk load" meter.
+        let backlog = self.recording.as_ref().map_or(0, |session| {
+            session
+                .audio
+                .iter()
+                .map(|take| {
+                    let pushed = take.stats.frames_pushed.load(Ordering::Relaxed);
+                    pushed.saturating_sub(take.stats.frames_written.load(Ordering::Relaxed))
+                })
+                .max()
+                .unwrap_or(0)
+        });
+        self.shared
+            .capture_backlog
+            .store(backlog, Ordering::Relaxed);
+
         let playing = self.shared.playing.load(Ordering::Acquire);
         let recording = self.shared.recording.load(Ordering::Acquire);
         let state = match (playing, recording) {

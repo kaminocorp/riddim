@@ -393,6 +393,21 @@ fn midi_played_while_recording_becomes_a_clip_with_the_notes_in_place() {
     // The unreleased note ends with the take.
     assert_eq!(notes[1].start + notes[1].length, *length);
 
+    // The take is also on disk as a Standard MIDI File with the same notes.
+    let file = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "mid"))
+        .expect("a .mid file for the take");
+    let on_disk = riddim_disk::smf::read(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(on_disk.notes.len(), 2);
+    assert_eq!(on_disk.notes[0].key, 60);
+    // A MIDI file holds 960 ticks per beat, coarser than the model: the note is within one of
+    // the file's ticks of where the model has it.
+    let file_tick = TICKS_PER_BEAT / 960;
+    assert!((on_disk.notes[0].start.0 - notes[0].start.0).abs() <= file_tick);
+
     // Playing the take back sounds the instrument at the corrected position.
     engine
         .apply_wait(vec![set(10, TrackChange::RecordArmed(false))])
@@ -516,12 +531,32 @@ fn long_recording() {
     let total = 60 * 60 * RATE as usize;
     engine.transport(TransportCommand::Record);
     engine.sync();
-    let slice = RATE as usize; // one second of timeline at a time
-    for _ in 0..total / slice {
+    // The manual device runs many times faster than real time, so let the disk set the pace:
+    // never get more than a second of audio ahead of what has been written. (On real hardware
+    // the clock does this; the ring holds four seconds.)
+    let slice = RATE as usize / 4;
+    let mut worst_backlog = 0;
+    let mut first_drop = None;
+    for iteration in 0..total / slice {
         engine.run(slice);
-        // Keep at most a second of audio ahead of the disk.
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        loop {
+            // A round trip through the control thread makes the backlog figure current even
+            // when this machine is busy with something else.
+            engine.sync();
+            let status = engine.status();
+            let backlog = status.capture_backlog;
+            worst_backlog = worst_backlog.max(backlog);
+            if status.capture_dropped > 0 && first_drop.is_none() {
+                first_drop = Some((iteration, backlog, status.capture_dropped));
+            }
+            if backlog < RATE as u64 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
+    eprintln!("first drop (iteration, backlog, dropped): {first_drop:?}");
+    eprintln!("worst disk backlog: {worst_backlog} frames");
     engine.transport(TransportCommand::Stop);
     engine.sync();
     engine.run(BLOCK);

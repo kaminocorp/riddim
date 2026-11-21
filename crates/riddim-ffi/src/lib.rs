@@ -89,6 +89,8 @@ pub struct RiddimStatus {
     pub rt_violations: u64,
     /// Recorded frames lost because the disk could not keep up.
     pub capture_dropped: u64,
+    /// Recorded frames waiting in memory for the disk. Climbing means the disk is falling behind.
+    pub capture_backlog: u64,
     /// Samples by which the output lags the timeline (plugin latency compensation).
     pub plan_latency: u32,
     pub input_latency: u32,
@@ -471,6 +473,7 @@ pub unsafe extern "C" fn riddim_status(
             xruns: s.xruns,
             rt_violations: s.rt_violations,
             capture_dropped: s.capture_dropped,
+            capture_backlog: s.capture_backlog,
             plan_latency: s.plan_latency,
             input_latency: s.input_latency,
             output_latency: s.output_latency,

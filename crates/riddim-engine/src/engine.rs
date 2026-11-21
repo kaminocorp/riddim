@@ -106,6 +106,9 @@ pub struct Status {
     pub rt_violations: u64,
     /// Recorded frames lost to a full capture ring.
     pub capture_dropped: u64,
+    /// Recorded frames waiting in memory for the disk (the track furthest behind). Climbing
+    /// towards the ring size means the disk is not keeping up.
+    pub capture_backlog: u64,
     /// Samples by which the output lags the timeline (plugin latency compensation).
     pub plan_latency: u32,
     pub input_latency: u32,
@@ -367,6 +370,7 @@ impl Engine {
             },
             rt_violations: self.shared.rt_violations.load(Ordering::Relaxed),
             capture_dropped: self.shared.capture_dropped.load(Ordering::Relaxed),
+            capture_backlog: self.shared.capture_backlog.load(Ordering::Relaxed),
             plan_latency: self.shared.plan_latency.load(Ordering::Acquire),
             input_latency: self.info.input_latency_frames,
             output_latency: self.info.output_latency_frames,

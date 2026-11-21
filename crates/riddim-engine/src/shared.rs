@@ -22,6 +22,8 @@ pub struct Shared {
     pub rt_violations: AtomicU64,
     /// Frames recorded audio lost because a capture ring was full.
     pub capture_dropped: AtomicU64,
+    /// Recorded frames waiting in memory for the disk, for the track furthest behind.
+    pub capture_backlog: AtomicU64,
     /// Things the audio thread had to leak rather than free (a full garbage chute).
     pub leaked: AtomicU64,
     /// Latency the running plan adds between the timeline and the device output, in samples.

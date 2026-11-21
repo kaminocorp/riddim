@@ -20,6 +20,9 @@ fn allocation_outside_rt_is_fine() {
     assert_eq!(guard::thread_violations(), before);
 }
 
+// Under RealtimeSanitizer an allocation in a real-time section ends the process, which is the
+// sanitizer doing its job; the counting behaviour is tested in ordinary builds.
+#[cfg(not(feature = "rtsan"))]
 #[test]
 fn allocation_inside_rt_is_counted() {
     let ((), n) = guard::rt_scope_counted(|| {

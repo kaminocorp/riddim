@@ -4,6 +4,9 @@
 #   scripts/ci.sh                 everything that needs no extra setup
 #   RIDDIM_TEST_VST3="/path/A.vst3;/path/B.vst3" scripts/ci.sh
 #                                 also run the third-party conformance test on those bundles
+#   RIDDIM_SKIP_RTSAN=1 scripts/ci.sh
+#                                 skip the RealtimeSanitizer run (it downloads a runtime the
+#                                 first time, and only exists for Linux and macOS)
 #
 # cargo-deny is used if installed (cargo install cargo-deny --locked).
 set -euo pipefail
@@ -34,6 +37,13 @@ if [ -n "${RIDDIM_TEST_VST3:-}" ]; then
     cargo test -p riddim-plugin --test third_party -- --nocapture
 else
     echo "note: RIDDIM_TEST_VST3 not set; no third-party plugins were tested"
+fi
+
+if [ -z "${RIDDIM_SKIP_RTSAN:-}" ]; then
+    step "RealtimeSanitizer"
+    scripts/rtsan.sh --quiet
+else
+    echo "note: RIDDIM_SKIP_RTSAN set; skipping the RealtimeSanitizer run"
 fi
 
 if command -v cargo-deny >/dev/null 2>&1; then

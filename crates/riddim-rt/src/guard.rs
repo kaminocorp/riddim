@@ -11,8 +11,10 @@
 //! then assert on the total), and counts are kept per thread as well as globally (so parallel
 //! tests do not see each other's deliberate violations).
 //!
-//! Lock and syscall detection is out of scope here; that is what the RealtimeSanitizer CI job is
-//! for.
+//! The allocator only sees heap traffic. Locks and blocking system calls are caught by LLVM's
+//! RealtimeSanitizer: with the `rtsan` feature (and `RTSAN_ENABLE=1` at build time) every
+//! real-time section is also an RTSan real-time context, and [`permit`] also suspends RTSan.
+//! `scripts/rtsan.sh` runs the test suite that way.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -40,6 +42,14 @@ pub struct RtSection {
 #[inline]
 pub fn enter() -> RtSection {
     RT_DEPTH.with(|d| d.set(d.get() + 1));
+    #[cfg(feature = "rtsan")]
+    {
+        // The standalone runtime has to be initialised once, before the first real-time
+        // context; without this its interceptors are never installed and it reports nothing.
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(rtsan_standalone::ensure_initialized);
+        rtsan_standalone::realtime_enter();
+    }
     RtSection {
         _not_send: PhantomData,
     }
@@ -48,6 +58,8 @@ pub fn enter() -> RtSection {
 impl Drop for RtSection {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(feature = "rtsan")]
+        rtsan_standalone::realtime_exit();
         RT_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
 }
@@ -75,12 +87,22 @@ pub fn permit<R>(f: impl FnOnce() -> R) -> R {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
+            #[cfg(feature = "rtsan")]
+            rtsan_standalone::enable();
             PERMIT_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         }
     }
     PERMIT_DEPTH.with(|d| d.set(d.get() + 1));
+    #[cfg(feature = "rtsan")]
+    rtsan_standalone::disable();
     let _reset = Reset;
     f()
+}
+
+/// True if this build ties real-time sections to RealtimeSanitizer. (Whether the sanitizer is
+/// actually linked in also depends on `RTSAN_ENABLE` having been set at build time.)
+pub const fn rtsan_feature() -> bool {
+    cfg!(feature = "rtsan")
 }
 
 /// True while the current thread is inside a real-time section.

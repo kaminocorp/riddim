@@ -62,6 +62,8 @@ typedef struct RiddimStatus {
     uint64_t rt_violations;
     // Recorded frames lost because the disk could not keep up.
     uint64_t capture_dropped;
+    // Recorded frames waiting in memory for the disk. Climbing means the disk is falling behind.
+    uint64_t capture_backlog;
     // Samples by which the output lags the timeline (plugin latency compensation).
     uint32_t plan_latency;
     uint32_t input_latency;

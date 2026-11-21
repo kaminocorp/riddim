@@ -600,6 +600,8 @@ pub struct NewOptions {
     pub sequence: bool,
     /// First device input channel (0-based) and channel count for the audio track.
     pub audio_input: Option<(u16, u8)>,
+    /// How many armed audio tracks to create on that input.
+    pub audio_tracks: u8,
     pub count_in: u8,
 }
 
@@ -625,27 +627,30 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
         )?;
     }
     if let Some((first_channel, channels)) = options.audio_input {
-        let index = model.tracks.len();
-        apply(
-            &mut model,
-            vec![
-                Op::AddTrack {
-                    index,
-                    track: Track::new(AUDIO_TRACK, "Audio", TrackKind::Audio),
-                },
-                Op::SetTrack {
-                    id: AUDIO_TRACK,
-                    change: TrackChange::Input(TrackInput::Audio {
-                        first_channel,
-                        channels,
-                    }),
-                },
-                Op::SetTrack {
-                    id: AUDIO_TRACK,
-                    change: TrackChange::RecordArmed(true),
-                },
-            ],
-        )?;
+        for n in 0..options.audio_tracks.max(1) as u64 {
+            let id = TrackId(AUDIO_TRACK.0 + n * 10);
+            let index = model.tracks.len();
+            apply(
+                &mut model,
+                vec![
+                    Op::AddTrack {
+                        index,
+                        track: Track::new(id, format!("Audio {}", n + 1), TrackKind::Audio),
+                    },
+                    Op::SetTrack {
+                        id,
+                        change: TrackChange::Input(TrackInput::Audio {
+                            first_channel,
+                            channels,
+                        }),
+                    },
+                    Op::SetTrack {
+                        id,
+                        change: TrackChange::RecordArmed(true),
+                    },
+                ],
+            )?;
+        }
     }
     if options.count_in > 0 {
         apply(
@@ -852,4 +857,157 @@ pub fn session_render(
         out.display()
     );
     Ok(true)
+}
+
+/// `riddim loopback`: measures where recorded audio lands relative to where it was played.
+///
+/// Plays a train of single-sample clicks from one track while recording the device's input on
+/// another, then finds each click in the take. With a cable from an output to an input, and a
+/// device that reports its latency truthfully, every click lands on the sample it was played at:
+/// the offset printed is the engine's placement error on this hardware.
+pub fn loopback(device: DeviceOptions, input: (u16, u8), seconds: f64) -> CommandResult {
+    const CLICK_TRACK: TrackId = TrackId(1);
+    const RECORD_TRACK: TrackId = TrackId(2);
+    crate::ui::init()?;
+    let dir = std::env::temp_dir().join(format!("riddim-loopback-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut device = device;
+    device.capture = true;
+    let mut running = Running::start(device.config(false), &dir, false)?;
+    let info = running.engine.stream_info().clone();
+    let rate = info.sample_rate as u32;
+    println!(
+        "device: {} at {} Hz, {} frames; reported latency {} in + {} out = {} frames",
+        info.device_name,
+        info.sample_rate,
+        info.max_frames,
+        info.input_latency_frames,
+        info.output_latency_frames,
+        info.input_latency_frames + info.output_latency_frames
+    );
+
+    // One click every quarter second, starting half a second in.
+    let spacing = rate as usize / 4;
+    let total = (seconds * rate as f64) as usize;
+    let mut signal = vec![0.0f32; total];
+    let clicks: Vec<usize> = (0..)
+        .map(|n| rate as usize / 2 + n * spacing)
+        .take_while(|&at| at + spacing < total)
+        .collect();
+    for &at in &clicks {
+        signal[at] = 0.5;
+    }
+    let click_path = dir.join("clicks.wav");
+    write_wav(&click_path, rate as f64, vec![signal])?;
+    let media = riddim::import::audio_file(&click_path, riddim::model::MediaId(10))
+        .map_err(|e| e.to_string())?;
+    let clip = riddim::import::clip_for_media(&media, ClipId(11), Position::START);
+    running.apply(vec![
+        Op::AddMedia { media },
+        Op::AddTrack {
+            index: 0,
+            track: Track::new(CLICK_TRACK, "clicks", TrackKind::Audio),
+        },
+        Op::AddClip {
+            track: CLICK_TRACK,
+            clip,
+        },
+        Op::AddTrack {
+            index: 1,
+            track: Track::new(RECORD_TRACK, "return", TrackKind::Audio),
+        },
+        Op::SetTrack {
+            id: RECORD_TRACK,
+            change: TrackChange::Input(TrackInput::Audio {
+                first_channel: input.0,
+                channels: input.1,
+            }),
+        },
+        Op::SetTrack {
+            id: RECORD_TRACK,
+            change: TrackChange::RecordArmed(true),
+        },
+    ])?;
+
+    running.engine.transport(TransportCommand::Record);
+    let mut finished = None;
+    running.pump_until(Duration::from_secs_f64(seconds), |_| false);
+    running.engine.transport(TransportCommand::Stop);
+    running.pump_until(Duration::from_secs(30), |event| {
+        if let Event::RecordingFinished {
+            track,
+            media: Some(media),
+            ..
+        } = event
+        {
+            if *track == RECORD_TRACK {
+                finished = Some(*media);
+            }
+        }
+        finished.is_some()
+    });
+    let Some(media) = finished else {
+        return Err("no take was recorded".into());
+    };
+    let model = running.engine.model();
+    let take_path = PathBuf::from(
+        &model
+            .media(media)
+            .ok_or("the take is missing from the model")?
+            .path,
+    );
+    let take = wav::read(&take_path).map_err(|e| e.to_string())?;
+    let status = running.engine.status();
+    drop(running);
+
+    // For each click, the loudest sample within a window around where it should be.
+    let channel = &take.channels[0];
+    let window = spacing as i64 / 2;
+    let mut offsets = Vec::new();
+    for &at in &clicks {
+        let from = (at as i64 - window).max(0) as usize;
+        let to = ((at as i64 + window) as usize).min(channel.len());
+        if from >= to {
+            continue;
+        }
+        let (index, level) =
+            channel[from..to]
+                .iter()
+                .enumerate()
+                .fold((0, 0.0f32), |best, (i, s)| {
+                    if s.abs() > best.1 {
+                        (i, s.abs())
+                    } else {
+                        best
+                    }
+                });
+        if level > 0.01 {
+            offsets.push((from + index) as i64 - at as i64);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if offsets.is_empty() {
+        println!(
+            "no clicks came back: is an output connected to input {}?",
+            input.0 + 1
+        );
+        return Ok(false);
+    }
+    let (min, max) = (
+        *offsets.iter().min().unwrap(),
+        *offsets.iter().max().unwrap(),
+    );
+    println!(
+        "{} of {} clicks found; offset from where they were played: {min} to {max} samples",
+        offsets.len(),
+        clicks.len()
+    );
+    println!(
+        "(positive means the take is late: the device's real round trip is longer than it reports)"
+    );
+    println!(
+        "frames lost while recording {}  audio-thread heap operations {}",
+        status.capture_dropped, status.rt_violations
+    );
+    Ok(min.abs() <= 1 && max.abs() <= 1)
 }

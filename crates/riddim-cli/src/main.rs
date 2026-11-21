@@ -112,6 +112,16 @@ enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Measure recording alignment through a cable from an output to an input.
+    Loopback {
+        #[command(flatten)]
+        device: DeviceArgs,
+        /// Device input the cable returns on, e.g. "1" or "1-2".
+        #[arg(long, default_value = "1")]
+        input: String,
+        #[arg(long, default_value_t = 5.0)]
+        seconds: f64,
+    },
     /// Open, resize and close a plugin's editor repeatedly (macOS).
     EditorCycle {
         plugin: String,
@@ -165,6 +175,9 @@ enum SessionAction {
         /// Add an audio track armed to record these device inputs, e.g. "1" or "1-2".
         #[arg(long, value_name = "INPUTS")]
         audio_input: Option<String>,
+        /// How many armed audio tracks to create on that input.
+        #[arg(long, default_value_t = 1)]
+        audio_tracks: u8,
         /// Bars of metronome before recording starts.
         #[arg(long, default_value_t = 0)]
         count_in: u8,
@@ -326,6 +339,7 @@ fn main() -> ExitCode {
                 midi,
                 sequence,
                 audio_input,
+                audio_tracks,
                 count_in,
             } => match audio_input.as_deref().map(parse_inputs).transpose() {
                 Ok(audio_input) => session::session_new(
@@ -336,6 +350,7 @@ fn main() -> ExitCode {
                         midi,
                         sequence,
                         audio_input,
+                        audio_tracks,
                         count_in,
                     },
                 ),
@@ -361,6 +376,14 @@ fn main() -> ExitCode {
                 rate,
                 block,
             } => session::session_render(&project, &out, seconds, rate, block),
+        },
+        Command::Loopback {
+            device,
+            input,
+            seconds,
+        } => match parse_inputs(&input) {
+            Ok(input) => session::loopback(device.options(), input, seconds),
+            Err(message) => Err(message),
         },
         Command::EditorCycle { plugin, count } => commands::editor_cycle(&context, &plugin, count),
         Command::Devices => commands::devices(),

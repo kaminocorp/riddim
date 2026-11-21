@@ -8,8 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Tie real-time sections to LLVM's RealtimeSanitizer, which also catches locks and blocking
+# system calls. Takes effect only when built with RTSAN_ENABLE=1; see scripts/rtsan.sh.
+rtsan = ["dep:rtsan-standalone"]
+
 [dependencies]
 rtrb.workspace = true
+rtsan-standalone = { workspace = true, optional = true }
 
 [lints]
 workspace = true

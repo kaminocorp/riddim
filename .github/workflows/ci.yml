@@ -50,6 +50,22 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  rtsan:
+    name: RealtimeSanitizer (real-time sections)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rtsan
+          workspaces: ". -> target/rtsan"
+      # Every real-time section runs as an RTSan context: allocation, locks and blocking system
+      # calls inside one stop the test. A self-check in riddim-rt fails the run if the sanitizer
+      # is not actually active.
+      - name: Tests under RealtimeSanitizer
+        run: scripts/rtsan.sh
+
   third-party:
     name: third-party plugins (Surge XT on Linux)
     runs-on: ubuntu-24.04
