@@ -54,7 +54,7 @@ Run on the Linux build machine (x86-64, 8 cores and 16 threads, Rust 1.100.0) wi
 | the CI job in a clean container (`scripts/ci-clean.sh`: fmt, clippy, test, on two cores) | passed: 244 tests; likewise 66, 158, 180 and 209 for the heads of the four phase branches below this one |
 | third-party conformance run: Surge XT and Surge XT Effects, VST3 and CLAP | passed, all four |
 | third-party demo song, VST3 and CLAP | passed, both |
-| `scripts/rtsan.sh` (RealtimeSanitizer) | 170 passed, 0 failed, with the sanitizer live, including the bridge tests, the CLAP fixture tests and the CLAP demo song |
+| `scripts/rtsan.sh` (RealtimeSanitizer) | 171 passed, 0 failed, with the sanitizer live, including the bridge tests, the CLAP fixture tests and the CLAP demo song |
 | `cargo deny --all-features check` | advisories, bans, licences, sources all ok (new dependencies: `clack-host`, `clack-extensions`, `clap-sys`, `libc`; MIT or Apache-2.0) |
 | `scripts/stress.sh 60` under RealtimeSanitizer | passed, run on two cores while the rest of the machine was busy with the hour-long sessions: 15,175 edits, 199 buffer-size changes and 375 takes in 60 s; 29,943 blocks served; 0 heap operations on the audio path, 0 messages lost. (Five threads on two cores: the device's timer ran late 2,466 times, which is the machine's doing and not something the run fails on) |
 
