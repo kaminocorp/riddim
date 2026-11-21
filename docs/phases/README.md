@@ -2,7 +2,7 @@
 
 One page across the five phase notes in this folder: every exit criterion of the vision's phasing (§5), whether it is met, and what the unmet ones are waiting for. The detail, the evidence and the Mac checklists are in the notes themselves.
 
-**In one line (2026-11-21):** every phase's code is written and passes on Linux; 9 of the 22 criteria are met there, 5 are met only in a weaker form (in simulation, fast-forwarded, or with stand-in plugins), and 8 are not met. None of the 13 that fall short can be finished from the Linux build machine: they need Phil's Mac, the four commercial plugins, Whiplash, or four weeks of calendar time. Nothing has run on macOS at all.
+**In one line (2026-11-21):** every phase's code is written and passes on Linux; 9 of the 22 criteria are met there, 5 are met only in a weaker form (in simulation, on a timer instead of an audio interface, or with stand-in plugins), and 8 are not met. None of the 13 that fall short can be finished from the Linux build machine: they need Phil's Mac, the four commercial plugins, Whiplash, or four weeks of calendar time. Nothing has run on macOS at all.
 
 ## Every criterion
 
@@ -17,7 +17,7 @@ One page across the five phase notes in this folder: every exit criterion of the
 | P2 | 2 | Recorded audio within ±1 sample of a loopback-calibrated position | Met in simulation, exactly | Mac and an interface, for real hardware |
 | P2 | 3 | Zero allocations on the audio thread under RealtimeSanitizer | Met (run locally, not in CI: D12) | |
 | P2 | 4 | Ops round-trip: apply, inverse, apply restores the model | Met | |
-| P2 | 5 | 60 minutes on 8 tracks with no dropped buffers; `kill -9` keeps what was flushed | Met fast-forwarded | Mac, for a real-time hour on real disks |
+| P2 | 5 | 60 minutes on 8 tracks with no dropped buffers; `kill -9` keeps what was flushed | Met on Linux in real time, on a timer instead of an interface (no frame lost in the hour; the timer itself was late 26 times) | Mac, for the hour on a real interface |
 | P3 | 1 | Whiplash v0.5: a demo song with all four plugins, bounced | Not met (stand-in: Surge XT demo song) | Whiplash, the four plugins, Mac |
 | P3 | 2 | PDC null test to −120 dBFS through sends and buses | Met (exactly zero) | |
 | P3 | 3 | Two offline bounces are bit-identical | Met | |
