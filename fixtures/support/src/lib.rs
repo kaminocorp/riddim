@@ -166,6 +166,56 @@ fn write_if_changed(path: &Path, bytes: &[u8]) {
     std::fs::rename(&tmp, path).unwrap();
 }
 
+/// The engine's C ABI as a dynamic library, built on demand. Returns its path.
+pub fn ffi_library() -> PathBuf {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut command = Command::new(cargo);
+            command.current_dir(workspace_root()).args([
+                "build",
+                "--quiet",
+                "--message-format=json",
+                "-p",
+                "riddim-ffi",
+                "--lib",
+            ]);
+            if !cfg!(debug_assertions) {
+                command.arg("--release");
+            }
+            let output = command
+                .output()
+                .expect("could not run cargo to build riddim-ffi");
+            assert!(
+                output.status.success(),
+                "building riddim-ffi failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if message["reason"] != "compiler-artifact"
+                    || message["target"]["name"] != "riddim_ffi"
+                {
+                    continue;
+                }
+                let library = message["filenames"].as_array().and_then(|files| {
+                    files
+                        .iter()
+                        .filter_map(|f| f.as_str())
+                        .find(|f| f.ends_with(std::env::consts::DLL_SUFFIX))
+                });
+                if let Some(library) = library {
+                    return PathBuf::from(library);
+                }
+            }
+            panic!("cargo did not report a dynamic library for riddim-ffi");
+        })
+        .clone()
+}
+
 /// The scanner child-process executable, built on demand.
 pub fn scanner_exe() -> PathBuf {
     fixture_libraries()

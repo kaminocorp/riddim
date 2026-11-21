@@ -289,12 +289,26 @@ impl Engine {
 
     /// Asks every loaded plugin for its current state and stores it in the model, ready to be
     /// saved with the project. Blocks until done.
+    ///
+    /// With an external main thread this must not be called on that thread (the plugins answer
+    /// from it): use [`request_plugin_states`](Self::request_plugin_states) there instead.
     pub fn capture_plugin_states(&self) -> Result<Applied, String> {
+        self.request_plugin_states()
+            .recv()
+            .map_err(|_| "the engine has shut down".to_string())?
+    }
+
+    /// As [`capture_plugin_states`](Self::capture_plugin_states), without waiting: the result
+    /// arrives on the returned channel once every plugin has answered.
+    pub fn request_plugin_states(&self) -> Receiver<Result<Applied, String>> {
         let (reply, outcome) = mpsc::channel();
         self.send(ControlMsg::CapturePluginStates(reply));
         outcome
-            .recv()
-            .map_err(|_| "the engine has shut down".to_string())?
+    }
+
+    /// True if the engine runs on the manual device and is advanced with [`run`](Self::run).
+    pub fn is_manual(&self) -> bool {
+        matches!(self.stream, Some(Stream::Manual(_)))
     }
 
     /// Replaces the whole model, as when opening a project. Returns the new revision.

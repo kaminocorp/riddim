@@ -1,9 +1,11 @@
 //! What the engine tells its client.
 
 use riddim_model::{ClipId, MediaId, Op, SlotId, TrackId};
+use serde::Serialize;
 
 /// Transport state as the client sees it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TransportState {
     Stopped,
     Playing,
@@ -11,7 +13,10 @@ pub enum TransportState {
 }
 
 /// An event from the engine. Subscribe with [`Engine::subscribe`](crate::Engine::subscribe).
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Events serialise as JSON objects tagged with `"event"`, which is how they cross the C ABI.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "event")]
 pub enum Event {
     /// A batch of ops was applied. `inverses` undo it, applied first to last.
     Applied {

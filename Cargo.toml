@@ -7,6 +7,8 @@ members = [
     "crates/riddim-graph",
     "crates/riddim-disk",
     "crates/riddim-engine",
+    "crates/riddim",
+    "crates/riddim-ffi",
     "crates/riddim-plugin",
     "crates/riddim-io",
     "crates/riddim-cli",
@@ -30,6 +32,7 @@ riddim-model = { path = "crates/riddim-model" }
 riddim-graph = { path = "crates/riddim-graph" }
 riddim-disk = { path = "crates/riddim-disk" }
 riddim-engine = { path = "crates/riddim-engine" }
+riddim = { path = "crates/riddim" }
 riddim-plugin = { path = "crates/riddim-plugin" }
 riddim-io = { path = "crates/riddim-io" }
 riddim-test-support = { path = "fixtures/support" }

@@ -1,22 +1,22 @@
-//! `riddim`: a headless tool for exercising the engine's parts.
+//! `riddim`: a headless tool for exercising the engine.
 //!
-//! Phase 1 scope: scan plugins, inspect and check them, render a test sequence offline, round-
-//! trip their state, and play one live through the audio device with its editor open.
+//! Hosting-level commands (`scan`, `info`, `check`, `state`, `editor-cycle`) talk to plugins
+//! directly. Everything that makes sound (`play`, `render`, `session ...`) runs the engine.
 
 mod commands;
 mod resolve;
-mod spike;
-mod wav;
+mod session;
+mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 // Count heap traffic inside real-time sections in every build of the tool, so "audio-thread
 // heap operations: 0" in its output is a measurement and not an assumption.
 #[global_allocator]
-static ALLOC: riddim_rt::guard::RtCheckAllocator = riddim_rt::guard::RtCheckAllocator::system();
+static ALLOC: riddim::rt::RtCheckAllocator = riddim::rt::RtCheckAllocator::system();
 
 #[derive(Parser)]
 #[command(
@@ -60,11 +60,14 @@ enum Command {
         #[arg(long, default_value_t = 128)]
         block: u32,
     },
-    /// Render a test sequence through a plugin, offline, to a WAV file.
+    /// Render a plugin playing a MIDI file (or the test arpeggio), offline, to a WAV file.
     Render {
         plugin: String,
         #[arg(long, short)]
         out: PathBuf,
+        /// A Standard MIDI File to play. Without it, the built-in arpeggio loops.
+        #[arg(long)]
+        midi: Option<PathBuf>,
         #[arg(long, default_value_t = 4.0)]
         seconds: f64,
         #[arg(long, default_value_t = 48_000.0)]
@@ -80,31 +83,34 @@ enum Command {
         #[command(subcommand)]
         action: StateAction,
     },
-    /// Play a plugin live: audio device out, MIDI keyboards in, editor window open.
+    /// Play a plugin live through the engine: device out, MIDI keyboards in, editor open.
     Play {
         plugin: String,
-        #[arg(long, default_value_t = 48_000.0)]
-        rate: f64,
-        #[arg(long, default_value_t = 128)]
-        buffer: u32,
+        #[command(flatten)]
+        device: DeviceArgs,
         /// Stop after this many seconds (default: until Enter is pressed or the editor closes).
         #[arg(long)]
         seconds: Option<f64>,
-        /// Play the built-in test arpeggio.
+        /// Loop the built-in test arpeggio.
         #[arg(long)]
         sequence: bool,
+        /// Play this Standard MIDI File.
+        #[arg(long)]
+        midi: Option<PathBuf>,
         /// Do not open the plugin's editor.
         #[arg(long)]
         no_editor: bool,
-        /// Use the silent null device instead of real audio hardware.
-        #[arg(long)]
-        null_device: bool,
         /// Restore this state file after loading.
         #[arg(long)]
         state: Option<PathBuf>,
         /// Save the plugin's state to this file on exit.
         #[arg(long)]
         save_state: Option<PathBuf>,
+    },
+    /// Small projects: build one, play it, record a take into it, render it.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
     },
     /// Open, resize and close a plugin's editor repeatedly (macOS).
     EditorCycle {
@@ -114,6 +120,109 @@ enum Command {
     },
     /// List audio devices.
     Devices,
+}
+
+#[derive(Args, Clone, Copy)]
+struct DeviceArgs {
+    #[arg(long, default_value_t = 48_000.0)]
+    rate: f64,
+    #[arg(long, default_value_t = 128)]
+    buffer: u32,
+    /// Use the silent, timer-driven null device instead of audio hardware.
+    #[arg(long)]
+    null_device: bool,
+    /// With --null-device: feed the output back to the input after this many frames.
+    #[arg(long, value_name = "FRAMES")]
+    loopback: Option<u32>,
+}
+
+impl DeviceArgs {
+    fn options(self) -> session::DeviceOptions {
+        session::DeviceOptions {
+            rate: self.rate,
+            buffer: self.buffer,
+            null_device: self.null_device,
+            loopback: self.loopback,
+            capture: false,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Create a project file with an instrument track and, optionally, an armed audio track.
+    New {
+        project: PathBuf,
+        /// Plugin for the instrument track.
+        #[arg(long)]
+        instrument: Option<String>,
+        /// Standard MIDI File for the instrument track.
+        #[arg(long)]
+        midi: Option<PathBuf>,
+        /// Put the test arpeggio on the instrument track.
+        #[arg(long)]
+        sequence: bool,
+        /// Add an audio track armed to record these device inputs, e.g. "1" or "1-2".
+        #[arg(long, value_name = "INPUTS")]
+        audio_input: Option<String>,
+        /// Bars of metronome before recording starts.
+        #[arg(long, default_value_t = 0)]
+        count_in: u8,
+    },
+    /// Describe a project file.
+    Info { project: PathBuf },
+    /// Play a project.
+    Play {
+        project: PathBuf,
+        #[command(flatten)]
+        device: DeviceArgs,
+        #[arg(long)]
+        seconds: Option<f64>,
+        /// Open the instrument's editor.
+        #[arg(long)]
+        editor: bool,
+    },
+    /// Play a project and record its armed tracks; the takes and plugin states are saved back.
+    Record {
+        project: PathBuf,
+        #[command(flatten)]
+        device: DeviceArgs,
+        #[arg(long)]
+        seconds: Option<f64>,
+        #[arg(long)]
+        editor: bool,
+    },
+    /// Render a project offline to a WAV file and print a fingerprint of the audio.
+    Render {
+        project: PathBuf,
+        #[arg(long, short)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 48_000.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 128)]
+        block: u32,
+    },
+}
+
+/// Parses "1" or "1-2" (1-based device inputs) into a first channel and a count.
+fn parse_inputs(text: &str) -> Result<(u16, u8), String> {
+    let bad = || format!("'{text}' is not an input like \"1\" or \"1-2\"");
+    let (first, last) = match text.split_once('-') {
+        Some((first, last)) => (
+            first.parse::<u16>().map_err(|_| bad())?,
+            last.parse::<u16>().map_err(|_| bad())?,
+        ),
+        None => {
+            let only = text.parse::<u16>().map_err(|_| bad())?;
+            (only, only)
+        }
+    };
+    if first == 0 || last < first || last - first > 1 {
+        return Err(bad());
+    }
+    Ok((first - 1, (last - first + 1) as u8))
 }
 
 #[derive(Subcommand)]
@@ -165,18 +274,22 @@ fn main() -> ExitCode {
         Command::Render {
             plugin,
             out,
+            midi,
             seconds,
             rate,
             block,
             state,
-        } => commands::render(
+        } => session::render(
             &context,
             &plugin,
-            &out,
-            seconds,
-            rate,
-            block,
-            state.as_deref(),
+            session::RenderOptions {
+                out,
+                seconds,
+                rate,
+                buffer: block,
+                state,
+                midi,
+            },
         ),
         Command::State {
             action: StateAction::Save { plugin, out },
@@ -186,28 +299,69 @@ fn main() -> ExitCode {
         } => commands::state_roundtrip(&context, &plugin, state.as_deref()),
         Command::Play {
             plugin,
-            rate,
-            buffer,
+            device,
             seconds,
             sequence,
+            midi,
             no_editor,
-            null_device,
             state,
             save_state,
-        } => commands::play(
+        } => session::play(
             &context,
             &plugin,
-            commands::PlayOptions {
-                rate,
-                buffer,
+            session::PlayOptions {
+                device: device.options(),
                 seconds,
                 sequence,
+                midi,
                 editor: !no_editor,
-                null_device,
                 state,
                 save_state,
             },
         ),
+        Command::Session { action } => match action {
+            SessionAction::New {
+                project,
+                instrument,
+                midi,
+                sequence,
+                audio_input,
+                count_in,
+            } => match audio_input.as_deref().map(parse_inputs).transpose() {
+                Ok(audio_input) => session::session_new(
+                    &context,
+                    &project,
+                    session::NewOptions {
+                        instrument,
+                        midi,
+                        sequence,
+                        audio_input,
+                        count_in,
+                    },
+                ),
+                Err(message) => Err(message),
+            },
+            SessionAction::Info { project } => session::session_info(&project),
+            SessionAction::Play {
+                project,
+                device,
+                seconds,
+                editor,
+            } => session::session_play(&project, device.options(), seconds, editor),
+            SessionAction::Record {
+                project,
+                device,
+                seconds,
+                editor,
+            } => session::session_record(&project, device.options(), seconds, editor),
+            SessionAction::Render {
+                project,
+                out,
+                seconds,
+                rate,
+                block,
+            } => session::session_render(&project, &out, seconds, rate, block),
+        },
         Command::EditorCycle { plugin, count } => commands::editor_cycle(&context, &plugin, count),
         Command::Devices => commands::devices(),
     };
