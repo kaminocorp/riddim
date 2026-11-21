@@ -86,6 +86,9 @@ enum Command {
         /// Restore this state file before rendering.
         #[arg(long)]
         state: Option<PathBuf>,
+        /// Extra threads to render with. The file is the same whatever the number.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
     /// Save, restore and compare plugin state.
     State {
@@ -153,6 +156,13 @@ struct DeviceArgs {
     /// With --null-device: feed the output back to the input after this many frames.
     #[arg(long, value_name = "FRAMES")]
     loopback: Option<u32>,
+    /// Threads that help the audio thread render (default: one fewer than the cores, at most
+    /// 7, on audio hardware; none on the null device). The sound is the same either way.
+    #[arg(long, value_name = "N")]
+    render_threads: Option<usize>,
+    /// Change to this buffer size a few seconds in, while running.
+    #[arg(long, value_name = "FRAMES")]
+    switch_buffer: Option<u32>,
 }
 
 impl DeviceArgs {
@@ -163,6 +173,8 @@ impl DeviceArgs {
             null_device: self.null_device,
             loopback: self.loopback,
             capture: false,
+            render_threads: self.render_threads,
+            switch_buffer: self.switch_buffer,
         }
     }
 }
@@ -225,7 +237,15 @@ enum SessionAction {
         seconds: Option<f64>,
         #[arg(long)]
         editor: bool,
+        /// Loop this stretch (beats, START:END) while recording: each time round is a take.
+        #[arg(long = "loop", value_name = "BEATS")]
+        loop_range: Option<session::BeatRange>,
+        /// Record only inside this stretch (beats, START:END), replacing what is there.
+        #[arg(long, value_name = "BEATS")]
+        punch: Option<session::BeatRange>,
     },
+    /// Edit a project with ops given as JSON: a file holding an array of ops, or `-` for stdin.
+    Apply { project: PathBuf, ops: PathBuf },
     /// Render a project offline to a WAV file and print a fingerprint of the audio.
     Render {
         project: PathBuf,
@@ -243,6 +263,9 @@ enum SessionAction {
         /// Render only this track id, as a stem (repeatable; see `session info` for ids).
         #[arg(long, value_name = "TRACK")]
         stem: Vec<u64>,
+        /// Extra threads to render with. The file is the same whatever the number.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
 }
 
@@ -332,6 +355,7 @@ fn main() -> ExitCode {
             rate,
             block,
             state,
+            threads,
         } => session::render(
             &context,
             &plugin,
@@ -342,6 +366,7 @@ fn main() -> ExitCode {
                 buffer: block,
                 state,
                 midi,
+                threads,
             },
         ),
         Command::State {
@@ -415,7 +440,19 @@ fn main() -> ExitCode {
                 device,
                 seconds,
                 editor,
-            } => session::session_record(&project, device.options(), seconds, editor),
+                loop_range,
+                punch,
+            } => session::session_record(
+                &project,
+                device.options(),
+                session::RecordOptions {
+                    seconds,
+                    editor,
+                    loop_range,
+                    punch,
+                },
+            ),
+            SessionAction::Apply { project, ops } => session::session_apply(&project, &ops),
             SessionAction::Render {
                 project,
                 out,
@@ -424,6 +461,7 @@ fn main() -> ExitCode {
                 block,
                 tail,
                 stem,
+                threads,
             } => session::session_render(
                 &project,
                 session::SessionRenderOptions {
@@ -433,6 +471,7 @@ fn main() -> ExitCode {
                     buffer: block,
                     tail,
                     stem,
+                    threads,
                 },
             ),
         },

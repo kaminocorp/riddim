@@ -617,3 +617,170 @@ fn a_mix_with_an_insert_a_send_and_automation_bounces_to_stems() {
     assert_eq!(lonely.status.code(), Some(2));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn loop_takes_punch_routing_threads_and_a_live_buffer_change() {
+    let dir = temp_dir("v1");
+    let project = dir.join("song.json");
+    let project_arg = project.to_str().unwrap();
+    let ok = |output: Output| {
+        assert!(
+            output.status.success(),
+            "{}{}",
+            stdout(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout(&output)
+    };
+    ok(riddim(&[
+        "session",
+        "new",
+        project_arg,
+        "--instrument",
+        &plugin("synth"),
+        "--sequence",
+        "--audio-input",
+        "1",
+    ]));
+
+    // Loop recording: the first two beats, round and round for two and a half seconds
+    // (a second a time at 120 bpm), through a simulated cable.
+    let text = ok(riddim(&[
+        "session",
+        "record",
+        project_arg,
+        "--null-device",
+        "--loopback",
+        "256",
+        "--seconds",
+        "2.5",
+        "--loop",
+        "0:2",
+    ]));
+    assert!(text.contains("take 1 on track 4: 48000 frames"), "{text}");
+    assert!(text.contains("take 2 on track 4: 48000 frames"), "{text}");
+    assert!(text.contains("take 3 on track 4"), "{text}");
+    assert!(text.contains("frames lost while recording 0"), "{text}");
+    let info = ok(riddim(&["session", "info", project_arg]));
+    assert!(info.contains("loop beats 0.00 to 2.00 (on)"), "{info}");
+    assert!(info.contains("take 1, muted"), "{info}");
+    assert!(
+        info.contains("take 2)"),
+        "the newest whole take should be the one heard: {info}"
+    );
+    assert!(info.contains("take 3, muted"), "{info}");
+
+    // Punch recording into the same track: one beat, and only that.
+    let text = ok(riddim(&[
+        "session",
+        "record",
+        project_arg,
+        "--null-device",
+        "--loopback",
+        "256",
+        "--seconds",
+        "2",
+        "--punch",
+        "1:2",
+    ]));
+    assert!(
+        text.contains("recording 1 track(s) from sample 24000"),
+        "{text}"
+    );
+    assert!(text.contains("take on track 4: 24000 frames"), "{text}");
+    let info = ok(riddim(&["session", "info", project_arg]));
+    assert!(info.contains("punch beats 1.00 to 2.00 (on)"), "{info}");
+
+    // Anything the model can express, from a file of ops: a bus, and the synth's second
+    // output routed to it.
+    let ops = dir.join("ops.json");
+    std::fs::write(
+        &ops,
+        r#"[
+          {"op":"set_punch","range":null,"enabled":false},
+          {"op":"set_loop","range":null,"enabled":false},
+          {"op":"add_track","index":0,"track":{"id":50,"name":"Second output","kind":"bus",
+            "gain":1.0,"pan":0.0,"mute":false,"solo":false,"record_armed":false,"monitor":false,
+            "input":{"type":"none"},"output":{"type":"master"}}},
+          {"op":"set_plugin_routing","track":1,"slot":2,"outputs":[{"bus":1,"target":50}]}
+        ]"#,
+    )
+    .unwrap();
+    let text = ok(riddim(&[
+        "session",
+        "apply",
+        project_arg,
+        ops.to_str().unwrap(),
+    ]));
+    assert!(text.contains("applied 4 op(s)"), "{text}");
+    let info = ok(riddim(&["session", "info", project_arg]));
+    assert!(info.contains("output 2 to track 50"), "{info}");
+    assert!(
+        info.contains("plugin Riddim Test Synth in slot 2"),
+        "{info}"
+    );
+    // An op the model refuses is reported with its position, and nothing is saved.
+    std::fs::write(
+        &ops,
+        r#"[{"op":"set_metronome","metronome":{"enabled":true,"gain":0.5,"count_in_bars":0}},
+            {"op":"remove_track","id":77}]"#,
+    )
+    .unwrap();
+    let refused = riddim(&["session", "apply", project_arg, ops.to_str().unwrap()]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("op 1 was refused"));
+    // (And the bus cannot be removed while the synth's output is routed to it.)
+    std::fs::write(&ops, r#"[{"op":"remove_track","id":50}]"#).unwrap();
+    let refused = riddim(&["session", "apply", project_arg, ops.to_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("op 0 was refused"));
+    assert!(ok(riddim(&["session", "info", project_arg])).contains("Second output"));
+
+    // Bounced with and without render threads: the same audio, to the bit.
+    let fingerprint = |threads: &str| {
+        let out = dir.join(format!("mix-{threads}.wav"));
+        let text = ok(riddim(&[
+            "session",
+            "render",
+            project_arg,
+            "--out",
+            out.to_str().unwrap(),
+            "--seconds",
+            "3",
+            "--threads",
+            threads,
+        ]));
+        let print = text
+            .split("fingerprint ")
+            .nth(1)
+            .expect("a fingerprint")
+            .trim()
+            .to_string();
+        (print, std::fs::read(out).unwrap())
+    };
+    let (one, one_bytes) = fingerprint("0");
+    let (four, four_bytes) = fingerprint("4");
+    assert_eq!(one, four);
+    assert!(one_bytes == four_bytes);
+    assert!(!one.starts_with("cbf29ce484222325"), "the bounce is empty");
+
+    // Played on a running device with render threads, changing the buffer size on the way.
+    let text = ok(riddim(&[
+        "session",
+        "play",
+        project_arg,
+        "--null-device",
+        "--seconds",
+        "1.5",
+        "--render-threads",
+        "2",
+        "--switch-buffer",
+        "256",
+    ]));
+    assert!(
+        text.contains("buffer size changed to 256 frames while running"),
+        "{text}"
+    );
+    assert!(text.contains("audio-thread heap operations 0"), "{text}");
+    assert!(text.contains("messages lost 0"), "{text}");
+    std::fs::remove_dir_all(&dir).ok();
+}

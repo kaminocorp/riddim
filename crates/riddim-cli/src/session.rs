@@ -47,6 +47,11 @@ pub struct DeviceOptions {
     pub loopback: Option<u32>,
     /// Open the device's inputs.
     pub capture: bool,
+    /// Threads that help the audio thread render. `None` lets the engine pick.
+    pub render_threads: Option<usize>,
+    /// Change to this buffer size a few seconds into playing, to show that it can be done
+    /// on the fly.
+    pub switch_buffer: Option<u32>,
 }
 
 impl DeviceOptions {
@@ -183,10 +188,35 @@ pub struct Running {
     pub engine: Engine,
     pub main: MainThread,
     pub events: Receiver<Event>,
+    /// A buffer size to change to while running (see [`DeviceOptions::switch_buffer`]).
+    switch_buffer: Option<u32>,
 }
 
 impl Running {
-    pub fn start(device: DeviceConfig, dir: &Path, midi_input: bool) -> Result<Running, String> {
+    /// Starts an engine on the device `options` describe (or, with `manual`, on the manual
+    /// device, for rendering).
+    pub fn open(
+        options: &DeviceOptions,
+        manual: bool,
+        dir: &Path,
+        midi_input: bool,
+    ) -> Result<Running, String> {
+        let mut running = Running::start(
+            options.config(manual),
+            dir,
+            midi_input,
+            options.render_threads,
+        )?;
+        running.switch_buffer = options.switch_buffer;
+        Ok(running)
+    }
+
+    fn start(
+        device: DeviceConfig,
+        dir: &Path,
+        midi_input: bool,
+        render_threads: Option<usize>,
+    ) -> Result<Running, String> {
         // The manual device is only ever used for rendering.
         let process_mode = match device {
             DeviceConfig::Manual(_) => riddim::plugins::ProcessMode::Offline,
@@ -201,7 +231,7 @@ impl Running {
             butler: Default::default(),
             midi_input,
             process_mode,
-            render_threads: None,
+            render_threads,
             parallel_from: riddim::PARALLEL_FROM_STEPS,
             streaming: Default::default(),
         };
@@ -214,6 +244,7 @@ impl Running {
             engine,
             main,
             events,
+            switch_buffer: None,
         })
     }
 
@@ -363,6 +394,7 @@ pub fn bounce_model(
     seconds: f64,
     tail_seconds: f64,
     tracks: Option<Vec<TrackId>>,
+    render_threads: usize,
 ) -> Result<(riddim::BounceResult, u64), String> {
     let request = riddim::BounceRequest {
         path: out.to_path_buf(),
@@ -377,7 +409,7 @@ pub fn bounce_model(
         format: SampleFormat::Float32,
         media_dir: media.to_path_buf(),
         tracks,
-        render_threads: 0,
+        render_threads,
     };
     let result = riddim::bounce(model, &request)?;
     for missing in &result.missing_plugins {
@@ -402,6 +434,8 @@ pub struct RenderOptions {
     pub buffer: u32,
     pub state: Option<PathBuf>,
     pub midi: Option<PathBuf>,
+    /// Extra threads to render with.
+    pub threads: usize,
 }
 
 /// `riddim render`: a plugin playing a MIDI file (or the test arpeggio), offline, to a WAV.
@@ -431,6 +465,7 @@ pub fn render(context: &Context, spec: &str, options: RenderOptions) -> CommandR
         options.seconds,
         0.0,
         None,
+        options.threads,
     )?;
     println!(
         "rendered {:.2} s of {} to {} (peak {:.4}, fingerprint {:016x})",
@@ -473,9 +508,22 @@ fn interact(
     }
     let started = Instant::now();
     let mut plugin_events = Vec::new();
+    // A change of buffer size, if one was asked for: three seconds in, or halfway if the run
+    // is shorter than six.
+    let switch_at = seconds.map_or(3.0, |s| (s / 2.0).min(3.0));
     loop {
         crate::ui::pump(Duration::from_millis(5));
         running.pump(&mut on_event);
+        if running.switch_buffer.is_some() && started.elapsed().as_secs_f64() >= switch_at {
+            let frames = running.switch_buffer.take().expect("just checked");
+            match running.engine.set_buffer_size(frames) {
+                Ok(info) => println!(
+                    "buffer size changed to {} frames while running (asked for {frames}); output latency now {} frames",
+                    info.max_frames, info.output_latency_frames
+                ),
+                Err(error) => eprintln!("error: the buffer size could not be changed: {error}"),
+            }
+        }
         if let Some((open, slot)) = window.as_mut() {
             let Some(instance) = running.main.instance_mut(*slot) else {
                 break;
@@ -525,6 +573,12 @@ fn print_summary(running: &Running) -> bool {
         "blocks {}  xruns {}  audio-thread heap operations {}  frames lost while recording {}",
         status.blocks, status.xruns, status.rt_violations, status.capture_dropped
     );
+    println!(
+        "peak dsp load {:.0}%  frames of streamed files not read in time {}  messages lost {}",
+        status.dsp_load * 100.0,
+        status.playback_starved,
+        status.events_lost
+    );
     status.rt_violations == 0 && status.capture_dropped == 0
 }
 
@@ -533,11 +587,7 @@ pub fn play(context: &Context, spec: &str, options: PlayOptions) -> CommandResul
     let descriptor = context.resolve(spec)?;
     crate::ui::init()?;
     let dir = std::env::temp_dir().join(format!("riddim-play-{}", std::process::id()));
-    let mut running = Running::start(
-        options.device.config(false),
-        &dir,
-        !options.device.null_device,
-    )?;
+    let mut running = Running::open(&options.device, false, &dir, !options.device.null_device)?;
     let info = running.engine.stream_info().clone();
     println!(
         "device: {} at {} Hz, {} frames, {} out; output latency {} frames",
@@ -777,6 +827,25 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
     Ok(true)
 }
 
+/// `riddim session apply`: edits a project file with ops given as JSON (an array of ops, as
+/// they cross the C ABI). Anything the engine's model can express can be set up this way.
+pub fn session_apply(project: &Path, ops: &Path) -> CommandResult {
+    let mut model = load_project(project)?;
+    let text = if ops.as_os_str() == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|e| e.to_string())?
+    } else {
+        std::fs::read_to_string(ops).map_err(|e| format!("{}: {e}", ops.display()))?
+    };
+    let ops: Vec<Op> =
+        serde_json::from_str(&text).map_err(|e| format!("the ops are not valid: {e}"))?;
+    model
+        .apply_all(&ops)
+        .map_err(|(index, error)| format!("op {index} was refused: {error}"))?;
+    save_project(project, &model)?;
+    println!("applied {} op(s) to {}", ops.len(), project.display());
+    Ok(true)
+}
+
 /// `riddim session info`.
 pub fn session_info(project: &Path) -> CommandResult {
     let model = load_project(project)?;
@@ -785,6 +854,18 @@ pub fn session_info(project: &Path) -> CommandResult {
         "  tempo {:.2} bpm at the start",
         model.tempo_map.tempo_at(Ticks::ZERO).bpm()
     );
+    let in_beats = |range: riddim::model::LoopRange| {
+        let beats = |position| model.tempo_map.position_to_ticks(position).as_beats_f64();
+        format!("beats {:.2} to {:.2}", beats(range.start), beats(range.end))
+    };
+    if let Some(range) = model.loop_range {
+        let state = if model.loop_enabled { "on" } else { "off" };
+        println!("  loop {} ({state})", in_beats(range));
+    }
+    if let Some(range) = model.punch_range {
+        let state = if model.punch_enabled { "on" } else { "off" };
+        println!("  punch {} ({state})", in_beats(range));
+    }
     for track in model.all_tracks() {
         println!(
             "  track {:>3}  {:<10} {:<24} gain {:.2}{}{}",
@@ -795,16 +876,37 @@ pub fn session_info(project: &Path) -> CommandResult {
             if track.record_armed { "  armed" } else { "" },
             if track.mute { "  muted" } else { "" }
         );
+        if let Some(from) = track.events_from {
+            println!(
+                "      also plays the notes that come out of track {}",
+                from.0
+            );
+        }
         for slot in &track.plugins {
             println!(
-                "      plugin {} ({}:{}){}",
+                "      plugin {} in slot {} ({}:{}){}",
                 slot.plugin.name,
+                slot.id.0,
                 slot.plugin.format,
                 slot.plugin.uid,
                 slot.state
                     .as_ref()
                     .map_or(String::new(), |s| format!(", {} bytes of state", s.len()))
             );
+            for output in &slot.outputs {
+                println!(
+                    "          output {} to track {}",
+                    output.bus + 1,
+                    output.target.0
+                );
+            }
+            if let Some(sidechain) = slot.sidechain {
+                println!(
+                    "          sidechain from track {} ({}-fader)",
+                    sidechain.source.0,
+                    if sidechain.pre_fader { "pre" } else { "post" }
+                );
+            }
         }
         for send in &track.sends {
             println!(
@@ -826,16 +928,27 @@ pub fn session_info(project: &Path) -> CommandResult {
             );
         }
         for clip in &track.clips {
+            let mut notes_on_it = String::new();
+            if let Some(take) = clip.take {
+                notes_on_it.push_str(&format!(", take {}", take.number));
+            }
+            if clip.muted {
+                notes_on_it.push_str(", muted");
+            }
             match &clip.content {
                 ClipContent::Audio { media, length, .. } => {
                     let path = model.media(*media).map_or("?", |m| m.path.as_str());
                     println!(
-                        "      audio clip {} from {path} ({length} frames)",
+                        "      audio clip {} from {path} ({length} frames{notes_on_it})",
                         clip.id.0
                     );
                 }
                 ClipContent::Midi { notes, .. } => {
-                    println!("      midi clip {} ({} notes)", clip.id.0, notes.len())
+                    println!(
+                        "      midi clip {} ({} notes{notes_on_it})",
+                        clip.id.0,
+                        notes.len()
+                    )
                 }
             }
         }
@@ -853,11 +966,7 @@ pub fn session_play(
 ) -> CommandResult {
     let model = load_project(project)?;
     crate::ui::init()?;
-    let mut running = Running::start(
-        device.config(false),
-        &media_dir(project),
-        !device.null_device,
-    )?;
+    let mut running = Running::open(&device, false, &media_dir(project), !device.null_device)?;
     running.engine.load(model)?;
     running.settle()?;
     running
@@ -884,21 +993,82 @@ pub fn session_play(
 }
 
 /// `riddim session record`: plays the project, records every armed track, saves the result.
+/// A stretch of the timeline given on the command line as `START:END` in beats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BeatRange {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl std::str::FromStr for BeatRange {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        let bad = || format!("'{text}' is not a range of beats like \"4:8\"");
+        let (start, end) = text.split_once(':').ok_or_else(bad)?;
+        let range = BeatRange {
+            start: start.trim().parse().map_err(|_| bad())?,
+            end: end.trim().parse().map_err(|_| bad())?,
+        };
+        if range.start < 0.0 || range.end <= range.start {
+            return Err(bad());
+        }
+        Ok(range)
+    }
+}
+
+impl BeatRange {
+    fn range(self) -> riddim::model::LoopRange {
+        let ticks =
+            |beats: f64| Ticks((beats * riddim::time::TICKS_PER_BEAT as f64).round() as i64);
+        riddim::model::LoopRange {
+            start: Position::Beats(ticks(self.start)),
+            end: Position::Beats(ticks(self.end)),
+        }
+    }
+}
+
+pub struct RecordOptions {
+    pub seconds: Option<f64>,
+    pub editor: bool,
+    /// Loop this stretch while recording: every time round becomes a take.
+    pub loop_range: Option<BeatRange>,
+    /// Record only inside this stretch.
+    pub punch: Option<BeatRange>,
+}
+
 pub fn session_record(
     project: &Path,
     device: DeviceOptions,
-    seconds: Option<f64>,
-    editor: bool,
+    options: RecordOptions,
 ) -> CommandResult {
-    let model = load_project(project)?;
+    let RecordOptions {
+        seconds,
+        editor,
+        loop_range,
+        punch,
+    } = options;
+    let mut model = load_project(project)?;
+    let mut ranges = Vec::new();
+    if let Some(range) = loop_range {
+        ranges.push(Op::SetLoop {
+            range: Some(range.range()),
+            enabled: true,
+        });
+    }
+    if let Some(range) = punch {
+        ranges.push(Op::SetPunch {
+            range: Some(range.range()),
+            enabled: true,
+        });
+    }
+    model
+        .apply_all(&ranges)
+        .map_err(|(_, error)| error.to_string())?;
     crate::ui::init()?;
     let mut device = device;
     device.capture = true;
-    let mut running = Running::start(
-        device.config(false),
-        &media_dir(project),
-        !device.null_device,
-    )?;
+    let mut running = Running::open(&device, false, &media_dir(project), !device.null_device)?;
     let info = running.engine.stream_info().clone();
     println!(
         "device: {} at {} Hz, {} frames, {} in / {} out; latency {} in + {} out frames",
@@ -922,26 +1092,47 @@ pub fn session_record(
         None
     };
 
-    let mut started = false;
-    interact(&mut running, seconds, window, |event| {
-        if let Event::RecordingStarted {
+    // What the engine reports about the recording, whenever it reports it: a punch-in ends
+    // by itself while the transport is still playing, a loop gives several takes at once.
+    let started = std::cell::Cell::new(false);
+    let takes = std::cell::Cell::new(0usize);
+    let tracks_done = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let note = |event: &Event| match event {
+        Event::RecordingStarted {
             tracks,
             position_samples,
-        } = event
-        {
-            started = true;
+        } => {
+            started.set(true);
             println!(
                 "recording {} track(s) from sample {position_samples}",
                 tracks.len()
             );
         }
-    });
-    if !started {
+        Event::RecordingFinished {
+            track,
+            frames,
+            media,
+            take,
+            ..
+        } => {
+            takes.set(takes.get() + 1);
+            tracks_done.borrow_mut().insert(*track);
+            let unit = if media.is_some() { "frames" } else { "notes" };
+            match take {
+                Some(number) => println!("take {number} on track {}: {frames} {unit}", track.0),
+                None => println!("take on track {}: {frames} {unit}", track.0),
+            }
+        }
+        _ => {}
+    };
+    interact(&mut running, seconds, window, note);
+    if !started.get() {
         running.engine.transport(TransportCommand::Stop);
         return Err("recording did not start (is a track armed with an input?)".into());
     }
 
-    // Stop, then wait for every take to be written and placed.
+    // Stop, then wait for every armed track's takes to be written and placed (unless a
+    // punch-out has already seen to that).
     let armed = running
         .engine
         .model()
@@ -950,21 +1141,16 @@ pub fn session_record(
         .filter(|t| t.record_armed)
         .count();
     running.engine.transport(TransportCommand::Stop);
-    let mut takes = 0;
     running.pump_until(Duration::from_secs(60), |event| {
-        if let Event::RecordingFinished {
-            track,
-            frames,
-            media,
-            ..
-        } = event
-        {
-            takes += 1;
-            let unit = if media.is_some() { "frames" } else { "notes" };
-            println!("take on track {}: {frames} {unit}", track.0);
-        }
-        takes >= armed
+        note(event);
+        tracks_done.borrow().len() >= armed
     });
+    // The takes of one recording arrive together; make sure none is still in the post.
+    running.pump_until(Duration::from_millis(250), |event| {
+        note(event);
+        false
+    });
+    let takes = takes.get();
     running.capture_states()?;
     save_project(project, &running.engine.model())?;
     println!("saved {} with {takes} new take(s)", project.display());
@@ -980,6 +1166,8 @@ pub struct SessionRenderOptions {
     pub tail: f64,
     /// Render only these tracks (a stem). Empty: the whole mix.
     pub stem: Vec<u64>,
+    /// Extra threads to render with.
+    pub threads: usize,
 }
 
 /// `riddim session render`: the project, offline, to a WAV, with a fingerprint of the audio.
@@ -1010,6 +1198,7 @@ pub fn session_render(project: &Path, options: SessionRenderOptions) -> CommandR
         options.seconds,
         options.tail,
         tracks,
+        options.threads,
     )?;
     println!(
         "rendered {:.2} s of {what} to {} (peak {:.4}, fingerprint {print:016x})",
@@ -1034,7 +1223,7 @@ pub fn loopback(device: DeviceOptions, input: (u16, u8), seconds: f64) -> Comman
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut device = device;
     device.capture = true;
-    let mut running = Running::start(device.config(false), &dir, false)?;
+    let mut running = Running::open(&device, false, &dir, false)?;
     let info = running.engine.stream_info().clone();
     let rate = info.sample_rate as u32;
     println!(
