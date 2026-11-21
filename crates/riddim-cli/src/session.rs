@@ -199,6 +199,20 @@ pub struct Running {
     worst_load: f32,
     load_reports: u32,
     loads_over_budget: u32,
+    /// When the engine was started, when the worst load was reported, and when the first few
+    /// reports of a block over its time came (in seconds since the start).
+    started: Instant,
+    worst_at: f64,
+    over_budget_at: Vec<f64>,
+}
+
+/// How many of the moments a block ran over its time the summary lists.
+const OVER_BUDGET_LISTED: usize = 6;
+
+/// Seconds as `m:ss`.
+fn clock(seconds: f64) -> String {
+    let whole = seconds.max(0.0) as u64;
+    format!("{}:{:02}", whole / 60, whole % 60)
 }
 
 impl Running {
@@ -258,6 +272,9 @@ impl Running {
             worst_load: 0.0,
             load_reports: 0,
             loads_over_budget: 0,
+            started: Instant::now(),
+            worst_at: 0.0,
+            over_budget_at: Vec::new(),
         })
     }
 
@@ -288,9 +305,18 @@ impl Running {
                 }
                 Event::Error { message } => eprintln!("error: {message}"),
                 Event::Load { dsp } => {
-                    self.worst_load = self.worst_load.max(*dsp);
+                    let at = self.started.elapsed().as_secs_f64();
+                    if *dsp > self.worst_load {
+                        self.worst_load = *dsp;
+                        self.worst_at = at;
+                    }
                     self.load_reports += 1;
-                    self.loads_over_budget += u32::from(*dsp > 1.0);
+                    if *dsp > 1.0 {
+                        self.loads_over_budget += 1;
+                        if self.over_budget_at.len() < OVER_BUDGET_LISTED {
+                            self.over_budget_at.push(at);
+                        }
+                    }
                 }
                 Event::RecordingOverflow {
                     track,
@@ -599,13 +625,25 @@ fn print_summary(running: &Running) -> bool {
     );
     // The status has the load of the last second only; the reports, one a second, cover the
     // whole run.
+    let mut when: Vec<String> = running.over_budget_at.iter().map(|at| clock(*at)).collect();
+    if running.loads_over_budget as usize > when.len() {
+        when.push("...".into());
+    }
+    let when = if when.is_empty() {
+        String::new()
+    } else {
+        format!(", at {}", when.join(", "))
+    };
     println!(
-        "peak dsp load {:.0}% ({} of {} seconds had a block over its time)  frames of streamed files not read in time {}  messages lost {}",
+        "peak dsp load {:.0}% at {} ({} of {} seconds had a block over its time{when})",
         running.worst_load.max(status.dsp_load) * 100.0,
+        clock(running.worst_at),
         running.loads_over_budget,
         running.load_reports,
-        status.playback_starved,
-        status.events_lost
+    );
+    println!(
+        "frames of streamed files not read in time {}  messages lost {}",
+        status.playback_starved, status.events_lost
     );
     status.rt_violations == 0 && status.capture_dropped == 0
 }

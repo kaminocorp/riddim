@@ -4,7 +4,9 @@ Completion notes for the fifth row of the vision's phasing (§5): CLAP, the out-
 
 **Where it stands (2026-11-21):** all four are written, and everything that can run without a Mac passes on Linux. CLAP hosting has been run against real plugins (Surge XT's CLAP builds); the bridge against the test plugins, including ones told to crash and to hang. **Nothing here has run on a Mac**, and the bridge's first exit criterion (Kontakt bridged at 128 frames with no xruns) needs Kontakt, which has not been bought. The stability promise is written and guarded but not made: that is Phil's to do, with a 1.0.
 
-GitHub Actions could still not start jobs on this repository when this was written (an account billing matter), and CI is one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded below.
+GitHub Actions could still not start jobs on this repository when this was written (an account billing matter), so the check on the pull request is red for that reason alone. The same job, run in a clean Ubuntu 24.04 container on two cores with `scripts/ci-clean.sh` (decision D73), passes for this branch and for every phase branch below it. CI is one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded below.
+
+Where every phase's exit criteria stand, on one page: [`README.md`](README.md).
 
 ## What was built
 
@@ -41,19 +43,20 @@ The headless renderer and the stability promise have no exit criteria in the vis
 
 ## Local results
 
-Run on the Linux build machine (x86-64, 16 cores, Rust 1.100.0) with `scripts/ci.sh`, with Surge XT 1.3.4's VST3 and CLAP builds, at the commit this file was added in.
+Run on the Linux build machine (x86-64, 8 cores and 16 threads, Rust 1.100.0) with `scripts/ci.sh`, with Surge XT 1.3.4's VST3 and CLAP builds, on the branch's final tree.
 
 | Check | Result |
 |---|---|
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | the same for `--target aarch64-apple-darwin` | clean |
-| `cargo test --workspace` | 226 passed, 0 failed, 2 ignored (the hour-long recording and one documentation example). The macOS-only tests compile for Apple Silicon but cannot run here |
+| `cargo test --workspace` | 243 passed, 0 failed, 2 ignored (the hour-long recording and one documentation example). The macOS-only tests compile for Apple Silicon but cannot run here |
+| the CI job in a clean container (`scripts/ci-clean.sh`: fmt, clippy, test, on two cores) | passed: 243 tests; likewise 66, 158, 180 and 209 for the heads of the four phase branches below this one |
 | third-party conformance run: Surge XT and Surge XT Effects, VST3 and CLAP | passed, all four |
 | third-party demo song, VST3 and CLAP | passed, both |
-| `scripts/rtsan.sh` (RealtimeSanitizer) | 155 passed, 0 failed, with the sanitizer live, including the bridge tests and the CLAP demo song |
+| `scripts/rtsan.sh` (RealtimeSanitizer) | 170 passed, 0 failed, with the sanitizer live, including the bridge tests, the CLAP fixture tests and the CLAP demo song |
 | `cargo deny --all-features check` | advisories, bans, licences, sources all ok (new dependencies: `clack-host`, `clack-extensions`, `clap-sys`, `libc`; MIT or Apache-2.0) |
-| `scripts/stress.sh 60` under RealtimeSanitizer | passed: 17,557 edits, 226 buffer-size changes and 466 takes in 60 s; 42,318 blocks served, longest gap 5.2 ms; 0 heap operations on the audio path, 0 messages lost |
+| `scripts/stress.sh 60` under RealtimeSanitizer | passed, run on two cores while the rest of the machine was busy with the hour-long sessions: 15,175 edits, 199 buffer-size changes and 375 takes in 60 s; 29,943 blocks served; 0 heap operations on the audio path, 0 messages lost. (Five threads on two cores: the device's timer ran late 2,466 times, which is the machine's doing and not something the run fails on) |
 
 ## Findings
 
@@ -62,6 +65,7 @@ Run on the Linux build machine (x86-64, 16 cores, Rust 1.100.0) with `scripts/ci
 - **RealtimeSanitizer caught the CLAP host calling the plugin unguarded.** The VST3 and Audio Unit hosts exempt the plugin's own `process` from the real-time checks (its allocations are its own affair); the CLAP host did not, and Surge XT allocates in `process`. The first full sanitizer run with a CLAP plugin stopped on it.
 - **The CLAP fixture found a contract breach in the CLAP host on its first run.** A block larger than the plugin was activated for was handed to the plugin, and for an effect the host indexed past its own input buffers first: a panic on the audio thread. The engine never sends such a block (it splits them), so this could not be heard; the VST3 host already refused them. Fixed, with a test for an instrument and for an effect.
 - **The scan cache could blocklist a healthy plugin** (D75), a phase 3 bug. Two processes sharing the cache file: one reads it while the other is mid-probe, and later writes its stale copy of the "being probed" mark over the other's result. Found because the new CLAP test in the CLI suite runs its commands alongside fourteen other tests' processes on one cache file; it failed about one run in two until this was fixed.
+- **A stand-in for phase 4's reference session was run from this branch** (four Surge XT instruments and twenty Surge XT effects at 64 frames for an hour, on a timer): the engine's share of a block is small, and the dropouts that session has on this machine are Surge XT reading the processor's hardware random number generator on every note. The account is in [`p4-v1.md`](p4-v1.md), under "A stand-in for the reference session".
 - **Environment variables are a poor way to configure a test.** The bridge executable was first found through `RIDDIM_BRIDGE` alone, and tests running in parallel set it under each other. It is now a field of the engine configuration, with the variable as a fallback.
 
 ## Known gaps
