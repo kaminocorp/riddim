@@ -6,6 +6,29 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 
 ## [Unreleased]
 
+### Phase 3: mix
+
+#### Added
+- **Sends**: any number per track, to buses, pre- or post-fader, with gain and mute; compensated for latency like every other path. **Polarity invert** on every strip.
+- **Automation**: lanes for fader, pan, send gain and plugin parameters, with linear and hold shapes, in beats. Read per sample for faders, pans and sends (exact at breakpoints, independent of buffer size); per block with sample-offset breakpoints for plugin parameters. **Touch, latch and write** passes, committed as one undoable edit each.
+- **Offline bounce**: `bounce(model, request)` renders a model to a WAV in an engine of its own: mix or stems, any range, tails, the plan's latency trimmed. Plugins are told they are rendering offline.
+- **Scan cache and blocklist** in `riddim-plugin`: unchanged bundles are not loaded again; bundles that crash, hang or fail are skipped until they change. Safe against the host dying mid-scan and against two hosts scanning at once.
+- **C ABI**: `riddim_touch` and `riddim_bounce`.
+- **`riddim` CLI**: `scan --rescan | --blocklist | --unblock <bundle>`; `session new --insert <plugin> --send-effect <plugin> --fade-in <beats>`; `session render --tail <seconds> --stem <track>`; `session play --save` (keeps what was changed in the plugins' editors); `session info` lists sends and automation.
+- A fixture plugin that takes 400 ms to initialise, and a demo-song test for third-party plugins (`RIDDIM_TEST_VST3`).
+
+#### Changed
+- **Solo follows the signal through sends**: soloing an effect return gives the return alone; soloing a track keeps its share of its returns. Tracks with post-fader sends get a switch node after the strip.
+- **A bypassed plugin keeps its latency** (it used to shift the track by that amount).
+- `riddim render` and `riddim session render` go through `bounce`, so their files start at the timeline's start rather than a plan-latency late.
+- The audio thread reports loop wraps and locates to the control thread.
+
+#### Verified
+- On Linux, on the deterministic manual device: a dry path and a path through a plugin with latency cancel exactly (silence, not merely −120 dBFS) through a bus, through a send, and with the plugin bypassed; two bounces of a project are the same file byte for byte and equal the live render sample for sample; automation steps land on their sample; a slow plugin load neither stalls the audio callback nor delays an edit; a demo song through Surge XT and Surge XT Effects plays, saves, reopens and bounces.
+
+#### Not verified
+- Anything on a Mac or on real audio hardware, and nothing with Kontakt, Superior Drummer 3, EZbass or Helix Native. See [`docs/phases/p3-mix.md`](docs/phases/p3-mix.md).
+
 ### Phase 2: engine core ("tape")
 
 #### Added

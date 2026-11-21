@@ -34,7 +34,7 @@ Rust 1.100.0 (pinned in `rust-toolchain.toml`; `rustup` installs it on first use
 ```sh
 cargo build --workspace
 cargo test --workspace
-scripts/ci.sh            # everything CI runs
+scripts/ci.sh            # what CI runs, plus the heavier checks kept out of CI
 scripts/rtsan.sh         # the real-time sections under RealtimeSanitizer
 ```
 
@@ -47,6 +47,10 @@ cargo run -p riddim-cli -- play "Surge XT" --sequence
 cargo run -p riddim-cli -- session new song.json --instrument "Surge XT" --sequence --audio-input 1-2
 cargo run -p riddim-cli -- session record song.json
 cargo run -p riddim-cli -- session render song.json -o song.wav
+cargo run -p riddim-cli -- session new mix.json --instrument "Surge XT" --sequence \
+    --send-effect "Surge XT Effects" --fade-in 4
+cargo run -p riddim-cli -- session render mix.json -o mix.wav --tail 2
+cargo run -p riddim-cli -- session render mix.json -o return.wav --stem 1000
 ```
 
 `riddim --help` lists the commands.
