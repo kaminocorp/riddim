@@ -118,12 +118,23 @@ impl MainThread {
         }
     }
 
-    /// Handles everything the engine has asked for and collects what plugins have to report.
+    /// Handles what the engine has asked for and collects what plugins have to report.
     /// Returns false once the engine has shut down.
+    ///
+    /// Loading a plugin can take seconds, and it has to happen on this thread. At most one
+    /// plugin is loaded per call, so that an application pumping from its UI thread gets to
+    /// handle its own events between one plugin and the next. Call it again soon: a few dozen
+    /// times a second is plenty.
     pub fn pump(&mut self) -> bool {
         loop {
             match self.requests.try_recv() {
-                Ok(request) => self.handle(request),
+                Ok(request) => {
+                    let slow = matches!(request, HostRequest::Load { .. });
+                    self.handle(request);
+                    if slow {
+                        break;
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.alive = false;
