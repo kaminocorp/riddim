@@ -284,6 +284,272 @@ impl Scanner {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Cache and blocklist
+// ---------------------------------------------------------------------------------------------
+
+/// Version of the cache file. A file with another version is ignored and rebuilt.
+const CACHE_VERSION: u32 = 1;
+
+/// Environment variable that overrides where the scan cache lives.
+pub const CACHE_ENV: &str = "RIDDIM_SCAN_CACHE";
+
+/// What a bundle looked like when it was scanned: if this still matches, the cached result
+/// stands; if the plugin was updated, it does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    /// Newest modification time found in the bundle, in nanoseconds since the Unix epoch.
+    pub modified: u128,
+    /// Total size of the files looked at.
+    pub size: u64,
+}
+
+impl FileStamp {
+    /// Stamps a bundle (or a single file) by walking its first few levels.
+    pub fn of(path: &Path) -> Option<FileStamp> {
+        fn visit(path: &Path, depth: u32, stamp: &mut FileStamp) {
+            let Ok(meta) = std::fs::metadata(path) else {
+                return;
+            };
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            stamp.modified = stamp.modified.max(modified);
+            if meta.is_file() {
+                stamp.size += meta.len();
+            } else if meta.is_dir() && depth < 4 {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        visit(&entry.path(), depth + 1, stamp);
+                    }
+                }
+            }
+        }
+        if !path.exists() {
+            return None;
+        }
+        let mut stamp = FileStamp {
+            modified: 0,
+            size: 0,
+        };
+        visit(path, 0, &mut stamp);
+        Some(stamp)
+    }
+}
+
+/// What the cache remembers about one bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub enum CachedOutcome {
+    Plugins {
+        plugins: Vec<PluginDescriptor>,
+    },
+    /// The bundle crashed, hung or failed to scan and is not probed again until it changes.
+    Blocked {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CacheEntry {
+    stamp: FileStamp,
+    #[serde(flatten)]
+    outcome: CachedOutcome,
+}
+
+/// Scan results kept between runs, and the list of bundles not to touch again.
+///
+/// Keyed by bundle path. An entry is only trusted while the bundle's [`FileStamp`] is
+/// unchanged, so installing an update gets a plugin rescanned (and a blocked one retried).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanCache {
+    version: u32,
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, CacheEntry>,
+}
+
+impl ScanCache {
+    pub fn new() -> ScanCache {
+        ScanCache {
+            version: CACHE_VERSION,
+            entries: Default::default(),
+        }
+    }
+
+    /// Where the cache lives by default: `$RIDDIM_SCAN_CACHE`, else the platform's cache
+    /// directory.
+    pub fn default_path() -> PathBuf {
+        if let Some(path) = std::env::var_os(CACHE_ENV) {
+            return PathBuf::from(path);
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let base = if cfg!(target_os = "macos") {
+            home.join("Library/Caches")
+        } else if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            PathBuf::from(xdg)
+        } else {
+            home.join(".cache")
+        };
+        base.join("riddim").join("plugin-scan.json")
+    }
+
+    /// Reads a cache file. A missing, unreadable or outdated file gives an empty cache.
+    pub fn load(path: &Path) -> ScanCache {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<ScanCache>(&text).ok())
+            .filter(|cache| cache.version == CACHE_VERSION)
+            .unwrap_or_else(ScanCache::new)
+    }
+
+    /// Writes the cache, replacing the file in one step.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(
+            &temporary,
+            serde_json::to_string_pretty(self).expect("the cache serialises"),
+        )?;
+        std::fs::rename(&temporary, path)
+    }
+
+    fn key(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The cached outcome for `path`, if the bundle has not changed since.
+    pub fn lookup(&self, path: &Path) -> Option<&CachedOutcome> {
+        let entry = self.entries.get(&Self::key(path))?;
+        (FileStamp::of(path) == Some(entry.stamp)).then_some(&entry.outcome)
+    }
+
+    fn store(&mut self, path: &Path, outcome: CachedOutcome) {
+        if let Some(stamp) = FileStamp::of(path) {
+            self.entries
+                .insert(Self::key(path), CacheEntry { stamp, outcome });
+        }
+    }
+
+    /// Bundles on the blocklist, with why.
+    pub fn blocked(&self) -> Vec<(PathBuf, String)> {
+        self.entries
+            .iter()
+            .filter_map(|(path, entry)| match &entry.outcome {
+                CachedOutcome::Blocked { reason } => Some((PathBuf::from(path), reason.clone())),
+                CachedOutcome::Plugins { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Takes a bundle off the blocklist (and out of the cache) so it is scanned again.
+    pub fn forget(&mut self, path: &Path) -> bool {
+        self.entries.remove(&Self::key(path)).is_some()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Scanner {
+    /// Scans `targets`, using and updating `cache`.
+    ///
+    /// A bundle that has not changed since it was last scanned is not loaded again: its
+    /// plugins come from the cache, or, if it is blocklisted, it is skipped and reported.
+    /// A bundle whose scan crashes, hangs or fails goes on the blocklist.
+    ///
+    /// If `cache_file` is given, the cache is saved before each bundle is probed, with that
+    /// bundle marked as blocked, and again after: so even if this process is killed while a
+    /// plugin hangs the scanner, the plugin responsible is not probed on the next start.
+    pub fn scan_cached(
+        &self,
+        targets: &[ScanTarget],
+        cache: &mut ScanCache,
+        cache_file: Option<&Path>,
+        mut progress: impl FnMut(&ScanTarget, &ScanOutcome, bool),
+    ) -> ScanReport {
+        let mut report = ScanReport::default();
+        for target in targets {
+            // Targets without a path (the Audio Unit registry) are cheap to list and are not
+            // cached.
+            let Some(path) = target.path.as_deref() else {
+                let outcome = self.scan(target);
+                progress(target, &outcome, false);
+                match outcome {
+                    ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
+                    other => report.failures.push((target.clone(), other)),
+                }
+                continue;
+            };
+
+            if let Some(cached) = cache.lookup(path) {
+                let outcome = match cached {
+                    CachedOutcome::Plugins { plugins } => ScanOutcome::Ok(plugins.clone()),
+                    CachedOutcome::Blocked { reason } => {
+                        ScanOutcome::Failed(format!("on the blocklist: {reason}"))
+                    }
+                };
+                progress(target, &outcome, true);
+                match outcome {
+                    ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
+                    other => report.failures.push((target.clone(), other)),
+                }
+                continue;
+            }
+
+            // The pedal: assume the worst until the scan comes back.
+            cache.store(
+                path,
+                CachedOutcome::Blocked {
+                    reason: "the scan did not finish".into(),
+                },
+            );
+            if let Some(file) = cache_file {
+                let _ = cache.save(file);
+            }
+            let outcome = self.scan(target);
+            let cached = match &outcome {
+                ScanOutcome::Ok(plugins) => CachedOutcome::Plugins {
+                    plugins: plugins.clone(),
+                },
+                ScanOutcome::Failed(reason) => CachedOutcome::Blocked {
+                    reason: reason.clone(),
+                },
+                ScanOutcome::Crashed(detail) => CachedOutcome::Blocked {
+                    reason: format!("crashed the scanner ({detail})"),
+                },
+                ScanOutcome::TimedOut => CachedOutcome::Blocked {
+                    reason: "hung the scanner".into(),
+                },
+            };
+            cache.store(path, cached);
+            if let Some(file) = cache_file {
+                let _ = cache.save(file);
+            }
+            progress(target, &outcome, false);
+            match outcome {
+                ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
+                other => report.failures.push((target.clone(), other)),
+            }
+        }
+        report
+    }
+}
+
 /// Everything there is to scan in the default locations (plus `extra_vst3_dirs`).
 pub fn default_targets(extra_vst3_dirs: &[PathBuf]) -> Vec<ScanTarget> {
     let mut dirs = format::vst3::default_search_paths();
