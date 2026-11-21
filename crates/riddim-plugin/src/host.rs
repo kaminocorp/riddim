@@ -22,7 +22,10 @@ pub fn instantiate(descriptor: &PluginDescriptor) -> Result<Box<dyn PluginInstan
         PluginFormat::AudioUnit => Ok(Box::new(format::au::instantiate(descriptor)?)),
         #[cfg(not(target_os = "macos"))]
         PluginFormat::AudioUnit => Err(PluginError::Unsupported("Audio Units need macOS")),
-        PluginFormat::Clap => Err(PluginError::Unsupported("CLAP hosting arrives after v1")),
+        PluginFormat::Clap => Ok(Box::new(format::clap::instantiate(
+            descriptor,
+            DEFAULT_HOST_NAME,
+        )?)),
         PluginFormat::Internal => Err(PluginError::Unsupported(
             "internal processors are created by the engine",
         )),

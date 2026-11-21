@@ -50,10 +50,7 @@ pub fn scan_targets(
 /// Scans one bundle (out of process, or from the cache).
 pub fn scan_bundle(scanner: &Scanner, path: &Path) -> Result<Vec<PluginDescriptor>, String> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let target = ScanTarget {
-        format: PluginFormat::Vst3,
-        path: Some(path.clone()),
-    };
+    let target = ScanTarget::for_path(path.clone());
     let plugins = scan_targets(scanner, &[target], false);
     if plugins.is_empty() {
         Err(format!("{} has no usable plugins", path.display()))

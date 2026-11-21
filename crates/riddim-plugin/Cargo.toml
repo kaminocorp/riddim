@@ -14,6 +14,8 @@ serde.workspace = true
 serde_json.workspace = true
 vst3.workspace = true
 crossbeam-queue.workspace = true
+clack-host.workspace = true
+clack-extensions.workspace = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 libloading.workspace = true

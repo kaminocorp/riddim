@@ -1450,6 +1450,12 @@ impl Control {
     fn automation_value(&mut self, track: TrackId, target: AutomationTarget, value: f32) {
         // Hear about any jump of the playhead first, so this value lands in the right pass.
         self.poll_audio();
+        self.record_automation_value(track, target, value);
+    }
+
+    /// As [`automation_value`](Self::automation_value), for a value that came from the audio
+    /// thread itself (and so is already in order with any jump it reported).
+    fn record_automation_value(&mut self, track: TrackId, target: AutomationTarget, value: f32) {
         if !self.shared.playing.load(Ordering::Acquire) {
             return;
         }
@@ -2261,6 +2267,13 @@ impl Control {
                         .host_requests
                         .send(HostRequest::NotifyParam { slot, id, value });
                     self.emit(Event::PluginParam { slot, id, value });
+                    // A change the plugin made on its audio side (for a CLAP plugin, that is
+                    // how a knob turned in its editor arrives) is automation to be written
+                    // like any other, if its lane is being written.
+                    if let Some(track) = self.plugins.get(&slot).map(|entry| entry.track) {
+                        let target = AutomationTarget::PluginParam { slot, param: id };
+                        self.record_automation_value(track, target, value as f32);
+                    }
                 }
                 FromAudio::Jumped { from, to } => {
                     // While recording, the only jumps are loop wraps: each starts a new pass.
