@@ -23,11 +23,11 @@ fn rt_checks_are_live() {
 }
 
 #[test]
-fn scan_lists_the_three_fixture_plugins() {
+fn scan_lists_the_fixture_plugins() {
     let found = fixture_descriptors();
     assert_eq!(
         found.len(),
-        3,
+        4,
         "controller classes must not be listed: {found:#?}"
     );
     let synth = found.iter().find(|d| d.id.uid == ids::SYNTH_UID).unwrap();

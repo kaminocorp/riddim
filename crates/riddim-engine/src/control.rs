@@ -17,8 +17,8 @@ use riddim_graph::compile;
 use riddim_graph::model_graph::{self, NodeKind, PluginPorts};
 use riddim_io::StreamInfo;
 use riddim_model::{
-    Clip, ClipContent, ClipId, Media, MediaId, Model, Note, Op, OpError, SlotId, Track, TrackId,
-    TrackInput, TrackKind, TrackOutput,
+    AutomationLane, AutomationMode, AutomationTarget, Clip, ClipContent, ClipId, CurveShape, Media,
+    MediaId, Model, Note, Op, OpError, SlotId, Track, TrackId, TrackInput, TrackKind, TrackOutput,
 };
 use riddim_plugin::{ActivateConfig, EventBody, PluginEvent, ProcessMode};
 use riddim_rt::garbage::GarbageCollector;
@@ -27,13 +27,14 @@ use riddim_rt::spsc::{Consumer, Producer, PushError};
 use riddim_time::{samples_to_superclock, Position, TempoMap, Ticks};
 
 use crate::audio::{CaptureRt, FromAudio, ToAudio};
-use crate::dsp::{Click, StereoGain};
+use crate::dsp::{Click, DelayLine, StereoGain};
 use crate::events::{Event, TransportState};
 use crate::host::{HostReply, HostRequest};
 use crate::media::MediaCache;
 use crate::plan::{
-    Buffers, DelayCell, MidiSourceRt, NodeCell, NodeRt, PluginRt, RtAudioClip, RtInput, RtPlan,
-    RtSource, RtStep, StepParams, StripRt, TimedEvent, EVENT_CAPACITY,
+    Buffers, DelayCell, GainRt, MidiSourceRt, NodeCell, NodeRt, PluginRt, RtAudioClip, RtCurve,
+    RtInput, RtPlan, RtPoint, RtSource, RtStep, StepParams, StripRt, TimedEvent,
+    AUTOMATED_CAPACITY, EVENT_CAPACITY,
 };
 use crate::shared::{MeterCell, Shared};
 
@@ -88,6 +89,12 @@ pub(crate) enum ControlMsg {
         model: Box<Model>,
         reply: Sender<Result<u64, String>>,
     },
+    /// A control was grabbed or released (for touch and latch automation).
+    Touch {
+        track: TrackId,
+        target: AutomationTarget,
+        down: bool,
+    },
     /// Ask every loaded plugin for its state and store it in the model.
     CapturePluginStates(Sender<Result<Applied, String>>),
     Shutdown,
@@ -123,6 +130,16 @@ struct RecordingSession {
     midi_events: Vec<(TrackId, i64, EventBody)>,
 }
 
+/// One automation lane being written: the control is held (touch), was touched (latch), or the
+/// transport is running over a lane in write mode.
+struct Writing {
+    track: TrackId,
+    lane: riddim_model::LaneId,
+    target: AutomationTarget,
+    start: Ticks,
+    points: Vec<riddim_model::AutomationPoint>,
+}
+
 struct PendingSave {
     waiting: HashSet<SlotId>,
     states: Vec<(TrackId, SlotId, Vec<u8>)>,
@@ -153,6 +170,7 @@ pub(crate) struct ControlSetup {
     pub capture_dir: PathBuf,
     pub media_dir: PathBuf,
     pub butler: Butler,
+    pub process_mode: ProcessMode,
 }
 
 pub(crate) struct Control {
@@ -169,6 +187,7 @@ pub(crate) struct Control {
     max_block: usize,
     capture_dir: PathBuf,
     butler: Butler,
+    process_mode: ProcessMode,
 
     model: Model,
     revision: u64,
@@ -193,6 +212,8 @@ pub(crate) struct Control {
     backlog: Vec<ToAudio>,
 
     recording: Option<RecordingSession>,
+    /// Automation being written right now.
+    writes: Vec<Writing>,
     take_counter: u32,
     pending_save: Option<PendingSave>,
     pending_syncs: Vec<Sender<()>>,
@@ -203,23 +224,31 @@ pub(crate) struct Control {
 /// Which tracks are heard, given mutes and solos.
 ///
 /// With no solo anywhere, everything unmuted is heard. With a solo, a track is heard if it is
-/// soloed, if it feeds a soloed bus, or if it is a bus that a soloed track plays through.
+/// soloed, if it feeds a soloed bus (by its output or a send), or if it is a bus that a soloed
+/// track plays through.
 fn audible_tracks(model: &Model) -> HashSet<TrackId> {
     let any_solo = model.tracks.iter().any(|t| t.solo);
+    // Every bus a track's signal reaches, through its output and its sends, however far.
     let downstream = |track: &Track| -> Vec<TrackId> {
-        let mut chain = Vec::new();
-        let mut output = track.output;
-        while let TrackOutput::Bus(bus) = output {
-            if chain.contains(&bus) {
-                break;
+        let mut reached = Vec::new();
+        let mut pending: Vec<TrackId> = Vec::new();
+        let targets = |t: &Track, into: &mut Vec<TrackId>| {
+            if let TrackOutput::Bus(bus) = t.output {
+                into.push(bus);
             }
-            chain.push(bus);
-            match model.track(bus) {
-                Some(next) => output = next.output,
-                None => break,
+            into.extend(t.sends.iter().filter(|s| !s.mute).map(|s| s.target));
+        };
+        targets(track, &mut pending);
+        while let Some(bus) = pending.pop() {
+            if reached.contains(&bus) {
+                continue;
+            }
+            reached.push(bus);
+            if let Some(next) = model.track(bus) {
+                targets(next, &mut pending);
             }
         }
-        chain
+        reached
     };
     let mut solo_path: HashSet<TrackId> = HashSet::new();
     if any_solo {
@@ -268,6 +297,7 @@ impl Control {
             max_block: setup.max_block,
             capture_dir: setup.capture_dir,
             butler: setup.butler,
+            process_mode: setup.process_mode,
             map: Arc::new(model.tempo_map.clone()),
             model,
             revision: 0,
@@ -284,6 +314,7 @@ impl Control {
             unsent: None,
             backlog: Vec::new(),
             recording: None,
+            writes: Vec::new(),
             take_counter: 0,
             pending_save: None,
             pending_syncs: Vec::new(),
@@ -365,6 +396,31 @@ impl Control {
         match message {
             ControlMsg::Apply { ticket, ops, reply } => {
                 let outcome = self.apply(&ops);
+                if outcome.is_ok() {
+                    // Moving a fader is an op; if its lane is being written, it is also a
+                    // point on that lane.
+                    for op in &ops {
+                        match op {
+                            Op::SetTrack {
+                                id,
+                                change: riddim_model::TrackChange::Gain(gain),
+                            } => {
+                                self.automation_value(*id, AutomationTarget::TrackGain, *gain);
+                            }
+                            Op::SetTrack {
+                                id,
+                                change: riddim_model::TrackChange::Pan(pan),
+                            } => {
+                                self.automation_value(*id, AutomationTarget::TrackPan, *pan);
+                            }
+                            Op::SetSend { track, send } => {
+                                let target = AutomationTarget::SendGain { send: send.id };
+                                self.automation_value(*track, target, send.gain);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 match &outcome {
                     Ok(applied) => self.emit(Event::Applied {
                         ticket,
@@ -387,7 +443,16 @@ impl Control {
                 let _ = self
                     .host_requests
                     .send(HostRequest::NotifyParam { slot, id, value });
+                if let Some(track) = self.plugins.get(&slot).map(|entry| entry.track) {
+                    let target = AutomationTarget::PluginParam { slot, param: id };
+                    self.automation_value(track, target, value as f32);
+                }
             }
+            ControlMsg::Touch {
+                track,
+                target,
+                down,
+            } => self.touch(track, target, down),
             ControlMsg::PlayNote { track, body } => self.send(ToAudio::Midi { track, body }),
             ControlMsg::Subscribe(subscriber) => self.subscribers.push(subscriber),
             ControlMsg::Sync(reply) => self.pending_syncs.push(reply),
@@ -509,7 +574,7 @@ impl Control {
         let config = ActivateConfig {
             sample_rate: self.rate as f64,
             max_block: self.max_block as u32,
-            mode: ProcessMode::Realtime,
+            mode: self.process_mode,
         };
         for track in self.model.all_tracks() {
             for slot in &track.plugins {
@@ -761,6 +826,31 @@ impl Control {
         }
     }
 
+    /// A lane as the audio thread reads it, or `None` if the lane is off, empty, or currently
+    /// being written (in which case the control's live value applies instead).
+    fn curve(&self, track: TrackId, lane: &AutomationLane) -> Option<Arc<RtCurve>> {
+        if lane.mode == AutomationMode::Off || lane.points.is_empty() {
+            return None;
+        }
+        if self
+            .writes
+            .iter()
+            .any(|w| w.track == track && w.lane == lane.id)
+        {
+            return None;
+        }
+        let points = lane
+            .points
+            .iter()
+            .map(|p| RtPoint {
+                sample: self.map.ticks_to_samples(p.at, self.rate),
+                value: p.value,
+                hold: p.shape == CurveShape::Hold,
+            })
+            .collect();
+        Some(Arc::new(RtCurve { points }))
+    }
+
     fn new_cell(&mut self, kind: NodeKind) -> Option<Arc<NodeCell>> {
         let rt = match kind {
             NodeKind::Source(track) => match self.model.track(track).map(|t| t.kind) {
@@ -773,6 +863,10 @@ impl Control {
                 gain: StereoGain::new(self.rate / 200),
                 primed: false,
                 meter: self.meters.entry(track).or_default().clone(),
+            }),
+            NodeKind::Send(..) => NodeRt::Gain(GainRt {
+                gain: StereoGain::new(self.rate / 200),
+                primed: false,
             }),
             NodeKind::Metronome => NodeRt::Metronome(Click::new()),
             // Plugin cells are created when the plugin finishes loading, never here.
@@ -844,14 +938,47 @@ impl Control {
                         .track(track)
                         .and_then(|t| t.plugin(slot))
                         .is_some_and(|s| s.bypass);
-                    StepParams::Plugin { bypass }
+                    let curves = model.track(track).map_or_else(Vec::new, |t| {
+                        t.automation
+                            .iter()
+                            .filter_map(|lane| match lane.target {
+                                AutomationTarget::PluginParam { slot: s, param } if s == slot => {
+                                    self.curve(track, lane).map(|curve| (param, curve))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    });
+                    StepParams::Plugin {
+                        bypass,
+                        curves: Arc::new(curves),
+                    }
                 }
                 NodeKind::Strip(track) => {
                     let strip = model.track(track);
+                    let curve_for = |target| {
+                        strip
+                            .and_then(|t| t.lane_for(target))
+                            .and_then(|lane| self.curve(track, lane))
+                    };
                     StepParams::Strip {
                         gain: strip.map_or(1.0, |t| t.gain),
                         pan: strip.map_or(0.0, |t| t.pan),
                         mute: !audible.contains(&track),
+                        invert: strip.is_some_and(|t| t.invert),
+                        gain_curve: curve_for(AutomationTarget::TrackGain),
+                        pan_curve: curve_for(AutomationTarget::TrackPan),
+                    }
+                }
+                NodeKind::Send(track, send) => {
+                    let owner = model.track(track);
+                    let settings = owner.and_then(|t| t.send(send));
+                    StepParams::Send {
+                        gain: settings.map_or(0.0, |s| s.gain),
+                        mute: settings.is_none_or(|s| s.mute),
+                        curve: owner
+                            .and_then(|t| t.lane_for(AutomationTarget::SendGain { send }))
+                            .and_then(|lane| self.curve(track, lane)),
                     }
                 }
                 NodeKind::Metronome => StepParams::Metronome {
@@ -921,6 +1048,7 @@ impl Control {
                 params,
                 inputs,
                 first_scratch,
+                input_latency: step.input_latency as i64,
                 in_channels: scratch_count - first_scratch,
                 first_buffer: step.outputs.first().map_or(0, |o| o.first_buffer),
                 out_channels: step.outputs.iter().map(|o| o.channels as usize).sum(),
@@ -1011,6 +1139,226 @@ impl Control {
     // -----------------------------------------------------------------------------------------
     // Transport and recording
     // -----------------------------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------------------------
+    // Writing automation
+    // -----------------------------------------------------------------------------------------
+
+    fn now_ticks(&self) -> Ticks {
+        self.map
+            .samples_to_ticks(self.shared.position.load(Ordering::Acquire), self.rate)
+    }
+
+    /// The control's own (un-automated) value, where the model knows it.
+    fn control_value(&self, track: TrackId, target: AutomationTarget) -> Option<f32> {
+        let track = self.model.track(track)?;
+        match target {
+            AutomationTarget::TrackGain => Some(track.gain),
+            AutomationTarget::TrackPan => Some(track.pan),
+            AutomationTarget::SendGain { send } => track.send(send).map(|s| s.gain),
+            // A plugin's parameter values live in the plugin.
+            AutomationTarget::PluginParam { .. } => None,
+        }
+    }
+
+    /// A control was grabbed (`down`) or let go.
+    fn touch(&mut self, track: TrackId, target: AutomationTarget, down: bool) {
+        let Some(lane) = self
+            .model
+            .track(track)
+            .and_then(|t| t.lane_for(target))
+            .cloned()
+        else {
+            return;
+        };
+        if down {
+            let rolling = self.shared.playing.load(Ordering::Acquire);
+            if rolling && matches!(lane.mode, AutomationMode::Touch | AutomationMode::Latch) {
+                self.begin_write(track, &lane);
+            }
+        } else if lane.mode == AutomationMode::Touch {
+            // Touch stops writing on release; latch carries on until the transport stops.
+            self.end_write(track, lane.id);
+        }
+    }
+
+    fn begin_write(&mut self, track: TrackId, lane: &AutomationLane) {
+        if self
+            .writes
+            .iter()
+            .any(|w| w.track == track && w.lane == lane.id)
+        {
+            return;
+        }
+        let start = self.now_ticks();
+        let mut points = Vec::new();
+        if let Some(value) = self.control_value(track, lane.target) {
+            points.push(riddim_model::AutomationPoint {
+                at: start,
+                value,
+                shape: CurveShape::Linear,
+            });
+        }
+        self.writes.push(Writing {
+            track,
+            lane: lane.id,
+            target: lane.target,
+            start,
+            points,
+        });
+        // From now on the control's live value applies, not the lane.
+        self.rebuild_plan();
+    }
+
+    /// A control produced a value: record it if its lane is being written, and start writing
+    /// if the lane latches on the first movement.
+    fn automation_value(&mut self, track: TrackId, target: AutomationTarget, value: f32) {
+        if !self.shared.playing.load(Ordering::Acquire) {
+            return;
+        }
+        if !self
+            .writes
+            .iter()
+            .any(|w| w.track == track && w.target == target)
+        {
+            let lane = self
+                .model
+                .track(track)
+                .and_then(|t| t.lane_for(target))
+                .cloned();
+            match lane {
+                Some(lane) if lane.mode == AutomationMode::Latch => self.begin_write(track, &lane),
+                _ => return,
+            }
+        }
+        let now = self.now_ticks();
+        let (low, high) = target.range();
+        if let Some(write) = self
+            .writes
+            .iter_mut()
+            .find(|w| w.track == track && w.target == target)
+        {
+            // Points must move forwards in time; values arriving within one tick stack up.
+            let at = match write.points.last() {
+                Some(last) if now <= last.at => Ticks(last.at.0 + 1),
+                _ => now,
+            };
+            write.points.push(riddim_model::AutomationPoint {
+                at,
+                value: value.clamp(low, high),
+                shape: CurveShape::Linear,
+            });
+        }
+    }
+
+    /// Commits what was written to the lane as one undoable edit.
+    fn end_write(&mut self, track: TrackId, lane: riddim_model::LaneId) {
+        let Some(index) = self
+            .writes
+            .iter()
+            .position(|w| w.track == track && w.lane == lane)
+        else {
+            return;
+        };
+        let write = self.writes.remove(index);
+        let Some(old) = self.model.track(track).and_then(|t| t.lane(lane)).cloned() else {
+            self.rebuild_plan();
+            return;
+        };
+        if write.points.is_empty() {
+            // Held but never moved, with no value of its own to record: nothing changes.
+            self.rebuild_plan();
+            return;
+        }
+        let end = write
+            .points
+            .last()
+            .map_or(write.start, |p| p.at)
+            .max(self.now_ticks());
+        let point = |at: Ticks| {
+            old.value_at(at).map(|value| riddim_model::AutomationPoint {
+                at,
+                value,
+                shape: CurveShape::Linear,
+            })
+        };
+        // What was there before the pass and after it stays; an anchor on each side keeps the
+        // old curve's shape right up to the edges of what was written.
+        let mut points: Vec<riddim_model::AutomationPoint> = old
+            .points
+            .iter()
+            .copied()
+            .filter(|p| p.at < write.start)
+            .collect();
+        if write.start > Ticks::ZERO {
+            if let Some(anchor) = point(Ticks(write.start.0 - 1)) {
+                if points.last().is_none_or(|p| p.at < anchor.at) {
+                    points.push(anchor);
+                }
+            }
+        }
+        for recorded in write.points {
+            // Leave out points that repeat the value on both sides of them.
+            let flat = points.len() >= 2
+                && points[points.len() - 1].value == recorded.value
+                && points[points.len() - 2].value == recorded.value
+                && points[points.len() - 1].at >= write.start;
+            if flat {
+                points.pop();
+            }
+            if points.last().is_none_or(|p| p.at < recorded.at) {
+                points.push(recorded);
+            }
+        }
+        let last_written = points.last().map_or(end, |p| p.at).max(end);
+        if points.last().is_some_and(|p| p.at < last_written) {
+            let value = points.last().expect("checked").value;
+            points.push(riddim_model::AutomationPoint {
+                at: last_written,
+                value,
+                shape: CurveShape::Linear,
+            });
+        }
+        if let Some(anchor) = point(Ticks(last_written.0 + 1)) {
+            if old.points.iter().any(|p| p.at > last_written) {
+                points.push(anchor);
+            }
+        }
+        points.extend(
+            old.points
+                .iter()
+                .copied()
+                .filter(|p| p.at > Ticks(last_written.0 + 1)),
+        );
+
+        let lane = AutomationLane {
+            points: Arc::new(points),
+            ..(*old).clone()
+        };
+        self.apply_internal(vec![Op::ReplaceLane { track, lane }]);
+    }
+
+    /// The transport started: lanes in write mode record from here.
+    fn start_write_lanes(&mut self) {
+        let lanes: Vec<(TrackId, Arc<AutomationLane>)> = self
+            .model
+            .all_tracks()
+            .flat_map(|t| t.automation.iter().map(|lane| (t.id, lane.clone())))
+            .filter(|(_, lane)| lane.mode == AutomationMode::Write)
+            .collect();
+        for (track, lane) in lanes {
+            self.begin_write(track, &lane);
+        }
+    }
+
+    /// The transport stopped: everything being written is committed.
+    fn finish_all_writes(&mut self) {
+        let open: Vec<(TrackId, riddim_model::LaneId)> =
+            self.writes.iter().map(|w| (w.track, w.lane)).collect();
+        for (track, lane) in open {
+            self.end_write(track, lane);
+        }
+    }
 
     fn transport(&mut self, command: TransportCommand) {
         match command {
@@ -1424,6 +1772,11 @@ impl Control {
                                 pending_params: riddim_plugin::EventBuffer::with_capacity(
                                     EVENT_CAPACITY,
                                 ),
+                                automated: Vec::with_capacity(AUTOMATED_CAPACITY),
+                                bypass_delay: (loaded.ports.latency > 0).then(|| {
+                                    Box::new(DelayLine::new(outputs, loaded.ports.latency as usize))
+                                }),
+                                was_bypassed: false,
                             })));
                             self.cells.insert(NodeKind::Plugin(track, slot), cell);
                             let latency = loaded.ports.latency;
@@ -1455,10 +1808,25 @@ impl Control {
                     self.finish_save_if_ready();
                 }
                 HostReply::Event { slot, event } => {
-                    if let PluginEvent::ParamChanged { id, value } = event {
-                        // An edit in the plugin's own editor: its processor has to be told.
-                        self.send(ToAudio::Param { slot, id, value });
-                        self.emit(Event::PluginParam { slot, id, value });
+                    let track = self.plugins.get(&slot).map(|entry| entry.track);
+                    let target = |param| AutomationTarget::PluginParam { slot, param };
+                    match (event, track) {
+                        (PluginEvent::ParamChanged { id, value }, _) => {
+                            // An edit in the plugin's own editor: its processor has to be told.
+                            self.send(ToAudio::Param { slot, id, value });
+                            self.emit(Event::PluginParam { slot, id, value });
+                            if let Some(track) = track {
+                                self.automation_value(track, target(id), value as f32);
+                            }
+                        }
+                        // Grabbing and releasing a knob in the editor is a touch.
+                        (PluginEvent::ParamGestureBegin { id }, Some(track)) => {
+                            self.touch(track, target(id), true);
+                        }
+                        (PluginEvent::ParamGestureEnd { id }, Some(track)) => {
+                            self.touch(track, target(id), false);
+                        }
+                        _ => {}
                     }
                 }
                 HostReply::Latency { slot, latency } => {
@@ -1469,6 +1837,10 @@ impl Control {
                     {
                         if ports.latency != latency {
                             ports.latency = latency;
+                            let channels: usize = ports.outputs.iter().map(|c| *c as usize).sum();
+                            let line = (latency > 0)
+                                .then(|| Box::new(DelayLine::new(channels, latency as usize)));
+                            self.send(ToAudio::BypassDelay { slot, line });
                             self.rebuild_plan();
                             self.emit(Event::PluginLatencyChanged { slot, latency });
                         }
@@ -1527,6 +1899,13 @@ impl Control {
         };
         let position = self.shared.position.load(Ordering::Acquire);
         if state != self.last_state {
+            let was_rolling = self.last_state != TransportState::Stopped;
+            let is_rolling = state != TransportState::Stopped;
+            if is_rolling && !was_rolling {
+                self.start_write_lanes();
+            } else if was_rolling && !is_rolling {
+                self.finish_all_writes();
+            }
             self.last_state = state;
             self.emit(Event::Transport {
                 state,

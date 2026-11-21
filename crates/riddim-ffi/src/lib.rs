@@ -108,7 +108,8 @@ pub struct RiddimStatus {
 ///   "capture_dir": "/path/to/project/media",
 ///   "media_dir": "/path/to/project/media",
 ///   "main_thread": "external",    // "external" (pump it yourself) | "internal"
-///   "midi_input": true
+///   "midi_input": true,
+///   "offline": false              // tell plugins this is an offline render
 /// }
 /// ```
 #[derive(Deserialize)]
@@ -129,6 +130,9 @@ struct Config {
     main_thread: String,
     #[serde(default)]
     midi_input: bool,
+    /// Tell plugins they are being rendered offline (bounces on the "manual" device).
+    #[serde(default)]
+    offline: bool,
     /// "null" and "manual" only: input and output channel counts.
     #[serde(default = "default_channels")]
     input_channels: u32,
@@ -186,6 +190,11 @@ fn engine_config(json: &str) -> Result<EngineConfig, String> {
         main_thread,
         butler: Default::default(),
         midi_input: config.midi_input,
+        process_mode: if config.offline {
+            riddim::plugins::ProcessMode::Offline
+        } else {
+            riddim::plugins::ProcessMode::Realtime
+        },
     })
 }
 

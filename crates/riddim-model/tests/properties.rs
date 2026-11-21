@@ -6,8 +6,10 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use riddim_model::time::{Position, Superclock, Tempo, TempoMap, Ticks, TICKS_PER_BEAT};
 use riddim_model::{
-    Clip, ClipContent, ClipId, LoopRange, Media, MediaId, Metronome, Model, Note, Op, PluginRef,
-    PluginSlot, SlotId, Track, TrackChange, TrackId, TrackInput, TrackKind, TrackOutput,
+    AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Clip, ClipContent, ClipId,
+    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, Model, Note, Op, PluginRef,
+    PluginSlot, Send, SendId, SlotId, Track, TrackChange, TrackId, TrackInput, TrackKind,
+    TrackOutput,
 };
 
 /// An edit described by raw numbers; `realise` turns it into an op that refers to things that
@@ -24,7 +26,7 @@ struct Seed {
 fn seeds() -> impl Strategy<Value = Vec<Seed>> {
     prop::collection::vec(
         (
-            0u8..22,
+            0u8..30,
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
@@ -236,6 +238,107 @@ fn realise(seed: &Seed, model: &Model) -> Option<Op> {
             }),
             enabled: seed.a % 2 == 0,
         },
+        22 => Op::SetTrack {
+            id: any_track(seed.a)?.id,
+            change: TrackChange::Invert(seed.b % 2 == 0),
+        },
+        23 | 24 => {
+            let track = any_track(seed.a)?;
+            Op::AddSend {
+                track: track.id,
+                index: (seed.b % (track.sends.len() as u64 + 2)) as usize,
+                send: Send {
+                    id: SendId(fresh),
+                    // Often a real bus, sometimes not: both outcomes must leave the model sound.
+                    target: any_track(seed.c).map_or(TrackId(77), |t| t.id),
+                    gain: seed.x,
+                    pre_fader: seed.c % 2 == 0,
+                    mute: seed.c % 5 == 0,
+                },
+            }
+        }
+        25 => {
+            let track = any_track(seed.a)?;
+            match pick(&track.sends, seed.b) {
+                Some(send) if seed.c % 2 == 0 => Op::RemoveSend {
+                    track: track.id,
+                    send: send.id,
+                },
+                Some(send) => Op::SetSend {
+                    track: track.id,
+                    send: Send {
+                        target: any_track(seed.c).map_or(send.target, |t| t.id),
+                        gain: seed.x.abs().min(4.0),
+                        ..*send
+                    },
+                },
+                None => Op::RemoveSend {
+                    track: track.id,
+                    send: SendId(seed.b % 9),
+                },
+            }
+        }
+        26 | 27 => {
+            let track = any_track(seed.a)?;
+            let target = match seed.b % 4 {
+                0 => AutomationTarget::TrackGain,
+                1 => AutomationTarget::TrackPan,
+                2 => AutomationTarget::SendGain {
+                    send: pick(&track.sends, seed.c).map_or(SendId(1), |s| s.id),
+                },
+                _ => AutomationTarget::PluginParam {
+                    slot: pick(&track.plugins, seed.c).map_or(SlotId(1), |s| s.id),
+                    param: (seed.c % 8) as u32,
+                },
+            };
+            let (low, high) = target.range();
+            let points = (0..seed.c % 5)
+                .map(|i| AutomationPoint {
+                    at: Ticks((i * 3 + seed.a % 3) as i64 * TICKS_PER_BEAT / 2),
+                    value: low + (high - low) * ((seed.b + i) % 11) as f32 / 10.0,
+                    shape: if (seed.a + i) % 2 == 0 {
+                        CurveShape::Linear
+                    } else {
+                        CurveShape::Hold
+                    },
+                })
+                .collect();
+            let modes = [
+                AutomationMode::Off,
+                AutomationMode::Read,
+                AutomationMode::Touch,
+                AutomationMode::Latch,
+                AutomationMode::Write,
+            ];
+            let lane = AutomationLane {
+                id: LaneId(fresh),
+                target,
+                mode: modes[(seed.c % 5) as usize],
+                points: Arc::new(points),
+            };
+            // Half the time, replace an existing lane's contents instead of adding a new one.
+            match pick(&track.automation, seed.c) {
+                Some(existing) if seed.a % 2 == 0 => Op::ReplaceLane {
+                    track: track.id,
+                    lane: AutomationLane {
+                        id: existing.id,
+                        target: existing.target,
+                        ..lane
+                    },
+                },
+                _ => Op::AddLane {
+                    track: track.id,
+                    lane,
+                },
+            }
+        }
+        28 => {
+            let track = any_track(seed.a)?;
+            Op::RemoveLane {
+                track: track.id,
+                lane: pick(&track.automation, seed.b).map_or(LaneId(seed.b % 9), |l| l.id),
+            }
+        }
         _ => Op::SetMetronome {
             metronome: Metronome {
                 enabled: seed.a % 2 == 0,

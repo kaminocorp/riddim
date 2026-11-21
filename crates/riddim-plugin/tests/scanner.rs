@@ -22,7 +22,7 @@ fn vst3(path: std::path::PathBuf) -> ScanTarget {
 fn healthy_bundle_scans_out_of_process() {
     match scanner().scan(&vst3(testplug_bundle())) {
         ScanOutcome::Ok(plugins) => {
-            assert_eq!(plugins.len(), 3);
+            assert_eq!(plugins.len(), 4);
             assert!(plugins.iter().any(|p| p.id.uid == ids::SYNTH_UID));
         }
         other => panic!("expected a clean scan, got {other:?}"),
@@ -79,7 +79,7 @@ fn scan_all_collects_plugins_and_failures() {
     let mut seen = 0;
     let report = scanner().scan_all(&targets, |_, _| seen += 1);
     assert_eq!(seen, 2);
-    assert_eq!(report.plugins.len(), 3);
+    assert_eq!(report.plugins.len(), 4);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].0, targets[0]);
 }

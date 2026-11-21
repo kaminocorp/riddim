@@ -14,6 +14,9 @@ pub mod ids {
     pub const SYNTH_UID: &str = "52444D5453594E3150524F4300000001";
     pub const DELAY_UID: &str = "52444D54444C593150524F4300000001";
     pub const GAIN_UID: &str = "52444D5447414E3153494E4700000001";
+    /// The gain plugin again, taking 400 ms to initialise.
+    pub const SLOW_UID: &str = "52444D54534C4F5753494E4700000001";
+    pub const SLOW_LOAD_MS: u64 = 400;
 
     pub const SYNTH_GAIN: u32 = 100;
     pub const SYNTH_MOD: u32 = 101;

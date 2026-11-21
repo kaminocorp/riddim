@@ -17,8 +17,9 @@ mod model;
 mod ops;
 
 pub use model::{
-    Clip, ClipContent, ClipId, LoopRange, Media, MediaId, Metronome, MidiEvent, Model, Note,
-    PluginRef, PluginSlot, SlotId, Track, TrackId, TrackInput, TrackKind, TrackOutput,
+    AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Clip, ClipContent, ClipId,
+    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, MidiEvent, Model, Note, PluginRef,
+    PluginSlot, Send, SendId, SlotId, Track, TrackId, TrackInput, TrackKind, TrackOutput,
     SCHEMA_VERSION,
 };
 pub use ops::{Op, OpError, TrackChange};

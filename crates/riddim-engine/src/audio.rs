@@ -49,6 +49,11 @@ pub(crate) enum ToAudio {
         count_in_bars: u32,
         punch_ahead: i64,
     },
+    /// A new bypass delay for a plugin whose latency changed (`None` for no latency).
+    BypassDelay {
+        slot: SlotId,
+        line: Option<Box<crate::dsp::DelayLine>>,
+    },
     /// A parameter value for a plugin, applied at the start of the next block.
     Param {
         slot: SlotId,
@@ -249,6 +254,22 @@ impl AudioEngine {
                         }
                     }
                 }
+                ToAudio::BypassDelay { slot, line } => {
+                    let mut line = line;
+                    if let Some(plan) = &self.plan {
+                        if let Some(step) = plan.plugin_step(slot) {
+                            // SAFETY: we are the audio thread, between blocks.
+                            if let NodeRt::Plugin(plugin) = unsafe { plan.steps[step].cell.get() } {
+                                std::mem::swap(&mut plugin.bypass_delay, &mut line);
+                            }
+                        }
+                    }
+                    // Whatever is left (the old line, or the new one if the plugin has gone) is
+                    // freed on the control thread.
+                    if let Some(old) = line {
+                        self.chute.discard(old);
+                    }
+                }
                 ToAudio::Midi { track, body } => {
                     if self.injected.len() < self.injected.capacity() {
                         self.injected.push((track, body));
@@ -375,6 +396,7 @@ impl AudioEngine {
                 outputs: &mut audio[step.first_buffer..step.first_buffer + step.out_channels],
                 events_in: buffers.merged_events.as_slice(),
                 events_out: step.event_output.map(|index| &mut events[index]),
+                latency: step.input_latency,
             };
             // SAFETY: we are the audio thread executing this step; the reference ends with it.
             let rt = unsafe { step.cell.get() };

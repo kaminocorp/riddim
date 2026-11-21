@@ -21,16 +21,30 @@ const STEREO: SpeakerArrangement = 3;
 
 pub struct GainSingle {
     gain: AtomicU64,
+    /// Take a long time to initialise, like a sampler loading its library.
+    slow: bool,
 }
 
 impl GainSingle {
     pub const NAME: &'static str = "Riddim Test Gain";
     pub const CID: TUID = uid(0x52444D54, 0x47414E31, 0x53494E47, 0x00000001);
     pub const GAIN: u32 = 7;
+    /// The same plugin under a second class id, with a 400 ms `initialize`.
+    pub const SLOW_NAME: &'static str = "Riddim Test Slow Loader";
+    pub const SLOW_CID: TUID = uid(0x52444D54, 0x534C4F57, 0x53494E47, 0x00000001);
+    pub const SLOW_LOAD: std::time::Duration = std::time::Duration::from_millis(400);
 
     pub fn new() -> Self {
         Self {
             gain: AtomicU64::new(0.5f64.to_bits()),
+            slow: false,
+        }
+    }
+
+    pub fn new_slow() -> Self {
+        Self {
+            slow: true,
+            ..Self::new()
         }
     }
 
@@ -45,6 +59,9 @@ impl Class for GainSingle {
 
 impl IPluginBaseTrait for GainSingle {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        if self.slow {
+            std::thread::sleep(Self::SLOW_LOAD);
+        }
         kResultOk
     }
 

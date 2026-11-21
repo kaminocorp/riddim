@@ -48,6 +48,88 @@ pub(crate) struct TimedEvent {
     pub body: EventBody,
 }
 
+/// One breakpoint of an automation curve, at an absolute timeline sample.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RtPoint {
+    pub sample: i64,
+    pub value: f32,
+    /// Stay at this value until the next point, instead of ramping towards it.
+    pub hold: bool,
+}
+
+/// An automation lane with its positions already converted to samples.
+pub(crate) struct RtCurve {
+    pub points: Vec<RtPoint>,
+}
+
+impl RtCurve {
+    /// The curve's value at `sample`. Before the first point and after the last, their values
+    /// hold. `None` for a curve with no points.
+    #[inline]
+    pub fn value_at(&self, sample: i64) -> Option<f32> {
+        let next = self.points.partition_point(|p| p.sample <= sample);
+        let Some(before) = next.checked_sub(1).map(|i| self.points[i]) else {
+            return self.points.first().map(|p| p.value);
+        };
+        match self.points.get(next) {
+            Some(after) if !before.hold => {
+                let span = (after.sample - before.sample) as f64;
+                let along = (sample - before.sample) as f64 / span;
+                Some(before.value + ((after.value - before.value) as f64 * along) as f32)
+            }
+            _ => Some(before.value),
+        }
+    }
+
+    /// A reader for walking the curve forwards one sample at a time.
+    #[inline]
+    pub fn cursor(&self) -> CurveCursor<'_> {
+        CurveCursor {
+            curve: self,
+            next: 0,
+        }
+    }
+
+    /// The breakpoints strictly inside `(start, end)`.
+    #[inline]
+    pub fn points_inside(&self, start: i64, end: i64) -> &[RtPoint] {
+        let from = self.points.partition_point(|p| p.sample <= start);
+        let to = self.points.partition_point(|p| p.sample < end);
+        &self.points[from..to.max(from)]
+    }
+}
+
+/// Reads a curve at increasing sample positions in constant time per sample.
+///
+/// The value at a sample is computed from the curve's own breakpoints, never from the previous
+/// sample, so it is the same whatever block size the engine happens to run at.
+pub(crate) struct CurveCursor<'a> {
+    curve: &'a RtCurve,
+    next: usize,
+}
+
+impl CurveCursor<'_> {
+    /// The curve's value at `sample`. Calls must not go backwards.
+    #[inline]
+    pub fn value_at(&mut self, sample: i64) -> Option<f32> {
+        let points = &self.curve.points;
+        while self.next < points.len() && points[self.next].sample <= sample {
+            self.next += 1;
+        }
+        let Some(before) = self.next.checked_sub(1).map(|i| points[i]) else {
+            return points.first().map(|p| p.value);
+        };
+        match points.get(self.next) {
+            Some(after) if !before.hold => {
+                let span = (after.sample - before.sample) as f64;
+                let along = (sample - before.sample) as f64 / span;
+                Some(before.value + ((after.value - before.value) as f64 * along) as f32)
+            }
+            _ => Some(before.value),
+        }
+    }
+}
+
 /// What a node is told to do for this plan. Small values and shared lists only: reading it
 /// costs nothing and it never has to be freed on the audio thread, because the plan that owns
 /// it is retired through the garbage chute.
@@ -68,11 +150,21 @@ pub(crate) enum StepParams {
     BusInput,
     Plugin {
         bypass: bool,
+        /// Automation for the plugin's parameters: (parameter id, curve).
+        curves: Arc<Vec<(u32, Arc<RtCurve>)>>,
     },
     Strip {
         gain: f32,
         pan: f32,
         mute: bool,
+        invert: bool,
+        gain_curve: Option<Arc<RtCurve>>,
+        pan_curve: Option<Arc<RtCurve>>,
+    },
+    Send {
+        gain: f32,
+        mute: bool,
+        curve: Option<Arc<RtCurve>>,
     },
     Metronome {
         enabled: bool,
@@ -88,6 +180,8 @@ pub(crate) enum NodeRt {
     MidiSource(MidiSourceRt),
     Plugin(Box<PluginRt>),
     Strip(StripRt),
+    /// A send's gain stage.
+    Gain(GainRt),
     Metronome(Click),
 }
 
@@ -116,6 +210,21 @@ pub(crate) struct PluginRt {
     pub events_out: EventBuffer,
     /// Parameter changes waiting for the next block.
     pub pending_params: EventBuffer,
+    /// The last value sent for each automated parameter, so a flat curve sends nothing.
+    pub automated: Vec<(u32, f32)>,
+    /// Delays the dry signal by the plugin's latency while it is bypassed, so bypassing does
+    /// not shift the track in time. `None` for a plugin with no latency.
+    pub bypass_delay: Option<Box<DelayLine>>,
+    pub was_bypassed: bool,
+}
+
+/// How many automated parameters per plugin are tracked for change detection. Lanes beyond
+/// this still work; they just resend their value every block.
+pub(crate) const AUTOMATED_CAPACITY: usize = 256;
+
+pub(crate) struct GainRt {
+    pub gain: StereoGain,
+    pub primed: bool,
 }
 
 pub(crate) struct StripRt {
@@ -209,6 +318,9 @@ pub(crate) struct RtStep {
     /// The step's input channels, flat across ports, are `scratch[first_scratch..][..in_channels]`.
     pub first_scratch: usize,
     pub in_channels: usize,
+    /// How late this node's input is relative to the timeline, in samples. Automation is read
+    /// that much earlier so it lines up with the audio it acts on.
+    pub input_latency: i64,
     /// Its output channels, flat across ports, are `audio[first_buffer..][..out_channels]`.
     pub first_buffer: usize,
     pub out_channels: usize,

@@ -7,8 +7,9 @@ use riddim_time::{Position, TempoMap, Ticks};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Clip, ClipContent, ClipId, LoopRange, Media, MediaId, Metronome, Model, PluginSlot, SlotId,
-    Track, TrackId, TrackInput, TrackKind, TrackOutput,
+    AutomationLane, AutomationTarget, Clip, ClipContent, ClipId, LaneId, LoopRange, Media, MediaId,
+    Metronome, Model, PluginSlot, Send, SendId, SlotId, Track, TrackId, TrackInput, TrackKind,
+    TrackOutput,
 };
 
 /// One property of a track's strip.
@@ -22,6 +23,8 @@ pub enum TrackChange {
     Solo(bool),
     RecordArmed(bool),
     Monitor(bool),
+    /// Flip the polarity of the track's output.
+    Invert(bool),
     Input(TrackInput),
     Output(TrackOutput),
 }
@@ -99,6 +102,37 @@ pub enum Op {
         bypass: bool,
     },
 
+    /// Adds a send at `index` in the track's list of sends.
+    AddSend {
+        track: TrackId,
+        index: usize,
+        send: Send,
+    },
+    RemoveSend {
+        track: TrackId,
+        send: SendId,
+    },
+    /// Replaces the send that has the same id as `send` (gain, target, pre/post, mute).
+    SetSend {
+        track: TrackId,
+        send: Send,
+    },
+
+    AddLane {
+        track: TrackId,
+        lane: AutomationLane,
+    },
+    RemoveLane {
+        track: TrackId,
+        lane: LaneId,
+    },
+    /// Replaces the lane that has the same id as `lane`: its points, its mode, or both. The
+    /// target cannot change.
+    ReplaceLane {
+        track: TrackId,
+        lane: AutomationLane,
+    },
+
     SetTempoMap {
         map: TempoMap,
     },
@@ -147,6 +181,14 @@ pub enum OpError {
         track: TrackId,
         clip: ClipId,
     },
+    UnknownSend(SendId),
+    UnknownLane(LaneId),
+    DuplicateSend(SendId),
+    DuplicateLane(LaneId),
+    /// The track already has a lane for that control.
+    TargetAlreadyAutomated(LaneId),
+    /// The plugin slot or send cannot be removed while a lane automates it.
+    Automated(LaneId),
     Invalid(&'static str),
 }
 
@@ -181,6 +223,16 @@ impl fmt::Display for OpError {
             }
             OpError::WrongClipKind { track, clip } => {
                 write!(f, "clip {} is the wrong kind for track {}", clip.0, track.0)
+            }
+            OpError::UnknownSend(id) => write!(f, "there is no send {}", id.0),
+            OpError::UnknownLane(id) => write!(f, "there is no automation lane {}", id.0),
+            OpError::DuplicateSend(id) => write!(f, "send id {} is already in use", id.0),
+            OpError::DuplicateLane(id) => write!(f, "lane id {} is already in use", id.0),
+            OpError::TargetAlreadyAutomated(id) => {
+                write!(f, "lane {} already automates that control", id.0)
+            }
+            OpError::Automated(id) => {
+                write!(f, "automation lane {} still refers to it", id.0)
             }
             OpError::Invalid(why) => write!(f, "invalid value: {why}"),
         }
@@ -313,6 +365,97 @@ pub(crate) fn check_output(
     Err(OpError::RoutingCycle(track))
 }
 
+/// Checks one send of `track`: it goes to a bus, other than the track itself, at a sane gain.
+pub(crate) fn check_send(model: &Model, track: TrackId, send: &Send) -> Result<(), OpError> {
+    if !send.gain.is_finite() || !(0.0..=4.0).contains(&send.gain) {
+        return Err(OpError::Invalid("send gain must be between 0 and 4"));
+    }
+    if send.target == track {
+        return Err(OpError::RoutingCycle(track));
+    }
+    let target = model
+        .track(send.target)
+        .ok_or(OpError::UnknownTrack(send.target))?;
+    if target.kind != TrackKind::Bus {
+        return Err(OpError::NotABus(send.target));
+    }
+    Ok(())
+}
+
+/// Checks a lane against the track that carries it.
+pub(crate) fn check_lane(track: &Track, lane: &AutomationLane) -> Result<(), OpError> {
+    match lane.target {
+        AutomationTarget::TrackGain | AutomationTarget::TrackPan => {}
+        AutomationTarget::SendGain { send } => {
+            track.send(send).ok_or(OpError::UnknownSend(send))?;
+        }
+        AutomationTarget::PluginParam { slot, .. } => {
+            track.plugin(slot).ok_or(OpError::UnknownSlot(slot))?;
+        }
+    }
+    let (low, high) = lane.target.range();
+    for point in lane.points.iter() {
+        if !point.value.is_finite() || point.value < low || point.value > high {
+            return Err(OpError::Invalid(
+                "an automation value is out of range for its control",
+            ));
+        }
+        if point.at < Ticks::ZERO {
+            return Err(OpError::Invalid(
+                "automation cannot start before the timeline",
+            ));
+        }
+    }
+    if !lane.points.windows(2).all(|w| w[0].at < w[1].at) {
+        return Err(OpError::Invalid(
+            "automation points must be in strictly increasing order",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that no signal can travel from a track back into itself through outputs and sends.
+pub(crate) fn check_routing(model: &Model) -> Result<(), OpError> {
+    // Depth-first search over "feeds into" edges, with the usual three colours.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        New,
+        Open,
+        Done,
+    }
+    fn visit(
+        model: &Model,
+        track: &Track,
+        marks: &mut std::collections::HashMap<TrackId, Mark>,
+    ) -> Result<(), OpError> {
+        match marks.get(&track.id).copied().unwrap_or(Mark::New) {
+            Mark::Done => return Ok(()),
+            Mark::Open => return Err(OpError::RoutingCycle(track.id)),
+            Mark::New => {}
+        }
+        marks.insert(track.id, Mark::Open);
+        let output = match track.output {
+            TrackOutput::Bus(bus) if track.kind != TrackKind::Master => Some(bus),
+            _ => None,
+        };
+        for next in output
+            .into_iter()
+            .chain(track.sends.iter().map(|s| s.target))
+        {
+            if let Some(next) = model.track(next) {
+                visit(model, next, marks)?;
+            }
+        }
+        marks.insert(track.id, Mark::Done);
+        Ok(())
+    }
+    let mut marks = std::collections::HashMap::new();
+    for track in &model.tracks {
+        visit(model, track, &mut marks)?;
+    }
+    Ok(())
+}
+
 fn check_index(index: usize, len: usize) -> Result<(), OpError> {
     if index > len {
         Err(OpError::IndexOutOfRange { index, len })
@@ -346,6 +489,14 @@ impl Model {
         self.all_tracks().any(|t| t.plugin(id).is_some())
     }
 
+    fn send_exists(&self, id: SendId) -> bool {
+        self.all_tracks().any(|t| t.send(id).is_some())
+    }
+
+    fn lane_exists(&self, id: LaneId) -> bool {
+        self.all_tracks().any(|t| t.lane(id).is_some())
+    }
+
     /// Applies one op. On success returns its inverse; on failure the model is untouched.
     pub fn apply(&mut self, op: &Op) -> Result<Op, OpError> {
         match op {
@@ -377,6 +528,27 @@ impl Model {
                 let mut candidate = self.clone();
                 candidate.tracks.insert(*index, Arc::new(track.clone()));
                 check_output(&candidate, track.id, track.output)?;
+                let mut sends = std::collections::HashSet::new();
+                for send in &track.sends {
+                    if self.send_exists(send.id) || !sends.insert(send.id) {
+                        return Err(OpError::DuplicateSend(send.id));
+                    }
+                    check_send(&candidate, track.id, send)?;
+                }
+                if !track.automation.windows(2).all(|w| w[0].id < w[1].id) {
+                    return Err(OpError::Invalid("a track's lanes must be sorted by id"));
+                }
+                let mut targets = std::collections::HashSet::new();
+                for lane in &track.automation {
+                    if self.lane_exists(lane.id) {
+                        return Err(OpError::DuplicateLane(lane.id));
+                    }
+                    if !targets.insert(lane.target) {
+                        return Err(OpError::TargetAlreadyAutomated(lane.id));
+                    }
+                    check_lane(track, lane)?;
+                }
+                check_routing(&candidate)?;
                 *self = candidate;
                 Ok(Op::RemoveTrack { id: track.id })
             }
@@ -386,11 +558,11 @@ impl Model {
                     return Err(OpError::MasterIsFixed);
                 }
                 let index = self.track_index(*id).ok_or(OpError::UnknownTrack(*id))?;
-                if let Some(feeder) = self
-                    .tracks
-                    .iter()
-                    .find(|t| t.output == TrackOutput::Bus(*id))
-                {
+                if let Some(feeder) = self.tracks.iter().find(|t| {
+                    t.id != *id
+                        && (t.output == TrackOutput::Bus(*id)
+                            || t.sends.iter().any(|s| s.target == *id))
+                }) {
                     return Err(OpError::BusInUse {
                         bus: *id,
                         by: feeder.id,
@@ -438,6 +610,7 @@ impl Model {
                     TrackChange::Solo(_) => TrackChange::Solo(current.solo),
                     TrackChange::RecordArmed(_) => TrackChange::RecordArmed(current.record_armed),
                     TrackChange::Monitor(_) => TrackChange::Monitor(current.monitor),
+                    TrackChange::Invert(_) => TrackChange::Invert(current.invert),
                     TrackChange::Input(input) => {
                         if let TrackInput::Audio { channels, .. } = input {
                             if !(1..=2).contains(channels) {
@@ -452,7 +625,10 @@ impl Model {
                         if *id == TrackId::MASTER {
                             return Err(OpError::MasterIsFixed);
                         }
-                        check_output(self, *id, *output)?;
+                        let mut candidate = self.clone();
+                        candidate.track_mut(*id)?.output = *output;
+                        check_output(&candidate, *id, *output)?;
+                        check_routing(&candidate)?;
                         TrackChange::Output(current.output)
                     }
                 };
@@ -465,6 +641,7 @@ impl Model {
                     TrackChange::Solo(solo) => track.solo = solo,
                     TrackChange::RecordArmed(armed) => track.record_armed = armed,
                     TrackChange::Monitor(monitor) => track.monitor = monitor,
+                    TrackChange::Invert(invert) => track.invert = invert,
                     TrackChange::Input(input) => track.input = input,
                     TrackChange::Output(output) => track.output = output,
                 }
@@ -576,6 +753,11 @@ impl Model {
                     .iter()
                     .position(|p| p.id == *slot)
                     .ok_or(OpError::UnknownSlot(*slot))?;
+                if let Some(lane) = target.automation.iter().find(|l| {
+                    matches!(l.target, AutomationTarget::PluginParam { slot: s, .. } if s == *slot)
+                }) {
+                    return Err(OpError::Automated(lane.id));
+                }
                 let removed = self.track_mut(*track)?.plugins.remove(index);
                 Ok(Op::InsertPlugin {
                     track: *track,
@@ -640,6 +822,114 @@ impl Model {
                     track: *track,
                     slot: *slot,
                     bypass: previous,
+                })
+            }
+
+            Op::AddSend { track, index, send } => {
+                let target = self.require_track(*track)?;
+                if target.kind == TrackKind::Master {
+                    return Err(OpError::MasterIsFixed);
+                }
+                if self.send_exists(send.id) {
+                    return Err(OpError::DuplicateSend(send.id));
+                }
+                check_index(*index, target.sends.len())?;
+                check_send(self, *track, send)?;
+                let mut candidate = self.clone();
+                candidate.track_mut(*track)?.sends.insert(*index, *send);
+                check_routing(&candidate)?;
+                *self = candidate;
+                Ok(Op::RemoveSend {
+                    track: *track,
+                    send: send.id,
+                })
+            }
+
+            Op::RemoveSend { track, send } => {
+                let target = self.require_track(*track)?;
+                let index = target
+                    .sends
+                    .iter()
+                    .position(|s| s.id == *send)
+                    .ok_or(OpError::UnknownSend(*send))?;
+                if let Some(lane) = target.automation.iter().find(
+                    |l| matches!(l.target, AutomationTarget::SendGain { send: s } if s == *send),
+                ) {
+                    return Err(OpError::Automated(lane.id));
+                }
+                let removed = self.track_mut(*track)?.sends.remove(index);
+                Ok(Op::AddSend {
+                    track: *track,
+                    index,
+                    send: removed,
+                })
+            }
+
+            Op::SetSend { track, send } => {
+                let target = self.require_track(*track)?;
+                let index = target
+                    .sends
+                    .iter()
+                    .position(|s| s.id == send.id)
+                    .ok_or(OpError::UnknownSend(send.id))?;
+                check_send(self, *track, send)?;
+                let mut candidate = self.clone();
+                let previous =
+                    std::mem::replace(&mut candidate.track_mut(*track)?.sends[index], *send);
+                check_routing(&candidate)?;
+                *self = candidate;
+                Ok(Op::SetSend {
+                    track: *track,
+                    send: previous,
+                })
+            }
+
+            Op::AddLane { track, lane } => {
+                let target = self.require_track(*track)?;
+                if self.lane_exists(lane.id) {
+                    return Err(OpError::DuplicateLane(lane.id));
+                }
+                if let Some(existing) = target.lane_for(lane.target) {
+                    return Err(OpError::TargetAlreadyAutomated(existing.id));
+                }
+                check_lane(target, lane)?;
+                let target = self.track_mut(*track)?;
+                let at = target.automation.partition_point(|l| l.id < lane.id);
+                target.automation.insert(at, Arc::new(lane.clone()));
+                Ok(Op::RemoveLane {
+                    track: *track,
+                    lane: lane.id,
+                })
+            }
+
+            Op::RemoveLane { track, lane } => {
+                let target = self.require_track(*track)?;
+                let at = target
+                    .automation
+                    .binary_search_by_key(lane, |l| l.id)
+                    .map_err(|_| OpError::UnknownLane(*lane))?;
+                let removed = self.track_mut(*track)?.automation.remove(at);
+                Ok(Op::AddLane {
+                    track: *track,
+                    lane: Arc::unwrap_or_clone(removed),
+                })
+            }
+
+            Op::ReplaceLane { track, lane } => {
+                let target = self.require_track(*track)?;
+                let at = target
+                    .automation
+                    .binary_search_by_key(&lane.id, |l| l.id)
+                    .map_err(|_| OpError::UnknownLane(lane.id))?;
+                if target.automation[at].target != lane.target {
+                    return Err(OpError::Invalid("a lane's target cannot change"));
+                }
+                check_lane(target, lane)?;
+                let slot = &mut self.track_mut(*track)?.automation[at];
+                let previous = std::mem::replace(slot, Arc::new(lane.clone()));
+                Ok(Op::ReplaceLane {
+                    track: *track,
+                    lane: Arc::unwrap_or_clone(previous),
                 })
             }
 

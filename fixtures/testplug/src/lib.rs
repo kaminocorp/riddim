@@ -6,6 +6,7 @@
 //! * **Riddim Test Delay** — an effect that delays by a parameter-controlled number of samples
 //!   and reports that as latency, with a sidechain input.
 //! * **Riddim Test Gain** — a single-component effect (processor and controller in one object).
+//! * **Riddim Test Slow Loader** — the same effect, but it takes 400 ms to initialise.
 //!
 //! Nothing here allocates, locks or does I/O inside `process`.
 
@@ -43,7 +44,7 @@ struct ClassRow {
     create: fn() -> vst3::ComPtr<FUnknown>,
 }
 
-fn classes() -> [ClassRow; 5] {
+fn classes() -> [ClassRow; 6] {
     [
         ClassRow {
             cid: SynthKernel::CID,
@@ -96,6 +97,17 @@ fn classes() -> [ClassRow; 5] {
             sub_categories: "Fx",
             create: || {
                 ComWrapper::new(gain::GainSingle::new())
+                    .to_com_ptr()
+                    .unwrap()
+            },
+        },
+        ClassRow {
+            cid: gain::GainSingle::SLOW_CID,
+            category: "Audio Module Class",
+            name: gain::GainSingle::SLOW_NAME,
+            sub_categories: "Fx",
+            create: || {
+                ComWrapper::new(gain::GainSingle::new_slow())
                     .to_com_ptr()
                     .unwrap()
             },

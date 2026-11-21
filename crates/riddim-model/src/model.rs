@@ -34,6 +34,15 @@ id_type!(
     SlotId
 );
 
+id_type!(
+    /// Identifies a send within the project.
+    SendId
+);
+id_type!(
+    /// Identifies an automation lane within the project.
+    LaneId
+);
+
 impl TrackId {
     pub const MASTER: TrackId = TrackId(0);
 }
@@ -99,6 +108,107 @@ pub struct PluginSlot {
     pub state: Option<Arc<Vec<u8>>>,
     #[serde(default)]
     pub bypass: bool,
+}
+
+/// A second route out of a track, into a bus.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Send {
+    pub id: SendId,
+    /// The bus that receives the send.
+    pub target: TrackId,
+    /// Linear gain, 0.0 to 4.0.
+    pub gain: f32,
+    /// Tap the signal before the track's fader, pan and mute instead of after.
+    pub pre_fader: bool,
+    pub mute: bool,
+}
+
+/// What an automation lane controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum AutomationTarget {
+    /// The track's fader, as linear gain 0.0 to 4.0.
+    TrackGain,
+    /// The track's pan, -1.0 to 1.0.
+    TrackPan,
+    /// A send's gain, 0.0 to 4.0.
+    SendGain { send: SendId },
+    /// A plugin parameter, normalised 0.0 to 1.0.
+    PluginParam { slot: SlotId, param: u32 },
+}
+
+impl AutomationTarget {
+    /// The values a lane for this target may hold.
+    pub fn range(self) -> (f32, f32) {
+        match self {
+            AutomationTarget::TrackGain | AutomationTarget::SendGain { .. } => (0.0, 4.0),
+            AutomationTarget::TrackPan => (-1.0, 1.0),
+            AutomationTarget::PluginParam { .. } => (0.0, 1.0),
+        }
+    }
+}
+
+/// How a lane behaves during playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationMode {
+    /// The lane is ignored; the control's own value applies.
+    Off,
+    /// The lane drives the control.
+    Read,
+    /// Read, but while the control is being held its movements are written into the lane.
+    Touch,
+    /// Like touch, but writing continues after release until the transport stops.
+    Latch,
+    /// Everything played over is overwritten with the control's value while the transport runs.
+    Write,
+}
+
+/// How the value moves from one point to the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveShape {
+    /// A straight line to the next point.
+    Linear,
+    /// Stay at this value until the next point.
+    Hold,
+}
+
+/// A breakpoint on an automation lane, at an absolute timeline position.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPoint {
+    pub at: Ticks,
+    pub value: f32,
+    pub shape: CurveShape,
+}
+
+/// The automation of one control of a track. A track has at most one lane per target.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationLane {
+    pub id: LaneId,
+    pub target: AutomationTarget,
+    pub mode: AutomationMode,
+    /// Strictly increasing in position. Before the first point and after the last the lane
+    /// holds their values.
+    pub points: Arc<Vec<AutomationPoint>>,
+}
+
+impl AutomationLane {
+    /// The lane's value at `at`, or `None` if it has no points.
+    pub fn value_at(&self, at: Ticks) -> Option<f32> {
+        let next = self.points.partition_point(|p| p.at <= at);
+        let Some(before) = next.checked_sub(1).map(|i| self.points[i]) else {
+            return self.points.first().map(|p| p.value);
+        };
+        match (before.shape, self.points.get(next)) {
+            (CurveShape::Linear, Some(after)) => {
+                let span = (after.at.0 - before.at.0) as f64;
+                let along = (at.0 - before.at.0) as f64 / span;
+                Some(before.value + ((after.value - before.value) as f64 * along) as f32)
+            }
+            _ => Some(before.value),
+        }
+    }
 }
 
 /// A note in a MIDI clip. Times are relative to the clip's start.
@@ -190,6 +300,9 @@ pub struct Track {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    /// Flip the polarity of the track's output.
+    #[serde(default)]
+    pub invert: bool,
     pub record_armed: bool,
     /// Pass the live input through the track while not playing back a recording.
     pub monitor: bool,
@@ -201,6 +314,12 @@ pub struct Track {
     /// The plugin chain, in processing order.
     #[serde(default)]
     pub plugins: Vec<Arc<PluginSlot>>,
+    /// Sends, in the order they were added.
+    #[serde(default)]
+    pub sends: Vec<Send>,
+    /// Automation lanes, kept sorted by id.
+    #[serde(default)]
+    pub automation: Vec<Arc<AutomationLane>>,
 }
 
 impl Track {
@@ -214,12 +333,15 @@ impl Track {
             pan: 0.0,
             mute: false,
             solo: false,
+            invert: false,
             record_armed: false,
             monitor: false,
             input: TrackInput::None,
             output: TrackOutput::Master,
             clips: Vec::new(),
             plugins: Vec::new(),
+            sends: Vec::new(),
+            automation: Vec::new(),
         }
     }
 
@@ -232,6 +354,22 @@ impl Track {
 
     pub fn plugin(&self, id: SlotId) -> Option<&Arc<PluginSlot>> {
         self.plugins.iter().find(|p| p.id == id)
+    }
+
+    pub fn send(&self, id: SendId) -> Option<&Send> {
+        self.sends.iter().find(|s| s.id == id)
+    }
+
+    pub fn lane(&self, id: LaneId) -> Option<&Arc<AutomationLane>> {
+        self.automation
+            .binary_search_by_key(&id, |l| l.id)
+            .ok()
+            .map(|i| &self.automation[i])
+    }
+
+    /// The lane that controls `target`, if there is one.
+    pub fn lane_for(&self, target: AutomationTarget) -> Option<&Arc<AutomationLane>> {
+        self.automation.iter().find(|l| l.target == target)
     }
 }
 
@@ -336,6 +474,12 @@ impl Model {
             for slot in &track.plugins {
                 highest = highest.max(slot.id.0);
             }
+            for send in &track.sends {
+                highest = highest.max(send.id.0);
+            }
+            for lane in &track.automation {
+                highest = highest.max(lane.id.0);
+            }
         }
         for media in &self.media {
             highest = highest.max(media.id.0);
@@ -369,6 +513,8 @@ impl Model {
         let mut track_ids = std::collections::HashSet::new();
         let mut clip_ids = std::collections::HashSet::new();
         let mut slot_ids = std::collections::HashSet::new();
+        let mut send_ids = std::collections::HashSet::new();
+        let mut lane_ids = std::collections::HashSet::new();
         for track in self.all_tracks() {
             if !track_ids.insert(track.id) {
                 return Err(format!("duplicate track id {}", track.id.0));
@@ -394,7 +540,27 @@ impl Model {
                     return Err(format!("duplicate plugin slot id {}", slot.id.0));
                 }
             }
+            for send in &track.sends {
+                if !send_ids.insert(send.id) {
+                    return Err(format!("duplicate send id {}", send.id.0));
+                }
+                crate::ops::check_send(self, track.id, send).map_err(|e| e.to_string())?;
+            }
+            if !track.automation.windows(2).all(|w| w[0].id < w[1].id) {
+                return Err(format!(
+                    "lanes of track {} are not sorted by id",
+                    track.id.0
+                ));
+            }
+            let mut targets = std::collections::HashSet::new();
+            for lane in &track.automation {
+                if !lane_ids.insert(lane.id) || !targets.insert(lane.target) {
+                    return Err(format!("duplicate automation lane {}", lane.id.0));
+                }
+                crate::ops::check_lane(track, lane).map_err(|e| e.to_string())?;
+            }
         }
+        crate::ops::check_routing(self).map_err(|e| e.to_string())?;
         if !self.media.windows(2).all(|w| w[0].id < w[1].id) {
             return Err("media are not sorted by id".into());
         }

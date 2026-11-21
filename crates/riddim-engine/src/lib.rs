@@ -16,6 +16,7 @@
 //! ([`Engine::model`], [`Engine::status`]) and events ([`Engine::subscribe`]).
 
 mod audio;
+mod bounce;
 mod control;
 mod dsp;
 mod engine;
@@ -26,6 +27,7 @@ mod nodes;
 mod plan;
 mod shared;
 
+pub use bounce::{bounce, BounceRequest, BounceResult};
 pub use control::{Applied, Rejected, TransportCommand};
 pub use engine::{DeviceConfig, Engine, EngineConfig, EngineError, MainThreadMode, Status};
 pub use events::{Event, TransportState};

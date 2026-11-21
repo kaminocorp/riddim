@@ -5,7 +5,11 @@ use riddim_plugin::{Event, EventBody, EventBuffer, ProcessContext, ProcessStatus
 use riddim_time::TempoMap;
 
 use crate::dsp::strip_gains;
-use crate::plan::{MidiSourceRt, NodeRt, PluginRt, RtAudioClip, StepParams, StripRt, TimedEvent};
+use crate::dsp::StereoGain;
+use crate::plan::{
+    MidiSourceRt, NodeRt, PluginRt, RtAudioClip, RtCurve, StepParams, TimedEvent,
+    AUTOMATED_CAPACITY,
+};
 
 /// Everything about the block that is the same for every node.
 pub(crate) struct BlockCtx<'a> {
@@ -36,6 +40,8 @@ pub(crate) struct NodeIo<'a> {
     pub outputs: &'a mut [Vec<f32>],
     pub events_in: &'a [Event],
     pub events_out: Option<&'a mut EventBuffer>,
+    /// How late this node's input is relative to the timeline, in samples.
+    pub latency: i64,
 }
 
 /// Things a node wants the engine to pass on to the control thread.
@@ -96,11 +102,73 @@ pub(crate) fn process(
                 output[..frames].copy_from_slice(&input[..frames]);
             }
         }
-        (NodeRt::Plugin(plugin), StepParams::Plugin { bypass }) => {
-            plugin_node(plugin, *bypass, io, ctx, &mut notify);
+        (NodeRt::Plugin(plugin), StepParams::Plugin { bypass, curves }) => {
+            plugin_node(plugin, *bypass, curves, io, ctx, &mut notify);
         }
-        (NodeRt::Strip(strip), StepParams::Strip { gain, pan, mute }) => {
-            strip_node(strip, strip_gains(*gain, *pan, *mute), io, frames);
+        (
+            NodeRt::Strip(strip),
+            StepParams::Strip {
+                gain,
+                pan,
+                mute,
+                invert,
+                gain_curve,
+                pan_curve,
+            },
+        ) => {
+            // Curves are read where this node's audio is on the timeline, not where the
+            // playhead is: its input arrives `latency` samples late.
+            let at = ctx.position - io.latency;
+            let sign = if *invert { -1.0 } else { 1.0 };
+            let mut gain_cursor = gain_curve.as_ref().map(|c| c.cursor());
+            let mut pan_cursor = pan_curve.as_ref().map(|c| c.cursor());
+            let mut gains_at = |sample: i64| {
+                let gain = gain_cursor
+                    .as_mut()
+                    .and_then(|c| c.value_at(sample))
+                    .unwrap_or(*gain);
+                let pan = pan_cursor
+                    .as_mut()
+                    .and_then(|c| c.value_at(sample))
+                    .unwrap_or(*pan);
+                let (left, right) = strip_gains(gain, pan, *mute);
+                (left * sign, right * sign)
+            };
+            let automated = ctx.playing && (gain_curve.is_some() || pan_curve.is_some());
+            let meter = strip.meter.clone();
+            gain_stage(
+                &mut strip.gain,
+                &mut strip.primed,
+                automated,
+                at,
+                &mut gains_at,
+                io,
+                frames,
+                |channel, peak| meter.raise(channel, peak),
+            );
+        }
+        (NodeRt::Gain(stage), StepParams::Send { gain, mute, curve }) => {
+            let at = ctx.position - io.latency;
+            let mut cursor = curve.as_ref().map(|c| c.cursor());
+            let mut gains_at = |sample: i64| {
+                let gain = cursor
+                    .as_mut()
+                    .and_then(|c| c.value_at(sample))
+                    .unwrap_or(*gain);
+                let gain = if *mute { 0.0 } else { gain };
+                (gain, gain)
+            };
+            let automated = ctx.playing && curve.is_some();
+            gain_stage(
+                &mut stage.gain,
+                &mut stage.primed,
+                automated,
+                at,
+                &mut gains_at,
+                io,
+                frames,
+                |_, _| {},
+            );
         }
         (NodeRt::Metronome(click), StepParams::Metronome { enabled, gain }) => {
             for output in io.outputs.iter_mut() {
@@ -311,31 +379,94 @@ fn midi_source(
 fn plugin_node(
     plugin: &mut PluginRt,
     bypass: bool,
+    curves: &[(u32, std::sync::Arc<RtCurve>)],
     io: NodeIo<'_>,
     ctx: &BlockCtx<'_>,
     notify: &mut impl FnMut(NodeMessage),
 ) {
     let frames = ctx.frames;
     if bypass {
-        // Pass the main input through (an instrument has none, and is silent).
-        for (c, output) in io.outputs.iter_mut().enumerate() {
-            match io.inputs.get(c) {
-                Some(input) => output[..frames].copy_from_slice(&input[..frames]),
-                None => output[..frames].fill(0.0),
+        if !plugin.was_bypassed {
+            plugin.was_bypassed = true;
+            if let Some(delay) = plugin.bypass_delay.as_mut() {
+                delay.clear();
             }
+        }
+        // Pass the main input through (an instrument has none, and is silent), delayed by the
+        // plugin's latency so the rest of the mix stays aligned with it.
+        for (c, output) in io.outputs.iter_mut().enumerate() {
+            output[..frames].fill(0.0);
+            let Some(input) = io.inputs.get(c) else {
+                continue;
+            };
+            match plugin.bypass_delay.as_mut() {
+                Some(delay) => delay.process_add(c, &input[..frames], &mut output[..frames]),
+                None => output[..frames].copy_from_slice(&input[..frames]),
+            }
+        }
+        if let Some(delay) = plugin.bypass_delay.as_mut() {
+            delay.advance(frames);
         }
         plugin.pending_params.clear();
         return;
     }
+    plugin.was_bypassed = false;
 
-    // Parameter changes first (they apply from the start of the block), then MIDI.
+    // Parameter changes first (they apply from the start of the block), then automation, then
+    // MIDI.
     plugin.events_in.clear();
     for event in plugin.pending_params.as_slice() {
         plugin.events_in.push(*event);
     }
     plugin.pending_params.clear();
+
+    let mut unsorted = false;
+    if ctx.playing {
+        let start = ctx.position - io.latency;
+        let end = start + frames as i64;
+        for (id, curve) in curves.iter() {
+            let Some(value) = curve.value_at(start) else {
+                continue;
+            };
+            // Send the block's starting value only when it moved (or after a jump), so a flat
+            // lane costs the plugin nothing.
+            let known = plugin.automated.iter().position(|(known, _)| known == id);
+            let changed = match known {
+                Some(index) => {
+                    let moved = plugin.automated[index].1 != value;
+                    plugin.automated[index].1 = value;
+                    moved
+                }
+                None => {
+                    if plugin.automated.len() < AUTOMATED_CAPACITY {
+                        plugin.automated.push((*id, value));
+                    }
+                    true
+                }
+            };
+            if changed || ctx.discontinuity {
+                plugin.events_in.push(Event::param(0, *id, value as f64));
+            }
+            // Breakpoints inside the block land on their own sample.
+            for point in curve.points_inside(start, end) {
+                plugin.events_in.push(Event::param(
+                    (point.sample - start) as u32,
+                    *id,
+                    point.value as f64,
+                ));
+                if let Some((_, last)) = plugin.automated.iter_mut().find(|(known, _)| known == id)
+                {
+                    *last = point.value;
+                }
+                unsorted = true;
+            }
+        }
+    }
     for event in io.events_in {
         plugin.events_in.push(*event);
+    }
+    if unsorted {
+        plugin.events_in.sort();
     }
     plugin.events_out.clear();
 
@@ -381,13 +512,24 @@ fn plugin_node(
     }
 }
 
-fn strip_node(strip: &mut StripRt, gains: (f32, f32), io: NodeIo<'_>, frames: usize) {
-    if strip.primed {
-        strip.gain.set(gains);
-    } else {
-        strip.gain.snap(gains);
-        strip.primed = true;
-    }
+/// A stereo gain stage: copy the input to the output and apply gains.
+///
+/// `gains_at(sample)` gives the gains for a timeline sample and is only ever asked for
+/// increasing samples. While `automated`, it is asked for every sample of the block and its
+/// answer is applied directly: the automation curve is the smoothing, exact at its breakpoints
+/// and independent of block size. Otherwise it is asked once, and a change from the previous
+/// block ramps over the stage's own short time so a fader move does not click.
+#[allow(clippy::too_many_arguments)]
+fn gain_stage(
+    gain: &mut StereoGain,
+    primed: &mut bool,
+    automated: bool,
+    at: i64,
+    gains_at: &mut dyn FnMut(i64) -> (f32, f32),
+    io: NodeIo<'_>,
+    frames: usize,
+    mut meter: impl FnMut(usize, f32),
+) {
     let [left, right] = io.outputs else { return };
     for (output, input) in [
         (&mut *left, io.inputs.first()),
@@ -398,9 +540,33 @@ fn strip_node(strip: &mut StripRt, gains: (f32, f32), io: NodeIo<'_>, frames: us
             None => output[..frames].fill(0.0),
         }
     }
-    strip.gain.apply(&mut left[..frames], &mut right[..frames]);
+
+    if automated {
+        let mut last = (0.0, 0.0);
+        for (i, (l, r)) in left[..frames]
+            .iter_mut()
+            .zip(right[..frames].iter_mut())
+            .enumerate()
+        {
+            last = gains_at(at + i as i64);
+            *l *= last.0;
+            *r *= last.1;
+        }
+        // If automation stops, the stage carries on from where the curve left it.
+        gain.snap(last);
+    } else {
+        let now = gains_at(at);
+        if *primed {
+            gain.set(now);
+        } else {
+            gain.snap(now);
+        }
+        gain.apply(&mut left[..frames], &mut right[..frames]);
+    }
+    *primed = true;
+
     for (channel, output) in [&*left, &*right].into_iter().enumerate() {
         let peak = output[..frames].iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        strip.meter.raise(channel, peak);
+        meter(channel, peak);
     }
 }

@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 use riddim_model::time::{Position, Superclock, Tempo, TempoMap, Ticks};
 use riddim_model::{
-    Clip, ClipContent, ClipId, LoopRange, Media, MediaId, Metronome, Model, Note, Op, OpError,
-    PluginRef, PluginSlot, SlotId, Track, TrackChange, TrackId, TrackInput, TrackKind, TrackOutput,
+    AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Clip, ClipContent, ClipId,
+    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, Model, Note, Op, OpError, PluginRef,
+    PluginSlot, Send, SendId, SlotId, Track, TrackChange, TrackId, TrackInput, TrackKind,
+    TrackOutput,
 };
 
 fn media(id: u64, frames: u64) -> Media {
@@ -664,4 +666,412 @@ fn ops_serialise_as_tagged_json() {
     let json = serde_json::to_string(&state).unwrap();
     assert!(json.contains("Zm9vYmFy"), "{json}");
     assert_eq!(serde_json::from_str::<Op>(&json).unwrap(), state);
+}
+
+fn send(id: u64, target: u64) -> Send {
+    Send {
+        id: SendId(id),
+        target: TrackId(target),
+        gain: 0.5,
+        pre_fader: false,
+        mute: false,
+    }
+}
+
+fn point(beats: i64, value: f32, shape: CurveShape) -> AutomationPoint {
+    AutomationPoint {
+        at: Ticks::from_beats(beats),
+        value,
+        shape,
+    }
+}
+
+fn lane(id: u64, target: AutomationTarget, points: Vec<AutomationPoint>) -> AutomationLane {
+    AutomationLane {
+        id: LaneId(id),
+        target,
+        mode: AutomationMode::Read,
+        points: Arc::new(points),
+    }
+}
+
+#[test]
+fn sends_route_into_buses_and_cannot_close_a_loop() {
+    let mut model = Model::new();
+    add_track(&mut model, 1, TrackKind::Audio);
+    add_track(&mut model, 2, TrackKind::Bus);
+    add_track(&mut model, 3, TrackKind::Bus);
+    apply_checked(
+        &mut model,
+        Op::AddSend {
+            track: TrackId(1),
+            index: 0,
+            send: send(10, 2),
+        },
+    );
+    apply_checked(
+        &mut model,
+        Op::AddSend {
+            track: TrackId(1),
+            index: 0,
+            send: send(11, 3),
+        },
+    );
+    assert_eq!(
+        model
+            .track(TrackId(1))
+            .unwrap()
+            .sends
+            .iter()
+            .map(|s| s.id.0)
+            .collect::<Vec<_>>(),
+        vec![11, 10]
+    );
+    let mut louder = send(10, 3);
+    louder.gain = 2.0;
+    louder.pre_fader = true;
+    apply_checked(
+        &mut model,
+        Op::SetSend {
+            track: TrackId(1),
+            send: louder,
+        },
+    );
+    apply_checked(
+        &mut model,
+        Op::SetTrack {
+            id: TrackId(1),
+            change: TrackChange::Invert(true),
+        },
+    );
+    assert_eq!(model.fresh_id(), 12);
+
+    let snapshot = model.clone();
+    let refused: Vec<(Op, OpError)> = vec![
+        (
+            Op::AddSend {
+                track: TrackId(1),
+                index: 0,
+                send: send(10, 2),
+            },
+            OpError::DuplicateSend(SendId(10)),
+        ),
+        (
+            Op::AddSend {
+                track: TrackId(2),
+                index: 0,
+                send: send(20, 1),
+            },
+            OpError::NotABus(TrackId(1)),
+        ),
+        (
+            Op::AddSend {
+                track: TrackId(2),
+                index: 0,
+                send: send(20, 2),
+            },
+            OpError::RoutingCycle(TrackId(2)),
+        ),
+        (
+            Op::AddSend {
+                track: TrackId(2),
+                index: 0,
+                send: send(20, 9),
+            },
+            OpError::UnknownTrack(TrackId(9)),
+        ),
+        (
+            Op::AddSend {
+                track: TrackId(2),
+                index: 3,
+                send: send(20, 3),
+            },
+            OpError::IndexOutOfRange { index: 3, len: 0 },
+        ),
+        (
+            Op::AddSend {
+                track: TrackId::MASTER,
+                index: 0,
+                send: send(20, 2),
+            },
+            OpError::MasterIsFixed,
+        ),
+        (
+            Op::RemoveSend {
+                track: TrackId(2),
+                send: SendId(10),
+            },
+            OpError::UnknownSend(SendId(10)),
+        ),
+        (
+            Op::RemoveTrack { id: TrackId(3) },
+            OpError::BusInUse {
+                bus: TrackId(3),
+                by: TrackId(1),
+            },
+        ),
+    ];
+    for (op, expected) in refused {
+        assert_eq!(model.apply(&op), Err(expected), "{op:?}");
+        assert_eq!(model, snapshot);
+    }
+
+    // A loop that only exists through a send: bus 2 outputs to bus 3, bus 3 sends to bus 2.
+    model
+        .apply(&Op::SetTrack {
+            id: TrackId(2),
+            change: TrackChange::Output(TrackOutput::Bus(TrackId(3))),
+        })
+        .unwrap();
+    assert!(matches!(
+        model.apply(&Op::AddSend {
+            track: TrackId(3),
+            index: 0,
+            send: send(30, 2)
+        }),
+        Err(OpError::RoutingCycle(_))
+    ));
+    // And the other way round: the send exists first, then the output would close the loop.
+    model
+        .apply(&Op::SetTrack {
+            id: TrackId(2),
+            change: TrackChange::Output(TrackOutput::Master),
+        })
+        .unwrap();
+    model
+        .apply(&Op::AddSend {
+            track: TrackId(3),
+            index: 0,
+            send: send(30, 2),
+        })
+        .unwrap();
+    assert!(matches!(
+        model.apply(&Op::SetTrack {
+            id: TrackId(2),
+            change: TrackChange::Output(TrackOutput::Bus(TrackId(3)))
+        }),
+        Err(OpError::RoutingCycle(_))
+    ));
+    model.validate().unwrap();
+    assert_eq!(Model::from_json(&model.to_json()).unwrap(), model);
+}
+
+#[test]
+fn automation_lanes_follow_their_targets() {
+    let mut model = Model::new();
+    add_track(&mut model, 1, TrackKind::Instrument);
+    add_track(&mut model, 2, TrackKind::Bus);
+    model
+        .apply(&Op::InsertPlugin {
+            track: TrackId(1),
+            index: 0,
+            slot: slot(5),
+        })
+        .unwrap();
+    model
+        .apply(&Op::AddSend {
+            track: TrackId(1),
+            index: 0,
+            send: send(6, 2),
+        })
+        .unwrap();
+
+    let gain = lane(
+        10,
+        AutomationTarget::TrackGain,
+        vec![
+            point(0, 0.0, CurveShape::Linear),
+            point(4, 1.0, CurveShape::Hold),
+            point(8, 0.5, CurveShape::Linear),
+        ],
+    );
+    apply_checked(
+        &mut model,
+        Op::AddLane {
+            track: TrackId(1),
+            lane: gain.clone(),
+        },
+    );
+    apply_checked(
+        &mut model,
+        Op::AddLane {
+            track: TrackId(1),
+            lane: lane(
+                11,
+                AutomationTarget::PluginParam {
+                    slot: SlotId(5),
+                    param: 7,
+                },
+                vec![point(1, 0.25, CurveShape::Hold)],
+            ),
+        },
+    );
+    apply_checked(
+        &mut model,
+        Op::AddLane {
+            track: TrackId(1),
+            lane: lane(9, AutomationTarget::SendGain { send: SendId(6) }, vec![]),
+        },
+    );
+    assert_eq!(
+        model
+            .track(TrackId(1))
+            .unwrap()
+            .automation
+            .iter()
+            .map(|l| l.id.0)
+            .collect::<Vec<_>>(),
+        vec![9, 10, 11]
+    );
+
+    let mut touched = gain.clone();
+    touched.mode = AutomationMode::Touch;
+    touched.points = Arc::new(vec![point(2, 2.0, CurveShape::Linear)]);
+    apply_checked(
+        &mut model,
+        Op::ReplaceLane {
+            track: TrackId(1),
+            lane: touched,
+        },
+    );
+    apply_checked(
+        &mut model,
+        Op::RemoveLane {
+            track: TrackId(1),
+            lane: LaneId(9),
+        },
+    );
+
+    let snapshot = model.clone();
+    let pan_on_gain_lane = AutomationLane {
+        target: AutomationTarget::TrackPan,
+        ..gain.clone()
+    };
+    let refused: Vec<(Op, OpError)> = vec![
+        (
+            Op::AddLane {
+                track: TrackId(1),
+                lane: lane(10, AutomationTarget::TrackPan, vec![]),
+            },
+            OpError::DuplicateLane(LaneId(10)),
+        ),
+        (
+            Op::AddLane {
+                track: TrackId(1),
+                lane: lane(20, AutomationTarget::TrackGain, vec![]),
+            },
+            OpError::TargetAlreadyAutomated(LaneId(10)),
+        ),
+        (
+            Op::AddLane {
+                track: TrackId(1),
+                lane: lane(
+                    20,
+                    AutomationTarget::PluginParam {
+                        slot: SlotId(99),
+                        param: 0,
+                    },
+                    vec![],
+                ),
+            },
+            OpError::UnknownSlot(SlotId(99)),
+        ),
+        (
+            Op::AddLane {
+                track: TrackId(2),
+                lane: lane(20, AutomationTarget::SendGain { send: SendId(6) }, vec![]),
+            },
+            OpError::UnknownSend(SendId(6)),
+        ),
+        (
+            Op::AddLane {
+                track: TrackId(2),
+                lane: lane(
+                    20,
+                    AutomationTarget::TrackPan,
+                    vec![point(0, 1.5, CurveShape::Linear)],
+                ),
+            },
+            OpError::Invalid("an automation value is out of range for its control"),
+        ),
+        (
+            Op::AddLane {
+                track: TrackId(2),
+                lane: lane(
+                    20,
+                    AutomationTarget::TrackGain,
+                    vec![
+                        point(4, 1.0, CurveShape::Linear),
+                        point(4, 0.5, CurveShape::Linear),
+                    ],
+                ),
+            },
+            OpError::Invalid("automation points must be in strictly increasing order"),
+        ),
+        (
+            Op::ReplaceLane {
+                track: TrackId(1),
+                lane: pan_on_gain_lane,
+            },
+            OpError::Invalid("a lane's target cannot change"),
+        ),
+        (
+            Op::RemoveLane {
+                track: TrackId(2),
+                lane: LaneId(10),
+            },
+            OpError::UnknownLane(LaneId(10)),
+        ),
+        // What a lane points at cannot be pulled out from under it.
+        (
+            Op::RemovePlugin {
+                track: TrackId(1),
+                slot: SlotId(5),
+            },
+            OpError::Automated(LaneId(11)),
+        ),
+    ];
+    for (op, expected) in refused {
+        assert_eq!(model.apply(&op), Err(expected), "{op:?}");
+        assert_eq!(model, snapshot);
+    }
+    assert_eq!(Model::from_json(&model.to_json()).unwrap(), model);
+}
+
+#[test]
+fn lane_values_interpolate_hold_and_extend() {
+    let ramp = lane(
+        1,
+        AutomationTarget::TrackGain,
+        vec![
+            point(4, 0.0, CurveShape::Linear),
+            point(8, 2.0, CurveShape::Hold),
+            point(12, 1.0, CurveShape::Linear),
+        ],
+    );
+    let at = |beats: (i64, i64)| ramp.value_at(Ticks::from_beat_fraction(beats.0, beats.1));
+    assert_eq!(
+        at((0, 1)),
+        Some(0.0),
+        "before the first point its value holds"
+    );
+    assert_eq!(at((4, 1)), Some(0.0));
+    assert_eq!(at((6, 1)), Some(1.0), "halfway up a linear segment");
+    assert_eq!(at((7, 1)), Some(1.5));
+    assert_eq!(at((8, 1)), Some(2.0));
+    assert_eq!(
+        at((23, 2)),
+        Some(2.0),
+        "a hold stays put until the next point"
+    );
+    assert_eq!(at((12, 1)), Some(1.0));
+    assert_eq!(
+        at((100, 1)),
+        Some(1.0),
+        "after the last point its value holds"
+    );
+    assert_eq!(
+        lane(2, AutomationTarget::TrackPan, vec![]).value_at(Ticks::ZERO),
+        None
+    );
 }

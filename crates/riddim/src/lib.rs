@@ -34,6 +34,7 @@
 
 pub mod import;
 
+pub use riddim_engine::{bounce, BounceRequest, BounceResult};
 pub use riddim_engine::{
     Applied, DeviceConfig, Engine, EngineConfig, EngineError, Event, MainThread, MainThreadMode,
     NullConfig, Rejected, Status, TransportCommand, TransportState,
@@ -51,7 +52,7 @@ pub mod plugins {
     pub use riddim_plugin::scan::{default_targets, ScanOutcome, ScanReport, ScanTarget, Scanner};
     pub use riddim_plugin::{
         EventBody, PluginDescriptor, PluginEvent, PluginFormat, PluginId, PluginInstance,
-        PluginKind,
+        PluginKind, ProcessMode,
     };
 
     #[cfg(target_os = "macos")]

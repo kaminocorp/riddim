@@ -55,6 +55,9 @@ pub struct EngineConfig {
     pub butler: ButlerConfig,
     /// Connect to the system's MIDI inputs.
     pub midi_input: bool,
+    /// What plugins are told about how they are being driven. `Offline` lets samplers wait for
+    /// their own disk streaming instead of dropping voices; use it for bounces.
+    pub process_mode: riddim_plugin::ProcessMode,
 }
 
 impl EngineConfig {
@@ -69,6 +72,7 @@ impl EngineConfig {
             main_thread: MainThreadMode::Internal,
             butler: ButlerConfig::default(),
             midi_input: false,
+            process_mode: riddim_plugin::ProcessMode::Realtime,
         }
     }
 }
@@ -207,6 +211,7 @@ impl Engine {
             capture_dir: config.capture_dir.clone(),
             media_dir: config.media_dir.clone(),
             butler: Butler::spawn(config.butler),
+            process_mode: config.process_mode,
         };
         let control_thread = std::thread::Builder::new()
             .name("riddim-control".into())
@@ -283,6 +288,17 @@ impl Engine {
     /// Sets a plugin parameter (normalised 0..=1).
     pub fn set_param(&self, slot: SlotId, id: u32, value: f64) {
         self.send(ControlMsg::SetParam { slot, id, value });
+    }
+
+    /// Tells the engine that a control is being held (`down`) or was released. This is what
+    /// drives touch and latch automation for faders, pans and sends; plugin editors report their
+    /// own gestures.
+    pub fn touch(&self, track: TrackId, target: riddim_model::AutomationTarget, down: bool) {
+        self.send(ControlMsg::Touch {
+            track,
+            target,
+            down,
+        });
     }
 
     /// Plays a note or controller into a track's instrument, as an on-screen keyboard would.

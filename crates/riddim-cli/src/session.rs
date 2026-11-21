@@ -177,6 +177,11 @@ pub struct Running {
 
 impl Running {
     pub fn start(device: DeviceConfig, dir: &Path, midi_input: bool) -> Result<Running, String> {
+        // The manual device is only ever used for rendering.
+        let process_mode = match device {
+            DeviceConfig::Manual(_) => riddim::plugins::ProcessMode::Offline,
+            _ => riddim::plugins::ProcessMode::Realtime,
+        };
         let config = EngineConfig {
             device,
             capture_dir: dir.to_path_buf(),
@@ -185,6 +190,7 @@ impl Running {
             main_thread: MainThreadMode::External,
             butler: Default::default(),
             midi_input,
+            process_mode,
         };
         let mut engine = Engine::start(config).map_err(|e| e.to_string())?;
         let main = engine

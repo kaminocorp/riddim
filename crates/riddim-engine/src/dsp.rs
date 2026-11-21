@@ -48,6 +48,15 @@ impl DelayLine {
     }
 }
 
+impl DelayLine {
+    /// Forgets everything in the line.
+    pub fn clear(&mut self) {
+        for line in &mut self.channels {
+            line.fill(0.0);
+        }
+    }
+}
+
 /// Per-channel gains for a stereo strip from its fader and pan.
 ///
 /// A balance control: at centre both channels are at the fader's gain; turning towards one side

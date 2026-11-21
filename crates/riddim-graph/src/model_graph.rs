@@ -12,10 +12,13 @@
 //!                                                           ▼
 //!  master:            BusInput ───────▶ plugins… ──▶ Strip ──▶ Output ◀── Metronome
 //! ```
+//!
+//! A send is one more node: it taps its track before the strip (pre-fader) or after it
+//! (post-fader), applies its own gain, and feeds the summing input of its target bus.
 
 use std::collections::HashMap;
 
-use riddim_model::{Model, SlotId, TrackId, TrackKind, TrackOutput};
+use riddim_model::{Model, SendId, SlotId, TrackId, TrackKind, TrackOutput};
 
 use crate::compile::{Edge, EventEdge, GraphSpec, NodeIndex, NodeSpec};
 
@@ -33,6 +36,8 @@ pub enum NodeKind {
     Plugin(TrackId, SlotId),
     /// Fader, pan, mute and meter.
     Strip(TrackId),
+    /// The gain stage of a send, between its tap on the track and the bus it feeds.
+    Send(TrackId, SendId),
     Metronome,
     /// The device output.
     Output,
@@ -98,6 +103,7 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
     // Pass 1: every track's own chain, remembering its strip and its summing input.
     let mut strips: Vec<(TrackId, NodeIndex, Option<TrackOutput>)> = Vec::new();
     let mut bus_inputs: HashMap<TrackId, NodeIndex> = HashMap::new();
+    let mut sends: Vec<(NodeIndex, TrackId)> = Vec::new();
 
     for track in model.all_tracks() {
         // The head of the chain: where audio and events for this track come from.
@@ -167,6 +173,15 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
         if let Some(source) = audio {
             graph.connect(source, strip, 0);
         }
+        // Sends tap the track before or after its strip. A pre-fader send on a track with no
+        // audio yet (an instrument whose plugin is missing) has nothing to tap and is left out.
+        for send in &track.sends {
+            let tap = if send.pre_fader { audio } else { Some(strip) };
+            let Some(tap) = tap else { continue };
+            let node = graph.add(NodeKind::Send(track.id, send.id), stereo_through());
+            graph.connect(tap, node, 0);
+            sends.push((node, send.target));
+        }
         let output = (track.kind != TrackKind::Master).then_some(track.output);
         strips.push((track.id, strip, output));
     }
@@ -203,6 +218,13 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
                     .unwrap_or(bus_inputs[&TrackId::MASTER]);
                 graph.connect(strip, target, 0);
             }
+        }
+    }
+    for (node, target) in sends {
+        // The model guarantees a send names an existing bus; one that somehow does not is
+        // simply not connected.
+        if let Some(&bus) = bus_inputs.get(&target) {
+            graph.connect(node, bus, 0);
         }
     }
     graph.connect(metronome, output, 0);
@@ -400,6 +422,75 @@ mod tests {
             vec![0, 256]
         );
         assert_eq!(plan.max_latency, 256);
+    }
+
+    #[test]
+    fn sends_tap_before_or_after_the_strip_and_are_compensated() {
+        use riddim_model::{Send, SendId};
+        let mut model = session();
+        model
+            .apply(&Op::InsertPlugin {
+                track: TrackId(3),
+                index: 0,
+                slot: slot(20),
+            })
+            .unwrap();
+        let send = |id, pre_fader| Send {
+            id: SendId(id),
+            target: TrackId(3),
+            gain: 1.0,
+            pre_fader,
+            mute: false,
+        };
+        model
+            .apply(&Op::AddSend {
+                track: TrackId(1),
+                index: 0,
+                send: send(30, false),
+            })
+            .unwrap();
+        model
+            .apply(&Op::AddSend {
+                track: TrackId(1),
+                index: 1,
+                send: send(31, true),
+            })
+            .unwrap();
+        // The bus carries an effect with 100 samples of latency.
+        let graph = build(&model, &HashMap::from([(SlotId(20), effect(100))]));
+        let index = |kind| {
+            graph
+                .index_of(kind)
+                .unwrap_or_else(|| panic!("no node {kind:?}"))
+        };
+        let has_edge = |from, to| {
+            graph
+                .spec
+                .edges
+                .iter()
+                .any(|e| e.from == index(from) && e.to == index(to))
+        };
+        let post = NodeKind::Send(TrackId(1), SendId(30));
+        let pre = NodeKind::Send(TrackId(1), SendId(31));
+        assert!(has_edge(NodeKind::Strip(TrackId(1)), post));
+        assert!(has_edge(NodeKind::Source(TrackId(1)), pre));
+        assert!(has_edge(post, NodeKind::BusInput(TrackId(3))));
+        assert!(has_edge(pre, NodeKind::BusInput(TrackId(3))));
+
+        // At the master, the track's direct path is delayed to match its path through the bus.
+        let plan = compile(&graph.spec).unwrap();
+        let master_in = &plan.steps[plan.step_of_node[index(NodeKind::BusInput(TrackId::MASTER))]];
+        let delay_from = |kind| {
+            master_in.inputs[0]
+                .sources
+                .iter()
+                .find(|s| s.edge.from == index(kind))
+                .unwrap()
+                .delay
+        };
+        assert_eq!(delay_from(NodeKind::Strip(TrackId(1))), 100);
+        assert_eq!(delay_from(NodeKind::Strip(TrackId(3))), 0);
+        assert_eq!(plan.max_latency, 100);
     }
 
     #[test]
