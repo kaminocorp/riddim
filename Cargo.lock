@@ -896,6 +896,7 @@ dependencies = [
  "clack-extensions",
  "clack-host",
  "crossbeam-queue",
+ "libc",
  "libloading 0.9.1",
  "objc2",
  "objc2-app-kit",

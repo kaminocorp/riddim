@@ -211,6 +211,10 @@ enum SessionAction {
         /// Automate the instrument's fader from silence to full over this many beats.
         #[arg(long, value_name = "BEATS")]
         fade_in: Option<u32>,
+        /// Run each plugin in a process of its own (riddim-bridge): a crash then costs only
+        /// that plugin.
+        #[arg(long)]
+        bridged: bool,
     },
     /// Describe a project file.
     Info { project: PathBuf },
@@ -409,6 +413,7 @@ fn main() -> ExitCode {
                 insert,
                 send_effect,
                 fade_in,
+                bridged,
             } => match audio_input.as_deref().map(parse_inputs).transpose() {
                 Ok(audio_input) => session::session_new(
                     &context,
@@ -423,6 +428,7 @@ fn main() -> ExitCode {
                         inserts: insert,
                         send_effect,
                         fade_in,
+                        bridged,
                     },
                 ),
                 Err(message) => Err(message),

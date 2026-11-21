@@ -66,6 +66,13 @@ pub enum Event {
         slot: SlotId,
         error: String,
     },
+    /// A plugin running in a process of its own (a bridged slot) crashed or stopped
+    /// answering. It is out of the mix; the session carries on. Removing the slot and
+    /// inserting it again starts a fresh one.
+    PluginCrashed {
+        track: TrackId,
+        slot: SlotId,
+    },
     /// A loaded plugin was taken out of the mix for a moment and activated again: its extra
     /// outputs or sidechain were routed, or the buffer size changed. Its settings are intact.
     PluginRestarted {

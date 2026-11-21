@@ -68,6 +68,9 @@ pub struct EngineConfig {
     pub parallel_from: usize,
     /// How long files are played from disk.
     pub streaming: crate::stream::StreamingConfig,
+    /// The `riddim-bridge` executable, for plugin slots marked to run in a process of their
+    /// own. `None` looks in `$RIDDIM_BRIDGE` and then beside the running program.
+    pub bridge_executable: Option<PathBuf>,
 }
 
 /// The default for [`EngineConfig::parallel_from`].
@@ -92,6 +95,7 @@ impl EngineConfig {
             render_threads: None,
             parallel_from: PARALLEL_FROM_STEPS,
             streaming: Default::default(),
+            bridge_executable: None,
         }
     }
 }
@@ -286,13 +290,21 @@ impl Engine {
             .map_err(EngineError::Io)?;
 
         let (main_thread, host_thread) = match config.main_thread {
-            MainThreadMode::External => (Some(MainThread::new(host_rx, host_reply_tx)), None),
+            MainThreadMode::External => (
+                Some(MainThread::new(
+                    host_rx,
+                    host_reply_tx,
+                    config.bridge_executable.clone(),
+                )),
+                None,
+            ),
             MainThreadMode::Internal => {
+                let bridge = config.bridge_executable.clone();
                 let thread = std::thread::Builder::new()
                     .name("riddim-plugin-host".into())
                     .spawn(move || {
                         // Plugin instances are created on, and never leave, this thread.
-                        let mut main = MainThread::new(host_rx, host_reply_tx);
+                        let mut main = MainThread::new(host_rx, host_reply_tx, bridge);
                         while main.pump() {
                             std::thread::sleep(Duration::from_millis(2));
                         }

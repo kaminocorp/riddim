@@ -115,6 +115,10 @@ pub struct PluginSlot {
     /// What feeds the plugin's sidechain input, if anything.
     #[serde(default)]
     pub sidechain: Option<Sidechain>,
+    /// Run the plugin in a process of its own, so that if it crashes it does not take the
+    /// session with it. Costs CPU on every block. Decided when the slot is created.
+    #[serde(default)]
+    pub bridged: bool,
 }
 
 impl PluginSlot {
@@ -127,6 +131,7 @@ impl PluginSlot {
             bypass: false,
             outputs: Vec::new(),
             sidechain: None,
+            bridged: false,
         }
     }
 }

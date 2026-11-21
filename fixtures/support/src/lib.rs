@@ -39,6 +39,10 @@ pub mod ids {
     pub const COMMAND_VALUES_CHANGED: f64 = 3.0 / 8.0;
     pub const COMMAND_INFO_CHANGED: f64 = 4.0 / 8.0;
     pub const COMMAND_RESTART: f64 = 5.0 / 8.0;
+    /// Abort the process the plugin is running in.
+    pub const COMMAND_ABORT: f64 = 6.0 / 8.0;
+    /// Make every later `process` call hang.
+    pub const COMMAND_HANG: f64 = 7.0 / 8.0;
 }
 
 fn workspace_root() -> PathBuf {
@@ -67,6 +71,8 @@ fn fixture_libraries() -> &'static Vec<(String, PathBuf)> {
             "riddim-plugin",
             "--bin",
             "riddim-scan",
+            "--bin",
+            "riddim-bridge",
             "--lib",
         ]);
         if !cfg!(debug_assertions) {
@@ -89,9 +95,10 @@ fn fixture_libraries() -> &'static Vec<(String, PathBuf)> {
             if message["reason"] != "compiler-artifact" {
                 continue;
             }
-            if message["target"]["name"] == "riddim-scan" {
+            let name = message["target"]["name"].as_str().unwrap_or_default();
+            if name == "riddim-scan" || name == "riddim-bridge" {
                 if let Some(executable) = message["executable"].as_str() {
-                    libraries.push(("riddim-scan".to_string(), PathBuf::from(executable)));
+                    libraries.push((name.to_string(), PathBuf::from(executable)));
                 }
                 continue;
             }
@@ -236,6 +243,15 @@ pub fn scanner_exe() -> PathBuf {
         .find(|(name, _)| name == "riddim-scan")
         .map(|(_, path)| path.clone())
         .expect("cargo did not report the riddim-scan executable")
+}
+
+/// The plugin bridge child-process executable, built on demand.
+pub fn bridge_exe() -> PathBuf {
+    fixture_libraries()
+        .iter()
+        .find(|(name, _)| name == "riddim-bridge")
+        .map(|(_, path)| path.clone())
+        .expect("cargo did not report the riddim-bridge executable")
 }
 
 /// The bundle holding the test synth, delay and gain plugins.

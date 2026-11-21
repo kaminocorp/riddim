@@ -783,6 +783,7 @@ impl Control {
                     state: slot.state.clone(),
                     config,
                     buses,
+                    bridged: slot.bridged,
                 });
             }
         }
@@ -2424,6 +2425,21 @@ impl Control {
                         }
                         (PluginEvent::StateDirty, _) => {
                             self.emit(Event::PluginStateDirty { slot });
+                        }
+                        // A bridged plugin's process died or hung. Take what is left of it
+                        // out of the mix; everything else carries on.
+                        (PluginEvent::Crashed, Some(track)) => {
+                            if let Some(entry) = self.plugins.get_mut(&slot) {
+                                entry.status = PluginStatus::Failed;
+                                let serial = entry.serial;
+                                if let Some(cell) =
+                                    self.cells.remove(&NodeKind::Plugin(track, slot))
+                                {
+                                    self.retired.push((serial, cell));
+                                }
+                            }
+                            self.rebuild_plan();
+                            self.emit(Event::PluginCrashed { track, slot });
                         }
                         (PluginEvent::EditorResizeRequest { width, height }, _) => {
                             self.emit(Event::PluginEditorResize {

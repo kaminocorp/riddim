@@ -148,6 +148,7 @@ pub fn instrument_ops(
                 bypass: false,
                 outputs: Vec::new(),
                 sidechain: None,
+                bridged: false,
             },
         },
     ];
@@ -234,6 +235,7 @@ impl Running {
             render_threads,
             parallel_from: riddim::PARALLEL_FROM_STEPS,
             streaming: Default::default(),
+            bridge_executable: None,
         };
         let mut engine = Engine::start(config).map_err(|e| e.to_string())?;
         let main = engine
@@ -684,6 +686,8 @@ pub struct NewOptions {
     pub send_effect: Option<String>,
     /// Automate the instrument's fader from silence to full over this many beats.
     pub fade_in: Option<u32>,
+    /// Run every plugin of the project in a process of its own.
+    pub bridged: bool,
 }
 
 /// `riddim session new`: writes a project with an instrument track and an armed audio track.
@@ -702,10 +706,13 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
             (None, true) => Material::Arpeggio,
             (None, false) => Material::Live,
         };
-        apply(
-            &mut model,
-            instrument_ops(&descriptor, None, &material, false)?,
-        )?;
+        let mut ops = instrument_ops(&descriptor, None, &material, false)?;
+        for op in &mut ops {
+            if let Op::InsertPlugin { slot, .. } = op {
+                slot.bridged = options.bridged;
+            }
+        }
+        apply(&mut model, ops)?;
     }
     let effect_slot = |id: SlotId, spec: &str| -> Result<PluginSlot, String> {
         Ok(PluginSlot {
@@ -715,6 +722,7 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
             bypass: false,
             outputs: Vec::new(),
             sidechain: None,
+            bridged: options.bridged,
         })
     };
     let wants_mixing =
@@ -884,11 +892,16 @@ pub fn session_info(project: &Path) -> CommandResult {
         }
         for slot in &track.plugins {
             println!(
-                "      plugin {} in slot {} ({}:{}){}",
+                "      plugin {} in slot {} ({}:{}{}){}",
                 slot.plugin.name,
                 slot.id.0,
                 slot.plugin.format,
                 slot.plugin.uid,
+                if slot.bridged {
+                    ", in a process of its own"
+                } else {
+                    ""
+                },
                 slot.state
                     .as_ref()
                     .map_or(String::new(), |s| format!(", {} bytes of state", s.len()))

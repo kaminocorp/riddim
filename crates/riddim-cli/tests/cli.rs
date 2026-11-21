@@ -784,3 +784,52 @@ fn loop_takes_punch_routing_threads_and_a_live_buffer_change() {
     assert!(text.contains("messages lost 0"), "{text}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_project_with_bridged_plugins_renders_what_it_renders_in_process() {
+    let dir = temp_dir("bridged");
+    let render = |name: &str, extra: &[&str]| {
+        let project = dir.join(format!("{name}.json"));
+        let mut args = vec!["session", "new", project.to_str().unwrap(), "--instrument"];
+        let synth = plugin("synth");
+        let delay = plugin("delay");
+        args.extend_from_slice(&[&synth, "--sequence", "--insert", &delay]);
+        args.extend_from_slice(extra);
+        let created = riddim(&args);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let out = dir.join(format!("{name}.wav"));
+        let rendered = riddim(&[
+            "session",
+            "render",
+            project.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--seconds",
+            "2",
+        ]);
+        assert!(
+            rendered.status.success(),
+            "{}{}",
+            stdout(&rendered),
+            String::from_utf8_lossy(&rendered.stderr)
+        );
+        (
+            std::fs::read(out).unwrap(),
+            stdout(&riddim(&["session", "info", project.to_str().unwrap()])),
+        )
+    };
+    let (in_process, info) = render("in-process", &[]);
+    assert!(!info.contains("in a process of its own"), "{info}");
+    // The bridge executable is found beside the tool, as it would be when installed.
+    let (bridged, info) = render("bridged", &["--bridged"]);
+    assert_eq!(info.matches("in a process of its own").count(), 2, "{info}");
+    assert!(
+        bridged == in_process,
+        "bridging the plugins changed the bounce"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

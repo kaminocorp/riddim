@@ -118,7 +118,8 @@ pub struct RiddimStatus {
 ///   "main_thread": "external",    // "external" (pump it yourself) | "internal"
 ///   "midi_input": true,
 ///   "offline": false,             // tell plugins this is an offline render
-///   "render_threads": null        // extra render threads; null picks for the device
+///   "render_threads": null,       // extra render threads; null picks for the device
+///   "bridge_executable": null     // where riddim-bridge is, for bridged plugin slots
 /// }
 /// ```
 #[derive(Deserialize)]
@@ -151,6 +152,10 @@ struct Config {
     /// has cores (at most 7) on audio hardware, none on "null" and "manual".
     #[serde(default)]
     render_threads: Option<usize>,
+    /// The `riddim-bridge` executable, for plugin slots marked `"bridged": true`. Absent or
+    /// null: `$RIDDIM_BRIDGE`, then beside the running program.
+    #[serde(default)]
+    bridge_executable: Option<PathBuf>,
 }
 
 fn default_device() -> String {
@@ -211,6 +216,7 @@ fn engine_config(json: &str) -> Result<EngineConfig, String> {
         render_threads: config.render_threads,
         parallel_from: riddim::PARALLEL_FROM_STEPS,
         streaming: Default::default(),
+        bridge_executable: config.bridge_executable,
     })
 }
 

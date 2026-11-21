@@ -15,6 +15,8 @@
 //! Scanning runs in a child process (`riddim-scan`) so that a plugin that crashes while being
 //! probed cannot take the host down; see [`scan`].
 
+#[cfg(unix)]
+pub mod bridge;
 pub mod check;
 pub mod descriptor;
 pub mod error;

@@ -91,6 +91,9 @@ pub enum PluginEvent {
         width: u32,
         height: u32,
     },
+    /// The plugin is gone: it ran in a process of its own and that process died or stopped
+    /// answering. Nothing more will come from this instance; its audio side gives silence.
+    Crashed,
 }
 
 /// Editor size in points.
