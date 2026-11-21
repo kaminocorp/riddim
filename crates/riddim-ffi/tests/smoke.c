@@ -106,6 +106,14 @@ int main(int argc, char **argv) {
     CHECK(93, riddim_play_note(engine, 7, 0, 60, 1.0f) == 1);
     CHECK(94, riddim_status(NULL, &status) == 0);
 
+    /* The buffer size changes under a running engine; a size out of range is refused. */
+    CHECK(110, riddim_set_buffer_size(engine, 256) == 256);
+    CHECK(111, riddim_status(engine, &status) == 1 && status.block_frames == 256);
+    CHECK(112, wait_for_event(engine, "\"event\":\"stream_changed\""));
+    CHECK(113, riddim_set_buffer_size(engine, 3) == 0);
+    CHECK(114, strlen(riddim_last_error()) > 0);
+    CHECK(115, status.events_lost == 0);
+
     /* Touching a fader: valid targets are accepted, nonsense is refused. */
     CHECK(95, riddim_touch(engine, 7, "{\"type\":\"track_gain\"}", 1) == 1);
     CHECK(96, riddim_touch(engine, 7, "{\"type\":\"track_gain\"}", 0) == 1);

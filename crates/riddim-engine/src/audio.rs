@@ -493,6 +493,7 @@ impl AudioEngine {
 
 impl AudioCallback for AudioEngine {
     fn process(&mut self, block: &mut IoBlock<'_>) {
+        let started = std::time::Instant::now();
         self.injected.clear();
         self.drain_control();
 
@@ -563,5 +564,13 @@ impl AudioCallback for AudioEngine {
             riddim_rt::guard::thread_violations() + self.executor.worker_violations(),
             Ordering::Relaxed,
         );
+        // How much of the block's own duration it took to render: the figure for a CPU meter.
+        if block.frames > 0 {
+            let budget = block.frames as f32 / self.sample_rate as f32;
+            let load = started.elapsed().as_secs_f32() / budget;
+            if load > self.shared.dsp_load.load(Ordering::Relaxed) {
+                self.shared.dsp_load.store(load, Ordering::Relaxed);
+            }
+        }
     }
 }

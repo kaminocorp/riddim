@@ -96,6 +96,11 @@ pub struct RiddimStatus {
     pub plan_latency: u32,
     pub input_latency: u32,
     pub output_latency: u32,
+    /// The largest share of a block's duration that rendering one took over the last second
+    /// or so: 1.0 is all of it.
+    pub dsp_load: f32,
+    /// Messages from the audio thread that were lost. Should stay at zero.
+    pub events_lost: u64,
 }
 
 /// Engine configuration as JSON.
@@ -445,6 +450,27 @@ pub unsafe extern "C" fn riddim_capture_plugin_states(engine: *mut RiddimEngine)
     }
 }
 
+/// Changes the audio buffer size while the engine runs, without reopening the project.
+/// Returns the size the device settled on (it may clamp what was asked for), or 0 on failure.
+///
+/// Every plugin is told the new size, which takes each out of the mix for a moment; a
+/// `plugin_restarted` event says when one is back, and `stream_changed` describes the device.
+/// Not allowed while recording.
+#[no_mangle]
+pub unsafe extern "C" fn riddim_set_buffer_size(engine: *mut RiddimEngine, frames: u32) -> u32 {
+    clear_error();
+    let Some(handle) = (unsafe { handle(engine) }) else {
+        return 0;
+    };
+    match handle.engine.lock().unwrap().set_buffer_size(frames) {
+        Ok(info) => info.max_frames,
+        Err(error) => {
+            set_error(error.to_string());
+            0
+        }
+    }
+}
+
 /// Tells the engine that a control is being held (`down` = 1) or was released (0). This is
 /// what drives touch and latch automation for faders, pans and sends. `target_json` names the
 /// control the way automation lanes do, for example `{"type":"track_gain"}` or
@@ -636,6 +662,8 @@ pub unsafe extern "C" fn riddim_status(
             plan_latency: s.plan_latency,
             input_latency: s.input_latency,
             output_latency: s.output_latency,
+            dsp_load: s.dsp_load,
+            events_lost: s.events_lost,
         };
     }
     1

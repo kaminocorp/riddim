@@ -30,6 +30,11 @@ pub struct Shared {
     pub plan_latency: AtomicU32,
     /// Messages for the control thread that did not fit in its queue.
     pub events_lost: AtomicU64,
+    /// The largest share of a block's duration that rendering it has taken since this was
+    /// last read and reset: 1.0 means a block took exactly as long as it lasts.
+    pub dsp_load: AtomicF32,
+    /// The last value of `dsp_load` that was reported: the load over the second before.
+    pub dsp_load_reported: AtomicF32,
 }
 
 /// Peak meter for one strip. The audio thread raises the peaks; whoever reads them takes the

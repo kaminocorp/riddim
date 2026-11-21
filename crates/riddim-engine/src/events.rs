@@ -45,6 +45,12 @@ pub enum Event {
     Position {
         samples: i64,
     },
+    /// While rolling, the playhead left `from_samples` and carried on at `to_samples`: a loop
+    /// wrapped, or the transport was located.
+    Jumped {
+        from_samples: i64,
+        to_samples: i64,
+    },
     /// Peak levels (left, right) per track since the previous report.
     Meters {
         tracks: Vec<(TrackId, [f32; 2])>,
@@ -77,6 +83,29 @@ pub enum Event {
         slot: SlotId,
         latency: u32,
     },
+    /// A control in a plugin's editor was grabbed (`down`) or let go.
+    PluginGesture {
+        slot: SlotId,
+        id: u32,
+        down: bool,
+    },
+    /// A plugin changed many parameter values at once (a preset, say), or, with `info`, its
+    /// parameter list itself (names, ranges, count). Anything cached about them is stale.
+    PluginParamsChanged {
+        slot: SlotId,
+        info: bool,
+    },
+    /// A plugin's state changed in a way its parameters do not show: the project has unsaved
+    /// changes.
+    PluginStateDirty {
+        slot: SlotId,
+    },
+    /// A plugin's editor wants to be this size, in points.
+    PluginEditorResize {
+        slot: SlotId,
+        width: u32,
+        height: u32,
+    },
     RecordingStarted {
         tracks: Vec<TrackId>,
         position_samples: i64,
@@ -106,6 +135,15 @@ pub enum Event {
         buffer_frames: u32,
         input_latency_frames: u32,
         output_latency_frames: u32,
+    },
+    /// The device missed a deadline. `total` counts them since the engine started.
+    Xrun {
+        total: u64,
+    },
+    /// Sent about once a second: the largest share of a block's duration that rendering one
+    /// took in that time (1.0 is the whole of it; more is a dropout).
+    Load {
+        dsp: f32,
     },
     Error {
         message: String,

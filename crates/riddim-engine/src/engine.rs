@@ -140,6 +140,12 @@ pub struct Status {
     pub plan_latency: u32,
     pub input_latency: u32,
     pub output_latency: u32,
+    /// The largest share of a block's duration that rendering one took over the last second
+    /// or so (1.0 is all of it). The same figure as [`Event::Load`].
+    pub dsp_load: f32,
+    /// Messages from the audio thread that were lost because nobody was taking them fast
+    /// enough. Should stay at zero.
+    pub events_lost: u64,
 }
 
 enum Stream {
@@ -260,6 +266,10 @@ impl Engine {
             media_dir: config.media_dir.clone(),
             butler: Butler::spawn(config.butler),
             process_mode: config.process_mode,
+            xruns: match &stream {
+                Stream::Running(stream) => Some(stream.xrun_counter()),
+                Stream::Manual(_) => None,
+            },
         };
         let control_thread = std::thread::Builder::new()
             .name("riddim-control".into())
@@ -479,6 +489,12 @@ impl Engine {
             plan_latency: self.shared.plan_latency.load(Ordering::Acquire),
             input_latency: self.info.input_latency_frames,
             output_latency: self.info.output_latency_frames,
+            dsp_load: self
+                .shared
+                .dsp_load_reported
+                .load(Ordering::Relaxed)
+                .max(self.shared.dsp_load.load(Ordering::Relaxed)),
+            events_lost: self.shared.events_lost.load(Ordering::Relaxed),
         }
     }
 

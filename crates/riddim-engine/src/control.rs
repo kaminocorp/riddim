@@ -120,6 +120,8 @@ struct PluginEntry {
     /// The buses and block size the plugin was last asked to run with.
     buses: BusRequest,
     max_block: u32,
+    /// The plugin itself asked to be deactivated and activated again.
+    restart_requested: bool,
 }
 
 /// The optional buses a slot's routing calls for.
@@ -242,6 +244,8 @@ pub(crate) struct ControlSetup {
     pub media_dir: PathBuf,
     pub butler: Butler,
     pub process_mode: ProcessMode,
+    /// The device's count of missed deadlines, if it keeps one.
+    pub xruns: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 pub(crate) struct Control {
@@ -273,6 +277,9 @@ pub(crate) struct Control {
     /// Plugins taken out of the plan to be activated again with other buses or another block
     /// size, waiting for the audio thread to let go of them.
     restarting: Vec<(SlotId, u64, Arc<NodeCell>)>,
+    /// Parameter changes a plugin had not yet been given when it was taken out to be
+    /// restarted, to hand to it when it is back.
+    carried_params: HashMap<SlotId, Vec<riddim_plugin::Event>>,
     plugins: HashMap<SlotId, PluginEntry>,
     meters: HashMap<TrackId, Arc<MeterCell>>,
     media: MediaCache,
@@ -296,6 +303,9 @@ pub(crate) struct Control {
     pending_syncs: Vec<Sender<()>>,
     last_state: TransportState,
     last_report: Instant,
+    last_load_report: Instant,
+    xruns: Option<Arc<std::sync::atomic::AtomicU64>>,
+    xruns_seen: u64,
 }
 
 /// What mutes and solos leave to be heard.
@@ -432,6 +442,7 @@ impl Control {
             retired: Vec::new(),
             next_serial: 1,
             restarting: Vec::new(),
+            carried_params: HashMap::new(),
             plugins: HashMap::new(),
             meters: HashMap::new(),
             media: MediaCache::new(setup.media_dir, rate),
@@ -448,6 +459,9 @@ impl Control {
             write_clock: None,
             last_state: TransportState::Stopped,
             last_report: Instant::now(),
+            last_load_report: Instant::now(),
+            xruns: setup.xruns,
+            xruns_seen: 0,
             stream: setup.stream,
         }
     }
@@ -717,8 +731,11 @@ impl Control {
                     // Loaded, but for other buses or another block size than are wanted now:
                     // take it out of the plan and have it activated again. (One that is still
                     // loading is looked at again when it arrives.)
-                    let stale = entry.buses != buses || entry.max_block != config.max_block;
+                    let stale = entry.buses != buses
+                        || entry.max_block != config.max_block
+                        || entry.restart_requested;
                     if stale && matches!(entry.status, PluginStatus::Loaded(_)) {
+                        entry.restart_requested = false;
                         entry.status = PluginStatus::Loading;
                         if let Some(cell) =
                             self.cells.remove(&NodeKind::Plugin(entry.track, slot.id))
@@ -738,6 +755,7 @@ impl Control {
                         serial,
                         buses,
                         max_block: config.max_block,
+                        restart_requested: false,
                     },
                 );
                 let _ = self.host_requests.send(HostRequest::Load {
@@ -1625,6 +1643,8 @@ impl Control {
             )),
             _ => None,
         };
+        // A range that a tempo change has turned inside out is no range.
+        let punch = punch.filter(|(from, to)| to > from);
         let mut captures = Vec::new();
         let mut audio = Vec::new();
         let mut midi_tracks = Vec::new();
@@ -2192,6 +2212,10 @@ impl Control {
                         session.wraps.push((from, to));
                     }
                     self.playhead_jumped(from, to);
+                    self.emit(Event::Jumped {
+                        from_samples: from,
+                        to_samples: to,
+                    });
                 }
             }
         }
@@ -2226,6 +2250,11 @@ impl Control {
                                 loaded.ports.inputs.iter().map(|c| *c as usize).sum();
                             let outputs: usize =
                                 loaded.ports.outputs.iter().map(|c| *c as usize).sum();
+                            let mut pending_params =
+                                riddim_plugin::EventBuffer::with_capacity(EVENT_CAPACITY);
+                            for event in self.carried_params.remove(&slot).unwrap_or_default() {
+                                pending_params.push(event);
+                            }
                             let cell = NodeCell::new(NodeRt::Plugin(Box::new(PluginRt {
                                 slot,
                                 processor: loaded.processor,
@@ -2236,9 +2265,7 @@ impl Control {
                                 events_out: riddim_plugin::EventBuffer::with_capacity(
                                     EVENT_CAPACITY,
                                 ),
-                                pending_params: riddim_plugin::EventBuffer::with_capacity(
-                                    EVENT_CAPACITY,
-                                ),
+                                pending_params,
                                 automated: Vec::with_capacity(AUTOMATED_CAPACITY),
                                 bypass_delay: (loaded.ports.latency > 0).then(|| {
                                     Box::new(DelayLine::new(outputs, loaded.ports.latency as usize))
@@ -2302,9 +2329,44 @@ impl Control {
                         // Grabbing and releasing a knob in the editor is a touch.
                         (PluginEvent::ParamGestureBegin { id }, Some(track)) => {
                             self.touch(track, target(id), true);
+                            self.emit(Event::PluginGesture {
+                                slot,
+                                id,
+                                down: true,
+                            });
                         }
                         (PluginEvent::ParamGestureEnd { id }, Some(track)) => {
                             self.touch(track, target(id), false);
+                            self.emit(Event::PluginGesture {
+                                slot,
+                                id,
+                                down: false,
+                            });
+                        }
+                        (PluginEvent::ParamValuesChanged, _) => {
+                            self.emit(Event::PluginParamsChanged { slot, info: false });
+                        }
+                        (PluginEvent::ParamInfoChanged, _) => {
+                            self.emit(Event::PluginParamsChanged { slot, info: true });
+                        }
+                        (PluginEvent::StateDirty, _) => {
+                            self.emit(Event::PluginStateDirty { slot });
+                        }
+                        (PluginEvent::EditorResizeRequest { width, height }, _) => {
+                            self.emit(Event::PluginEditorResize {
+                                slot,
+                                width,
+                                height,
+                            });
+                        }
+                        // The plugin's buses changed, or it asks to be taken through a
+                        // deactivate and activate: restart it, as for a routing change.
+                        (PluginEvent::IoChanged | PluginEvent::RestartRequested, Some(_)) => {
+                            if let Some(entry) = self.plugins.get_mut(&slot) {
+                                entry.restart_requested = true;
+                            }
+                            self.sync_plugins();
+                            self.rebuild_plan();
                         }
                         _ => {}
                     }
@@ -2356,7 +2418,17 @@ impl Control {
             match Arc::try_unwrap(cell) {
                 Ok(cell) => {
                     let processor = match cell.into_inner() {
-                        NodeRt::Plugin(plugin) => Some(plugin.processor),
+                        NodeRt::Plugin(plugin) => {
+                            let plugin = *plugin;
+                            let waiting = plugin.pending_params.as_slice();
+                            if !waiting.is_empty() {
+                                self.carried_params
+                                    .entry(slot)
+                                    .or_default()
+                                    .extend_from_slice(waiting);
+                            }
+                            Some(plugin.processor)
+                        }
                         _ => None,
                     };
                     let still_wanted = self.plugins.get(&slot).is_some_and(|e| e.serial == serial);
@@ -2375,6 +2447,7 @@ impl Control {
                         }
                         // Removed from the model in the meantime.
                         _ => {
+                            self.carried_params.remove(&slot);
                             let _ = self
                                 .host_requests
                                 .send(HostRequest::Unload { serial, processor });
@@ -2427,8 +2500,22 @@ impl Control {
                 position_samples: position,
             });
         }
+        if let Some(xruns) = &self.xruns {
+            let total = xruns.load(Ordering::Relaxed);
+            if total != self.xruns_seen {
+                self.xruns_seen = total;
+                self.emit(Event::Xrun { total });
+            }
+        }
         if self.subscribers.is_empty() || self.last_report.elapsed() < Duration::from_millis(33) {
             return;
+        }
+        if self.last_load_report.elapsed() >= Duration::from_secs(1) {
+            self.last_load_report = Instant::now();
+            // Reading the peak starts a new measurement.
+            let dsp = self.shared.dsp_load.swap(0.0, Ordering::Relaxed);
+            self.shared.dsp_load_reported.store(dsp, Ordering::Relaxed);
+            self.emit(Event::Load { dsp });
         }
         self.last_report = Instant::now();
         if playing {

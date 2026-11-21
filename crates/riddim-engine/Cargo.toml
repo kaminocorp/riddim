@@ -20,6 +20,7 @@ serde.workspace = true
 
 [dev-dependencies]
 riddim-test-support.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

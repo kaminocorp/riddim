@@ -7,7 +7,7 @@
 //! Both can loop their output back to their input after a fixed delay, which stands in for a
 //! cable from output to input when testing recording alignment.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -216,6 +216,8 @@ pub struct NullStream {
     driver: Option<Driver>,
     thread: Option<JoinHandle<Driver>>,
     running: Arc<AtomicBool>,
+    /// Blocks that started late because the one before overran its slot.
+    xruns: Arc<AtomicU64>,
 }
 
 impl NullStream {
@@ -226,6 +228,7 @@ impl NullStream {
             config,
             thread: None,
             running: Arc::new(AtomicBool::new(false)),
+            xruns: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -240,6 +243,7 @@ impl AudioStream for NullStream {
             return Ok(());
         };
         let running = self.running.clone();
+        let xruns = self.xruns.clone();
         running.store(true, Ordering::Release);
         let frames = self.config.buffer_frames.max(1) as usize;
         let period = Duration::from_secs_f64(frames as f64 / self.config.sample_rate);
@@ -253,7 +257,10 @@ impl AudioStream for NullStream {
                     if let Some(wait) = next.checked_duration_since(Instant::now()) {
                         std::thread::sleep(wait);
                     } else {
-                        // We fell behind; do not try to catch up in a burst.
+                        // The block took longer than its slot (or the machine did not let us
+                        // run in time): on hardware that is a dropout. Count it, and do not
+                        // try to catch up in a burst.
+                        xruns.fetch_add(1, Ordering::Relaxed);
                         next = Instant::now();
                     }
                 }
@@ -274,7 +281,11 @@ impl AudioStream for NullStream {
     }
 
     fn xruns(&self) -> u64 {
-        0
+        self.xruns.load(Ordering::Relaxed)
+    }
+
+    fn xrun_counter(&self) -> Arc<AtomicU64> {
+        self.xruns.clone()
     }
 
     fn set_buffer_frames(&mut self, frames: u32) -> Result<(), IoError> {
@@ -394,5 +405,49 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         stream.stop();
         assert!(count.load(Ordering::Relaxed) > blocks);
+    }
+
+    #[test]
+    fn a_callback_that_overruns_its_slot_is_counted_as_an_xrun() {
+        // 64 frames at 48 kHz is 1.3 ms; a callback that takes 5 ms misses every deadline.
+        let config = NullConfig {
+            buffer_frames: 64,
+            ..NullConfig::default()
+        };
+        let mut stream = NullStream::new(config, |_: &mut IoBlock<'_>| {
+            riddim_rt::guard::permit(|| std::thread::sleep(Duration::from_millis(5)));
+        });
+        let counter = stream.xrun_counter();
+        assert_eq!(stream.xruns(), 0);
+        stream.start().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        stream.stop();
+        assert!(
+            stream.xruns() >= 5,
+            "only {} overruns counted",
+            stream.xruns()
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), stream.xruns());
+    }
+
+    #[test]
+    fn the_buffer_size_can_change_under_a_running_stream() {
+        let frames_seen = Arc::new(AtomicU64::new(0));
+        let seen = frames_seen.clone();
+        let mut stream = NullStream::new(NullConfig::default(), move |block: &mut IoBlock<'_>| {
+            seen.store(block.frames as u64, Ordering::Relaxed);
+        });
+        stream.start().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(frames_seen.load(Ordering::Relaxed), 128);
+        stream.set_buffer_frames(512).unwrap();
+        assert_eq!(stream.info().max_frames, 512);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            frames_seen.load(Ordering::Relaxed),
+            512,
+            "the stream did not carry on"
+        );
+        stream.stop();
     }
 }

@@ -641,12 +641,9 @@ impl Model {
         for track in &self.tracks {
             crate::ops::check_output(self, track.id, track.output).map_err(|e| e.to_string())?;
         }
-        crate::ops::check_range(
-            self,
-            self.punch_range,
-            "a punch range must end after it starts",
-        )
-        .map_err(|e| e.to_string())?;
+        // (Loop and punch ranges are checked when they are set, not here: a later tempo change
+        // can turn a range with one end in beats and the other in time inside out, and that
+        // makes the range one that does nothing, not the project one that cannot be opened.)
         Ok(())
     }
 }

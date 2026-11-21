@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vst3::Steinberg::Vst::{
     BusDirection, BusInfo, CtrlNumber, IAudioProcessor, IAudioProcessorTrait, IComponent,
-    IComponentHandler, IComponentHandlerTrait, IComponentTrait, IEditController,
-    IEditControllerTrait, IMidiMapping, IMidiMappingTrait, IParamValueQueueTrait,
-    IParameterChangesTrait, IoMode, MediaType, ParamID, ParameterInfo, ProcessData, ProcessSetup,
-    RoutingInfo, SpeakerArrangement, String128, TChar,
+    IComponentHandler, IComponentHandler2, IComponentHandler2Trait, IComponentHandlerTrait,
+    IComponentTrait, IEditController, IEditControllerTrait, IMidiMapping, IMidiMappingTrait,
+    IParamValueQueueTrait, IParameterChangesTrait, IoMode, MediaType, ParamID, ParameterInfo,
+    ProcessData, ProcessSetup, RoutingInfo, SpeakerArrangement, String128, TChar,
 };
 use vst3::Steinberg::{
     int16, int32, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult,
@@ -27,6 +27,15 @@ pub const PARAM_CAN_AUTOMATE: i32 = 1;
 pub const PARAM_IS_READ_ONLY: i32 = 1 << 1;
 
 pub const RESTART_LATENCY_CHANGED: i32 = 1 << 3;
+pub const RESTART_RELOAD_COMPONENT: i32 = 1;
+pub const RESTART_PARAM_VALUES_CHANGED: i32 = 1 << 2;
+pub const RESTART_PARAM_TITLES_CHANGED: i32 = 1 << 4;
+
+/// Setting this "parameter" on the controller makes the plugin act on its own behalf. The
+/// value, times eight, picks what: 1 drags its first parameter to 0.75 (begin, perform, end);
+/// 2 says its state is dirty; 3 says its parameter values changed; 4 that its parameter list
+/// did; 5 asks to be restarted.
+pub const COMMAND_PARAM: u32 = 0x7E57_0001;
 
 pub struct BusSpec {
     pub name: &'static str,
@@ -462,6 +471,41 @@ pub struct Controller<K: Kernel> {
 }
 
 impl<K: Kernel> Controller<K> {
+    fn command(&self, what: i32) {
+        let handler = self.handler.borrow();
+        let Some(handler) = handler.as_ref() else {
+            return;
+        };
+        // SAFETY: calls on the host's live component handler, from the thread it gave it on.
+        unsafe {
+            match what {
+                1 => {
+                    if let Some(first) = K::PARAMS.first() {
+                        handler.beginEdit(first.id);
+                        self.values[0].set(0.75);
+                        handler.performEdit(first.id, 0.75);
+                        handler.endEdit(first.id);
+                    }
+                }
+                2 => {
+                    if let Some(extended) = handler.cast::<IComponentHandler2>() {
+                        extended.setDirty(1);
+                    }
+                }
+                3 => {
+                    handler.restartComponent(RESTART_PARAM_VALUES_CHANGED);
+                }
+                4 => {
+                    handler.restartComponent(RESTART_PARAM_TITLES_CHANGED);
+                }
+                5 => {
+                    handler.restartComponent(RESTART_RELOAD_COMPONENT);
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             values: K::PARAMS.iter().map(|p| Cell::new(p.default)).collect(),
@@ -579,6 +623,12 @@ impl<K: Kernel> IEditControllerTrait for Controller<K> {
     }
 
     unsafe fn setParamNormalized(&self, id: u32, value: f64) -> tresult {
+        if id == COMMAND_PARAM {
+            // Not a parameter: a way for tests to have the plugin do what a plugin does of
+            // its own accord (a knob dragged in its editor, a preset loaded, and so on).
+            self.command((value * 8.0).round() as i32);
+            return kResultOk;
+        }
         let Some(index) = Self::index(id) else {
             return kInvalidArgument;
         };

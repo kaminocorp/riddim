@@ -29,6 +29,16 @@ pub mod ids {
     pub const DELAY_MAX: u32 = 1024;
 
     pub const GAIN_GAIN: u32 = 7;
+
+    /// Setting this on a fixture's controller makes the plugin act of its own accord. Use the
+    /// `COMMAND_*` values.
+    pub const COMMAND: u32 = 0x7E57_0001;
+    /// Drag the first parameter to 0.75 in the "editor" (begin, perform, end).
+    pub const COMMAND_EDIT: f64 = 1.0 / 8.0;
+    pub const COMMAND_DIRTY: f64 = 2.0 / 8.0;
+    pub const COMMAND_VALUES_CHANGED: f64 = 3.0 / 8.0;
+    pub const COMMAND_INFO_CHANGED: f64 = 4.0 / 8.0;
+    pub const COMMAND_RESTART: f64 = 5.0 / 8.0;
 }
 
 fn workspace_root() -> PathBuf {

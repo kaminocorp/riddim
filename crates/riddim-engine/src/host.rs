@@ -159,6 +159,8 @@ pub struct MainThread {
 struct Held {
     serial: u64,
     instance: Box<dyn PluginInstance>,
+    /// The latency last reported to the engine.
+    latency: u32,
 }
 
 impl MainThread {
@@ -205,16 +207,21 @@ impl MainThread {
             self.events.clear();
             instance.poll_events(&mut self.events);
             for event in &self.events {
-                if *event == PluginEvent::LatencyChanged {
-                    let latency = instance.latency_samples();
-                    let _ = self.replies.send(HostReply::Latency {
-                        slot: *slot,
-                        latency,
-                    });
-                }
                 let _ = self.replies.send(HostReply::Event {
                     slot: *slot,
                     event: *event,
+                });
+            }
+            // Latency is asked for on every turn, not only when the plugin says it changed:
+            // the question is cheap, some plugins announce a change before their audio side
+            // has made it (so asking at that moment gets the old answer), and some never
+            // announce it at all.
+            let latency = instance.latency_samples();
+            if latency != held.latency {
+                held.latency = latency;
+                let _ = self.replies.send(HostReply::Latency {
+                    slot: *slot,
+                    latency,
                 });
             }
         }
@@ -262,14 +269,18 @@ impl MainThread {
                             instance.deactivate(processor);
                         }
                         configure_buses(instance.as_mut(), buses);
-                        instance
+                        let result = instance
                             .activate(&config)
                             .map(|processor| Loaded {
                                 processor,
                                 ports: ports_of(instance.as_ref()),
                                 parameters: instance.params().len(),
                             })
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string());
+                        if let Ok(loaded) = &result {
+                            held.latency = loaded.ports.latency;
+                        }
+                        result
                     }
                     _ => {
                         // Not the instance in that slot any more: all that is left to do
@@ -363,7 +374,14 @@ impl MainThread {
             ports: ports_of(instance.as_ref()),
             parameters: instance.params().len(),
         };
-        self.instances.insert(slot, Held { serial, instance });
+        self.instances.insert(
+            slot,
+            Held {
+                serial,
+                instance,
+                latency: loaded.ports.latency,
+            },
+        );
         Ok(loaded)
     }
 

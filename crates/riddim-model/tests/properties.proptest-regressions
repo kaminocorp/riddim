@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1c4836352c59bd9b61dfe9dafd07ea93d0fd241fa744d38c9b89f7e621acf184 # shrinks to seeds = [Seed { kind: 0, a: 0, b: 9754016393583328380, c: 0, x: 0.0 }, Seed { kind: 3, a: 0, b: 0, c: 0, x: 0.0 }, Seed { kind: 14, a: 0, b: 6253632955631903972, c: 0, x: 0.0 }, Seed { kind: 14, a: 0, b: 3555701988701130186, c: 0, x: 0.0 }, Seed { kind: 17, a: 0, b: 11365440333812939407, c: 14325145811822772948, x: 0.0 }]
+cc 43c5969ded6fb75a8f363a389ee02075f139263ffc9ac77831046c610dbcb8f3 # shrinks to seeds = [Seed { kind: 35, a: 4151905773837838533, b: 16390137707087752957, c: 13592899605476807120, x: 0.0 }, Seed { kind: 18, a: 5216619550465615552, b: 228741669792978281, c: 0, x: 0.0 }]

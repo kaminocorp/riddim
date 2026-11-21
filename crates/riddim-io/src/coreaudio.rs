@@ -730,6 +730,10 @@ impl AudioStream for CoreAudioStream {
         self.xruns.load(Ordering::Relaxed)
     }
 
+    fn xrun_counter(&self) -> Arc<AtomicU64> {
+        self.xruns.clone()
+    }
+
     fn set_buffer_frames(&mut self, frames: u32) -> Result<(), IoError> {
         let was_started = self.started;
         self.stop();

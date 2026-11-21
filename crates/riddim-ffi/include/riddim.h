@@ -68,6 +68,11 @@ typedef struct RiddimStatus {
     uint32_t plan_latency;
     uint32_t input_latency;
     uint32_t output_latency;
+    // The largest share of a block's duration that rendering one took over the last second
+    // or so: 1.0 is all of it.
+    float dsp_load;
+    // Messages from the audio thread that were lost. Should stay at zero.
+    uint64_t events_lost;
 } RiddimStatus;
 
 #ifdef __cplusplus
@@ -127,6 +132,14 @@ uint64_t riddim_load_model(struct RiddimEngine *engine, const char *model_json);
 // With an external main thread, call this from a thread other than the main thread while the
 // main thread keeps pumping, or the plugins cannot answer.
 int32_t riddim_capture_plugin_states(struct RiddimEngine *engine);
+
+// Changes the audio buffer size while the engine runs, without reopening the project.
+// Returns the size the device settled on (it may clamp what was asked for), or 0 on failure.
+//
+// Every plugin is told the new size, which takes each out of the mix for a moment; a
+// `plugin_restarted` event says when one is back, and `stream_changed` describes the device.
+// Not allowed while recording.
+uint32_t riddim_set_buffer_size(struct RiddimEngine *engine, uint32_t frames);
 
 // Tells the engine that a control is being held (`down` = 1) or was released (0). This is
 // what drives touch and latch automation for faders, pans and sends. `target_json` names the
