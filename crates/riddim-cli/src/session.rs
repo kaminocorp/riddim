@@ -96,6 +96,7 @@ pub fn arpeggio_clip(id: ClipId) -> Clip {
         name: "arpeggio".into(),
         start: Position::START,
         muted: false,
+        take: None,
         content: ClipContent::Midi {
             length: Ticks::from_beats(4),
             notes: std::sync::Arc::new(notes),
@@ -140,6 +141,8 @@ pub fn instrument_ops(
                 plugin: plugin_ref(descriptor),
                 state,
                 bypass: false,
+                outputs: Vec::new(),
+                sidechain: None,
             },
         },
     ];
@@ -656,6 +659,8 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
             plugin: plugin_ref(&context.resolve(spec)?),
             state: None,
             bypass: false,
+            outputs: Vec::new(),
+            sidechain: None,
         })
     };
     let wants_mixing =

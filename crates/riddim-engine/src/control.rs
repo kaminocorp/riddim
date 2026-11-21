@@ -1628,6 +1628,7 @@ impl Control {
                             // tempo is changed later.
                             start: Position::Time(samples_to_superclock(session.start, self.rate)),
                             muted: false,
+                            take: None,
                             content: ClipContent::Audio {
                                 media,
                                 offset: 0,
@@ -1790,6 +1791,7 @@ impl Control {
             name: "MIDI take".into(),
             start: Position::Beats(start_tick),
             muted: false,
+            take: None,
             content: ClipContent::Midi {
                 length,
                 notes: Arc::new(notes),

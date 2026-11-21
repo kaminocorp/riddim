@@ -103,6 +103,7 @@ pub fn midi_bytes(
             name: name.unwrap_or_default(),
             start: Position::START,
             muted: false,
+            take: None,
             content: ClipContent::Midi {
                 length: Ticks::from_beats(beats.max(1)),
                 notes: Arc::new(notes),
@@ -135,6 +136,7 @@ pub fn clip_for_media(media: &Media, clip_id: ClipId, start: Position) -> Clip {
             .unwrap_or_default(),
         start,
         muted: false,
+        take: None,
         content: ClipContent::Audio {
             media: media.id,
             offset: 0,

@@ -18,9 +18,9 @@ mod ops;
 
 pub use model::{
     AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Clip, ClipContent, ClipId,
-    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, MidiEvent, Model, Note, PluginRef,
-    PluginSlot, Send, SendId, SlotId, Track, TrackId, TrackInput, TrackKind, TrackOutput,
-    SCHEMA_VERSION,
+    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, MidiEvent, Model, Note, PluginOutput,
+    PluginRef, PluginSlot, Send, SendId, Sidechain, SlotId, Take, Track, TrackId, TrackInput,
+    TrackKind, TrackOutput, MAX_PLUGIN_OUTPUTS, SCHEMA_VERSION,
 };
 pub use ops::{Op, OpError, TrackChange};
 pub use riddim_time as time;

@@ -108,6 +108,49 @@ pub struct PluginSlot {
     pub state: Option<Arc<Vec<u8>>>,
     #[serde(default)]
     pub bypass: bool,
+    /// Extra output buses of the plugin (a multi-out instrument's second pair and up), each
+    /// routed to a bus track. The main output always continues down the track's own chain.
+    #[serde(default)]
+    pub outputs: Vec<PluginOutput>,
+    /// What feeds the plugin's sidechain input, if anything.
+    #[serde(default)]
+    pub sidechain: Option<Sidechain>,
+}
+
+impl PluginSlot {
+    /// A slot with no saved state, not bypassed, and nothing routed beyond the main path.
+    pub fn new(id: SlotId, plugin: PluginRef) -> PluginSlot {
+        PluginSlot {
+            id,
+            plugin,
+            state: None,
+            bypass: false,
+            outputs: Vec::new(),
+            sidechain: None,
+        }
+    }
+}
+
+/// One extra output bus of a plugin and the bus track that receives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PluginOutput {
+    /// Which of the plugin's audio output buses: 1 is the first after the main output.
+    pub bus: u8,
+    /// The bus track it plays into.
+    pub target: TrackId,
+}
+
+/// The most extra output buses one plugin can have routed.
+pub const MAX_PLUGIN_OUTPUTS: u8 = 63;
+
+/// Where a plugin's sidechain input comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Sidechain {
+    /// The track that is listened to.
+    pub source: TrackId,
+    /// Tap that track before its fader, pan and mute instead of after.
+    #[serde(default)]
+    pub pre_fader: bool,
 }
 
 /// A second route out of a track, into a bus.
@@ -264,6 +307,21 @@ pub struct Clip {
     #[serde(default)]
     pub muted: bool,
     pub content: ClipContent,
+    /// Set on clips that are alternative recordings of the same stretch of the same track.
+    #[serde(default)]
+    pub take: Option<Take>,
+}
+
+/// Marks a clip as one of several takes of the same passage.
+///
+/// Loop recording produces one clip per time round, all in one group; the engine leaves the
+/// newest audible and mutes the rest. Choosing another take is muting and unmuting clips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Take {
+    /// Shared by the takes that belong together. Unique within the project.
+    pub group: u64,
+    /// 1 for the first time round, counting up.
+    pub number: u32,
 }
 
 /// An audio file the project uses. The engine reads it; the application owns where it lives.
@@ -320,6 +378,10 @@ pub struct Track {
     /// Automation lanes, kept sorted by id.
     #[serde(default)]
     pub automation: Vec<Arc<AutomationLane>>,
+    /// For instrument tracks: also play the notes that come out of this other track's plugins
+    /// (a drum sampler's or an arpeggiator's MIDI output).
+    #[serde(default)]
+    pub events_from: Option<TrackId>,
 }
 
 impl Track {
@@ -342,6 +404,7 @@ impl Track {
             plugins: Vec::new(),
             sends: Vec::new(),
             automation: Vec::new(),
+            events_from: None,
         }
     }
 
@@ -413,6 +476,11 @@ pub struct Model {
     pub loop_range: Option<LoopRange>,
     pub loop_enabled: bool,
     pub metronome: Metronome,
+    /// The stretch that recording is confined to when punch is enabled.
+    #[serde(default)]
+    pub punch_range: Option<LoopRange>,
+    #[serde(default)]
+    pub punch_enabled: bool,
 }
 
 impl Default for Model {
@@ -433,6 +501,8 @@ impl Model {
             loop_range: None,
             loop_enabled: false,
             metronome: Metronome::default(),
+            punch_range: None,
+            punch_enabled: false,
         }
     }
 
@@ -539,7 +609,11 @@ impl Model {
                 if !slot_ids.insert(slot.id) {
                     return Err(format!("duplicate plugin slot id {}", slot.id.0));
                 }
+                crate::ops::check_plugin_routing(self, track.id, slot)
+                    .map_err(|e| e.to_string())?;
             }
+            crate::ops::check_events_from(self, track, track.events_from)
+                .map_err(|e| e.to_string())?;
             for send in &track.sends {
                 if !send_ids.insert(send.id) {
                     return Err(format!("duplicate send id {}", send.id.0));
@@ -567,6 +641,12 @@ impl Model {
         for track in &self.tracks {
             crate::ops::check_output(self, track.id, track.output).map_err(|e| e.to_string())?;
         }
+        crate::ops::check_range(
+            self,
+            self.punch_range,
+            "a punch range must end after it starts",
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 }

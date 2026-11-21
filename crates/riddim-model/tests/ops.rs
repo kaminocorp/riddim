@@ -5,9 +5,9 @@ use std::sync::Arc;
 use riddim_model::time::{Position, Superclock, Tempo, TempoMap, Ticks};
 use riddim_model::{
     AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Clip, ClipContent, ClipId,
-    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, Model, Note, Op, OpError, PluginRef,
-    PluginSlot, Send, SendId, SlotId, Track, TrackChange, TrackId, TrackInput, TrackKind,
-    TrackOutput,
+    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, Model, Note, Op, OpError,
+    PluginOutput, PluginRef, PluginSlot, Send, SendId, Sidechain, SlotId, Track, TrackChange,
+    TrackId, TrackInput, TrackKind, TrackOutput,
 };
 
 fn media(id: u64, frames: u64) -> Media {
@@ -26,6 +26,7 @@ fn audio_clip(id: u64, media: u64, length: u64) -> Clip {
         name: format!("clip {id}"),
         start: Position::Time(Superclock::from_seconds(1)),
         muted: false,
+        take: None,
         content: ClipContent::Audio {
             media: MediaId(media),
             offset: 0,
@@ -43,6 +44,7 @@ fn midi_clip(id: u64) -> Clip {
         name: String::new(),
         start: Position::Beats(Ticks::from_beats(4)),
         muted: false,
+        take: None,
         content: ClipContent::Midi {
             length: Ticks::from_beats(4),
             notes: Arc::new(vec![Note {
@@ -68,6 +70,8 @@ fn slot(id: u64) -> PluginSlot {
         },
         state: Some(Arc::new(vec![0, 1, 2, 250, 255])),
         bypass: false,
+        outputs: Vec::new(),
+        sidechain: None,
     }
 }
 
@@ -1074,4 +1078,202 @@ fn lane_values_interpolate_hold_and_extend() {
         lane(2, AutomationTarget::TrackPan, vec![]).value_at(Ticks::ZERO),
         None
     );
+}
+
+#[test]
+fn plugin_outputs_sidechains_and_note_routing_are_validated_and_undoable() {
+    let mut model = Model::new();
+    let add = |model: &mut Model, id: u64, kind: TrackKind| {
+        let index = model.tracks.len();
+        model
+            .apply(&Op::AddTrack {
+                index,
+                track: Track::new(TrackId(id), format!("t{id}"), kind),
+            })
+            .unwrap();
+    };
+    add(&mut model, 1, TrackKind::Instrument); // a multi-out sampler
+    add(&mut model, 2, TrackKind::Bus); // its second output
+    add(&mut model, 3, TrackKind::Audio); // a kick, say
+    add(&mut model, 4, TrackKind::Instrument); // plays the sampler's MIDI out
+    model
+        .apply(&Op::InsertPlugin {
+            track: TrackId(1),
+            index: 0,
+            slot: slot(10),
+        })
+        .unwrap();
+    model
+        .apply(&Op::InsertPlugin {
+            track: TrackId(2),
+            index: 0,
+            slot: slot(20),
+        })
+        .unwrap();
+    let before = model.clone();
+
+    // Route output 1 of the sampler to the bus, and key the bus's plugin from the audio track.
+    let route = |outputs: Vec<PluginOutput>, sidechain: Option<Sidechain>| Op::SetPluginRouting {
+        track: TrackId(1),
+        slot: SlotId(10),
+        outputs,
+        sidechain,
+    };
+    let to_bus = PluginOutput {
+        bus: 1,
+        target: TrackId(2),
+    };
+    let undo_route = model.apply(&route(vec![to_bus], None)).unwrap();
+    let undo_key = model
+        .apply(&Op::SetPluginRouting {
+            track: TrackId(2),
+            slot: SlotId(20),
+            outputs: vec![],
+            sidechain: Some(Sidechain {
+                source: TrackId(3),
+                pre_fader: true,
+            }),
+        })
+        .unwrap();
+    let undo_notes = model
+        .apply(&Op::SetTrack {
+            id: TrackId(4),
+            change: TrackChange::EventsFrom(Some(TrackId(1))),
+        })
+        .unwrap();
+    assert_eq!(
+        model.track(TrackId(1)).unwrap().plugins[0].outputs,
+        vec![to_bus]
+    );
+    assert_eq!(
+        model.track(TrackId(4)).unwrap().events_from,
+        Some(TrackId(1))
+    );
+    model.validate().unwrap();
+    // It survives the trip through JSON.
+    assert_eq!(Model::from_json(&model.to_json()).unwrap(), model);
+
+    // What is refused: output 0 (that is the main output), the same output twice, a target
+    // that is not a bus, a route back into the plugin's own track.
+    let refused = |model: &mut Model, op: Op| {
+        let snapshot = model.clone();
+        let error = model.apply(&op).unwrap_err();
+        assert_eq!(*model, snapshot, "a refused op changed the model");
+        error
+    };
+    let out = |bus: u8, target: u64| PluginOutput {
+        bus,
+        target: TrackId(target),
+    };
+    assert!(matches!(
+        refused(&mut model, route(vec![out(0, 2)], None)),
+        OpError::Invalid(_)
+    ));
+    assert!(matches!(
+        refused(&mut model, route(vec![out(1, 2), out(1, 2)], None)),
+        OpError::Invalid(_)
+    ));
+    assert_eq!(
+        refused(&mut model, route(vec![out(1, 3)], None)),
+        OpError::NotABus(TrackId(3))
+    );
+    assert_eq!(
+        refused(&mut model, route(vec![out(1, 9)], None)),
+        OpError::UnknownTrack(TrackId(9))
+    );
+    // Loops through the new kinds of connection are loops all the same: the bus (fed by the
+    // sampler's output) cannot key the sampler, and the sampler cannot take notes from track 4
+    // (which takes notes from it).
+    let key_from_bus = Some(Sidechain {
+        source: TrackId(2),
+        pre_fader: false,
+    });
+    assert!(matches!(
+        refused(&mut model, route(vec![to_bus], key_from_bus)),
+        OpError::RoutingCycle(_)
+    ));
+    assert!(matches!(
+        refused(
+            &mut model,
+            Op::SetTrack {
+                id: TrackId(1),
+                change: TrackChange::EventsFrom(Some(TrackId(4))),
+            }
+        ),
+        OpError::RoutingCycle(_)
+    ));
+    // Only instruments take notes.
+    assert!(matches!(
+        refused(
+            &mut model,
+            Op::SetTrack {
+                id: TrackId(3),
+                change: TrackChange::EventsFrom(Some(TrackId(1))),
+            }
+        ),
+        OpError::Invalid(_)
+    ));
+    // A track that something listens to cannot be removed from under it.
+    for id in [1, 2, 3] {
+        assert!(
+            matches!(
+                refused(&mut model, Op::RemoveTrack { id: TrackId(id) }),
+                OpError::BusInUse { .. }
+            ),
+            "track {id}"
+        );
+    }
+    // Removing the plugin takes its routing with it, and undoing brings both back.
+    let undo_remove = model
+        .apply(&Op::RemovePlugin {
+            track: TrackId(1),
+            slot: SlotId(10),
+        })
+        .unwrap();
+    model.apply(&undo_remove).unwrap();
+    assert_eq!(
+        model.track(TrackId(1)).unwrap().plugins[0].outputs,
+        vec![to_bus]
+    );
+
+    for undo in [undo_notes, undo_key, undo_route] {
+        model.apply(&undo).unwrap();
+    }
+    assert_eq!(model, before);
+}
+
+#[test]
+fn punch_ranges_and_takes() {
+    let mut model = Model::new();
+    let range = |start: i64, end: i64| LoopRange {
+        start: Position::Beats(Ticks::from_beats(start)),
+        end: Position::Beats(Ticks::from_beats(end)),
+    };
+    assert!(model
+        .apply(&Op::SetPunch {
+            range: Some(range(4, 4)),
+            enabled: true
+        })
+        .is_err());
+    let undo = model
+        .apply(&Op::SetPunch {
+            range: Some(range(4, 8)),
+            enabled: true,
+        })
+        .unwrap();
+    assert!(model.punch_enabled);
+    assert_eq!(Model::from_json(&model.to_json()).unwrap(), model);
+    model.apply(&undo).unwrap();
+    assert_eq!(model, Model::new());
+
+    // A model saved before takes, punch and plugin routing existed still loads.
+    let old = r#"{"schema":1,"tempo_map":TEMPO,"master":MASTER,"tracks":[],"media":[],
+        "loop_range":null,"loop_enabled":false,"metronome":{"enabled":false,"gain":0.5,"count_in_bars":0}}"#;
+    let current: serde_json::Value = serde_json::from_str(&Model::new().to_json()).unwrap();
+    let mut master = current["master"].clone();
+    master.as_object_mut().unwrap().remove("events_from");
+    let old = old
+        .replace("TEMPO", &current["tempo_map"].to_string())
+        .replace("MASTER", &master.to_string());
+    assert_eq!(Model::from_json(&old).unwrap(), Model::new());
 }

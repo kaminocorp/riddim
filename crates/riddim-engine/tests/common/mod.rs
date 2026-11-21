@@ -78,6 +78,7 @@ pub fn audio_clip(id: u64, media: u64, at: i64, frames: u64) -> Clip {
         name: String::new(),
         start: Position::Time(riddim_model::time::samples_to_superclock(at, RATE)),
         muted: false,
+        take: None,
         content: ClipContent::Audio {
             media: MediaId(media),
             offset: 0,
@@ -105,6 +106,7 @@ pub fn midi_clip(id: u64, at_beats: i64, length_beats: i64, notes: Vec<Note>) ->
         name: String::new(),
         start: Position::Beats(Ticks::from_beats(at_beats)),
         muted: false,
+        take: None,
         content: ClipContent::Midi {
             length: Ticks::from_beats(length_beats),
             notes: std::sync::Arc::new(notes),
@@ -129,6 +131,8 @@ pub fn fixture_slot(id: u64, uid: &str) -> PluginSlot {
         },
         state: None,
         bypass: false,
+        outputs: Vec::new(),
+        sidechain: None,
     }
 }
 

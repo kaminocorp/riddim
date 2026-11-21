@@ -7,9 +7,9 @@ use proptest::prelude::*;
 use riddim_model::time::{Position, Superclock, Tempo, TempoMap, Ticks, TICKS_PER_BEAT};
 use riddim_model::{
     AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Clip, ClipContent, ClipId,
-    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, Model, Note, Op, PluginRef,
-    PluginSlot, Send, SendId, SlotId, Track, TrackChange, TrackId, TrackInput, TrackKind,
-    TrackOutput,
+    CurveShape, LaneId, LoopRange, Media, MediaId, Metronome, Model, Note, Op, PluginOutput,
+    PluginRef, PluginSlot, Send, SendId, Sidechain, SlotId, Track, TrackChange, TrackId,
+    TrackInput, TrackKind, TrackOutput,
 };
 
 /// An edit described by raw numbers; `realise` turns it into an op that refers to things that
@@ -26,7 +26,7 @@ struct Seed {
 fn seeds() -> impl Strategy<Value = Vec<Seed>> {
     prop::collection::vec(
         (
-            0u8..30,
+            0u8..36,
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
@@ -91,6 +91,7 @@ fn clip_for(track: &Track, model: &Model, id: u64, seed: &Seed) -> Option<Clip> 
         name: format!("c{id}"),
         start: position(seed.a),
         muted: seed.b % 3 == 0,
+        take: None,
         content,
     })
 }
@@ -194,6 +195,8 @@ fn realise(seed: &Seed, model: &Model) -> Option<Op> {
                     },
                     state: (seed.c % 2 == 0).then(|| Arc::new(seed.c.to_le_bytes().to_vec())),
                     bypass: seed.b % 5 == 0,
+                    outputs: Vec::new(),
+                    sidechain: None,
                 },
             }
         }
@@ -241,6 +244,40 @@ fn realise(seed: &Seed, model: &Model) -> Option<Op> {
         22 => Op::SetTrack {
             id: any_track(seed.a)?.id,
             change: TrackChange::Invert(seed.b % 2 == 0),
+        },
+        // Plugin outputs and sidechains: often valid, often not (a target that is not a bus, a
+        // route that would loop). Both outcomes must leave the model sound.
+        30..=32 => {
+            let track = any_track(seed.a)?;
+            let slot = pick(&track.plugins, seed.b)?.id;
+            let outputs = (0..seed.c % 3)
+                .map(|i| PluginOutput {
+                    bus: (seed.b % 4 + i) as u8,
+                    target: any_track(seed.c + i).map_or(TrackId(77), |t| t.id),
+                })
+                .collect();
+            Op::SetPluginRouting {
+                track: track.id,
+                slot,
+                outputs,
+                sidechain: (seed.a % 3 != 0).then(|| Sidechain {
+                    source: any_track(seed.b + 1).map_or(TrackId(78), |t| t.id),
+                    pre_fader: seed.c % 2 == 0,
+                }),
+            }
+        }
+        33 | 34 => Op::SetTrack {
+            id: any_track(seed.a)?.id,
+            change: TrackChange::EventsFrom(
+                (seed.b % 4 != 0).then(|| any_track(seed.c).map_or(TrackId(79), |t| t.id)),
+            ),
+        },
+        35 => Op::SetPunch {
+            range: (seed.a % 4 != 0).then(|| LoopRange {
+                start: position(seed.b),
+                end: position(seed.c),
+            }),
+            enabled: seed.a % 2 == 0,
         },
         23 | 24 => {
             let track = any_track(seed.a)?;

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     AutomationLane, AutomationTarget, Clip, ClipContent, ClipId, LaneId, LoopRange, Media, MediaId,
-    Metronome, Model, PluginSlot, Send, SendId, SlotId, Track, TrackId, TrackInput, TrackKind,
-    TrackOutput,
+    Metronome, Model, PluginOutput, PluginSlot, Send, SendId, Sidechain, SlotId, Track, TrackId,
+    TrackInput, TrackKind, TrackOutput, MAX_PLUGIN_OUTPUTS,
 };
 
 /// One property of a track's strip.
@@ -27,6 +27,8 @@ pub enum TrackChange {
     Invert(bool),
     Input(TrackInput),
     Output(TrackOutput),
+    /// For an instrument track: also play the notes another track's plugins put out.
+    EventsFrom(Option<TrackId>),
 }
 
 /// An edit to the model.
@@ -101,6 +103,16 @@ pub enum Op {
         slot: SlotId,
         bypass: bool,
     },
+    /// Sets where a plugin's extra outputs go and what feeds its sidechain. Both at once,
+    /// because both change which of the plugin's buses are switched on.
+    SetPluginRouting {
+        track: TrackId,
+        slot: SlotId,
+        #[serde(default)]
+        outputs: Vec<PluginOutput>,
+        #[serde(default)]
+        sidechain: Option<Sidechain>,
+    },
 
     /// Adds a send at `index` in the track's list of sends.
     AddSend {
@@ -140,6 +152,11 @@ pub enum Op {
         range: Option<LoopRange>,
         enabled: bool,
     },
+    /// The stretch recording is confined to, and whether that applies.
+    SetPunch {
+        range: Option<LoopRange>,
+        enabled: bool,
+    },
     SetMetronome {
         metronome: Metronome,
     },
@@ -167,7 +184,8 @@ pub enum OpError {
         media: MediaId,
         clip: ClipId,
     },
-    /// A bus cannot be removed while a track outputs to it.
+    /// A track cannot be removed while another track outputs or sends to it, routes a plugin
+    /// output to it, listens to it on a sidechain or takes notes from it.
     BusInUse {
         bus: TrackId,
         by: TrackId,
@@ -414,7 +432,35 @@ pub(crate) fn check_lane(track: &Track, lane: &AutomationLane) -> Result<(), OpE
     Ok(())
 }
 
-/// Checks that no signal can travel from a track back into itself through outputs and sends.
+/// Every track that `track`'s signal (audio or notes) goes into directly.
+pub(crate) fn feeds(model: &Model, track: &Track) -> Vec<TrackId> {
+    let mut next = Vec::new();
+    if let (TrackOutput::Bus(bus), true) = (track.output, track.kind != TrackKind::Master) {
+        next.push(bus);
+    }
+    next.extend(track.sends.iter().map(|s| s.target));
+    next.extend(
+        track
+            .plugins
+            .iter()
+            .flat_map(|slot| slot.outputs.iter().map(|o| o.target)),
+    );
+    // Listeners: tracks with a plugin sidechained from this one, or taking its notes.
+    for other in model.all_tracks() {
+        let listens = other.events_from == Some(track.id)
+            || other
+                .plugins
+                .iter()
+                .any(|slot| slot.sidechain.is_some_and(|sc| sc.source == track.id));
+        if listens {
+            next.push(other.id);
+        }
+    }
+    next
+}
+
+/// Checks that nothing can travel from a track back into itself: through outputs, sends,
+/// plugin outputs, sidechains or note routing.
 pub(crate) fn check_routing(model: &Model) -> Result<(), OpError> {
     // Depth-first search over "feeds into" edges, with the usual three colours.
     #[derive(Clone, Copy, PartialEq)]
@@ -434,14 +480,7 @@ pub(crate) fn check_routing(model: &Model) -> Result<(), OpError> {
             Mark::New => {}
         }
         marks.insert(track.id, Mark::Open);
-        let output = match track.output {
-            TrackOutput::Bus(bus) if track.kind != TrackKind::Master => Some(bus),
-            _ => None,
-        };
-        for next in output
-            .into_iter()
-            .chain(track.sends.iter().map(|s| s.target))
-        {
+        for next in feeds(model, track) {
             if let Some(next) = model.track(next) {
                 visit(model, next, marks)?;
             }
@@ -452,6 +491,86 @@ pub(crate) fn check_routing(model: &Model) -> Result<(), OpError> {
     let mut marks = std::collections::HashMap::new();
     for track in &model.tracks {
         visit(model, track, &mut marks)?;
+    }
+    Ok(())
+}
+
+/// Checks a slot's extra outputs and sidechain against the model that will hold it.
+pub(crate) fn check_plugin_routing(
+    model: &Model,
+    track: TrackId,
+    slot: &PluginSlot,
+) -> Result<(), OpError> {
+    let mut buses = std::collections::HashSet::new();
+    for output in &slot.outputs {
+        if output.bus == 0 || output.bus > MAX_PLUGIN_OUTPUTS {
+            return Err(OpError::Invalid(
+                "plugin outputs are numbered from 1 (the first after the main output) to 63",
+            ));
+        }
+        if !buses.insert(output.bus) {
+            return Err(OpError::Invalid("a plugin output can only be routed once"));
+        }
+        if output.target == track {
+            return Err(OpError::RoutingCycle(track));
+        }
+        let target = model
+            .track(output.target)
+            .ok_or(OpError::UnknownTrack(output.target))?;
+        if target.kind != TrackKind::Bus {
+            return Err(OpError::NotABus(output.target));
+        }
+    }
+    if let Some(sidechain) = slot.sidechain {
+        if sidechain.source == track {
+            return Err(OpError::RoutingCycle(track));
+        }
+        let source = model
+            .track(sidechain.source)
+            .ok_or(OpError::UnknownTrack(sidechain.source))?;
+        if source.kind == TrackKind::Master {
+            return Err(OpError::Invalid("the master cannot feed a sidechain"));
+        }
+    }
+    Ok(())
+}
+
+/// Checks where a track takes notes from.
+pub(crate) fn check_events_from(
+    model: &Model,
+    track: &Track,
+    source: Option<TrackId>,
+) -> Result<(), OpError> {
+    let Some(source) = source else { return Ok(()) };
+    if track.kind != TrackKind::Instrument {
+        return Err(OpError::Invalid(
+            "only an instrument track can take notes from another track",
+        ));
+    }
+    if source == track.id {
+        return Err(OpError::RoutingCycle(track.id));
+    }
+    let from = model.track(source).ok_or(OpError::UnknownTrack(source))?;
+    if from.kind == TrackKind::Master {
+        return Err(OpError::Invalid("the master has no notes to give"));
+    }
+    Ok(())
+}
+
+/// Checks a loop or punch range.
+pub(crate) fn check_range(
+    model: &Model,
+    range: Option<LoopRange>,
+    message: &'static str,
+) -> Result<(), OpError> {
+    if let Some(range) = range {
+        check_position(range.start)?;
+        check_position(range.end)?;
+        let start = model.tempo_map.position_to_superclock(range.start);
+        let end = model.tempo_map.position_to_superclock(range.end);
+        if end <= start {
+            return Err(OpError::Invalid(message));
+        }
     }
     Ok(())
 }
@@ -535,6 +654,10 @@ impl Model {
                     }
                     check_send(&candidate, track.id, send)?;
                 }
+                for slot in &track.plugins {
+                    check_plugin_routing(&candidate, track.id, slot)?;
+                }
+                check_events_from(&candidate, track, track.events_from)?;
                 if !track.automation.windows(2).all(|w| w[0].id < w[1].id) {
                     return Err(OpError::Invalid("a track's lanes must be sorted by id"));
                 }
@@ -561,7 +684,12 @@ impl Model {
                 if let Some(feeder) = self.tracks.iter().find(|t| {
                     t.id != *id
                         && (t.output == TrackOutput::Bus(*id)
-                            || t.sends.iter().any(|s| s.target == *id))
+                            || t.sends.iter().any(|s| s.target == *id)
+                            || t.events_from == Some(*id)
+                            || t.plugins.iter().any(|slot| {
+                                slot.outputs.iter().any(|o| o.target == *id)
+                                    || slot.sidechain.is_some_and(|sc| sc.source == *id)
+                            }))
                 }) {
                     return Err(OpError::BusInUse {
                         bus: *id,
@@ -631,6 +759,13 @@ impl Model {
                         check_routing(&candidate)?;
                         TrackChange::Output(current.output)
                     }
+                    TrackChange::EventsFrom(source) => {
+                        check_events_from(self, current, *source)?;
+                        let mut candidate = self.clone();
+                        candidate.track_mut(*id)?.events_from = *source;
+                        check_routing(&candidate)?;
+                        TrackChange::EventsFrom(current.events_from)
+                    }
                 };
                 let track = self.track_mut(*id)?;
                 match change.clone() {
@@ -644,6 +779,7 @@ impl Model {
                     TrackChange::Invert(invert) => track.invert = invert,
                     TrackChange::Input(input) => track.input = input,
                     TrackChange::Output(output) => track.output = output,
+                    TrackChange::EventsFrom(source) => track.events_from = source,
                 }
                 Ok(Op::SetTrack {
                     id: *id,
@@ -737,9 +873,16 @@ impl Model {
                 if slot.plugin.format.is_empty() || slot.plugin.uid.is_empty() {
                     return Err(OpError::Invalid("a plugin needs a format and an id"));
                 }
-                self.track_mut(*track)?
+                let mut candidate = self.clone();
+                candidate
+                    .track_mut(*track)?
                     .plugins
                     .insert(*index, Arc::new(slot.clone()));
+                if !slot.outputs.is_empty() || slot.sidechain.is_some() {
+                    check_plugin_routing(&candidate, *track, slot)?;
+                    check_routing(&candidate)?;
+                }
+                *self = candidate;
                 Ok(Op::RemovePlugin {
                     track: *track,
                     slot: slot.id,
@@ -822,6 +965,34 @@ impl Model {
                     track: *track,
                     slot: *slot,
                     bypass: previous,
+                })
+            }
+
+            Op::SetPluginRouting {
+                track,
+                slot,
+                outputs,
+                sidechain,
+            } => {
+                let target = self.require_track(*track)?;
+                let index = target
+                    .plugins
+                    .iter()
+                    .position(|p| p.id == *slot)
+                    .ok_or(OpError::UnknownSlot(*slot))?;
+                let mut candidate = self.clone();
+                let entry = Arc::make_mut(&mut candidate.track_mut(*track)?.plugins[index]);
+                let old_outputs = std::mem::replace(&mut entry.outputs, outputs.clone());
+                let old_sidechain = std::mem::replace(&mut entry.sidechain, *sidechain);
+                let routed = entry.clone();
+                check_plugin_routing(&candidate, *track, &routed)?;
+                check_routing(&candidate)?;
+                *self = candidate;
+                Ok(Op::SetPluginRouting {
+                    track: *track,
+                    slot: *slot,
+                    outputs: old_outputs,
+                    sidechain: old_sidechain,
                 })
             }
 
@@ -939,21 +1110,24 @@ impl Model {
             }
 
             Op::SetLoop { range, enabled } => {
-                if let Some(range) = range {
-                    check_position(range.start)?;
-                    check_position(range.end)?;
-                    let start = self.tempo_map.position_to_superclock(range.start);
-                    let end = self.tempo_map.position_to_superclock(range.end);
-                    if end <= start {
-                        return Err(OpError::Invalid("a loop must end after it starts"));
-                    }
-                }
+                check_range(self, *range, "a loop must end after it starts")?;
                 let previous = Op::SetLoop {
                     range: self.loop_range,
                     enabled: self.loop_enabled,
                 };
                 self.loop_range = *range;
                 self.loop_enabled = *enabled;
+                Ok(previous)
+            }
+
+            Op::SetPunch { range, enabled } => {
+                check_range(self, *range, "a punch range must end after it starts")?;
+                let previous = Op::SetPunch {
+                    range: self.punch_range,
+                    enabled: self.punch_enabled,
+                };
+                self.punch_range = *range;
+                self.punch_enabled = *enabled;
                 Ok(previous)
             }
 

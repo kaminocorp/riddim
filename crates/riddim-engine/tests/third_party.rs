@@ -65,6 +65,8 @@ fn slot(id: u64, descriptor: &PluginDescriptor) -> PluginSlot {
         },
         state: None,
         bypass: false,
+        outputs: Vec::new(),
+        sidechain: None,
     }
 }
 

@@ -240,6 +240,8 @@ fn a_missing_plugin_is_reported_and_the_rest_of_the_project_plays() {
         },
         state: Some(std::sync::Arc::new(vec![1, 2, 3])),
         bypass: false,
+        outputs: Vec::new(),
+        sidechain: None,
     };
     engine
         .apply_wait(vec![
