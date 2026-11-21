@@ -50,7 +50,7 @@ Run on the Linux build machine (x86-64, 16 cores, Rust 1.100.0) with `scripts/ci
 | third-party demo song, VST3 and CLAP | passed, both |
 | `scripts/rtsan.sh` (RealtimeSanitizer) | 155 passed, 0 failed, with the sanitizer live, including the bridge tests and the CLAP demo song |
 | `cargo deny --all-features check` | advisories, bans, licences, sources all ok (new dependencies: `clack-host`, `clack-extensions`, `clap-sys`, `libc`; MIT or Apache-2.0) |
-| `scripts/stress.sh 60` under RealtimeSanitizer | passed: 17,474 edits, 227 buffer-size changes and 462 takes in 60 s; 42,133 blocks served, longest gap 5.2 ms; 0 heap operations on the audio path, 0 messages lost |
+| `scripts/stress.sh 60` under RealtimeSanitizer | passed: 17,557 edits, 226 buffer-size changes and 466 takes in 60 s; 42,318 blocks served, longest gap 5.2 ms; 0 heap operations on the audio path, 0 messages lost |
 
 ## Findings
 
