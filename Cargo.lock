@@ -806,6 +806,7 @@ dependencies = [
  "riddim-rt",
  "riddim-test-support",
  "riddim-time",
+ "serde_json",
 ]
 
 [[package]]

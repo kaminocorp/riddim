@@ -16,6 +16,7 @@ riddim-plugin.workspace = true
 riddim-io.workspace = true
 riddim-disk.workspace = true
 riddim-rt.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 riddim-test-support.workspace = true
