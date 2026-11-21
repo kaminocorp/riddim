@@ -165,6 +165,91 @@ fn a_demo_song_through_third_party_plugins_bounces() {
     assert_eq!(engine.status().rt_violations, 0);
     engine.transport(TransportCommand::Stop);
 
+    // Routing that makes the engine switch the plugins' optional buses on, which means
+    // restarting them: the instrument's second output to the effect bus, and each plugin's
+    // sidechain input (if it has one) fed from a third track. Whatever the plugins make of
+    // it, they must come back, and the song must still play.
+    let instrument_layout = riddim_plugin::host::instantiate(instrument)
+        .map(|plugin| plugin.bus_layout())
+        .unwrap();
+    let effect_layout = riddim_plugin::host::instantiate(effect)
+        .map(|plugin| plugin.bus_layout())
+        .unwrap();
+    let has_aux_in = |layout: &riddim_plugin::BusLayout| {
+        layout
+            .audio_inputs
+            .iter()
+            .any(|bus| bus.kind == riddim_plugin::BusKind::Aux)
+    };
+    let mut restarts = 0;
+    let mut routing = vec![add_track(2, 50, TrackKind::Audio)];
+    let second_output = instrument_layout.audio_outputs.len() > 1;
+    if second_output || has_aux_in(&instrument_layout) {
+        restarts += 1;
+        routing.push(Op::SetPluginRouting {
+            track: TrackId(10),
+            slot: SlotId(11),
+            outputs: second_output
+                .then_some(riddim_model::PluginOutput {
+                    bus: 1,
+                    target: TrackId(20),
+                })
+                .into_iter()
+                .collect(),
+            sidechain: has_aux_in(&instrument_layout).then_some(riddim_model::Sidechain {
+                source: TrackId(50),
+                pre_fader: true,
+            }),
+        });
+    }
+    if has_aux_in(&effect_layout) {
+        restarts += 1;
+        routing.push(Op::SetPluginRouting {
+            track: TrackId(20),
+            slot: SlotId(21),
+            outputs: vec![],
+            sidechain: Some(riddim_model::Sidechain {
+                source: TrackId(50),
+                pre_fader: false,
+            }),
+        });
+    }
+    engine.apply_wait(routing).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while restarts > 0 {
+        engine.run(256);
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::PluginRestarted { .. } => restarts -= 1,
+                Event::PluginFailed { error, .. } => panic!("a plugin did not restart: {error}"),
+                _ => {}
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the plugins did not come back"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    engine.sync();
+    engine.transport(TransportCommand::Locate(Position::START));
+    engine.transport(TransportCommand::Play);
+    engine.sync();
+    let rerouted = engine.run(2 * RATE as usize);
+    assert!(
+        peak(&rerouted[0]) > 0.001,
+        "the song is silent after rerouting"
+    );
+    assert!(rerouted.iter().flatten().all(|s| s.is_finite()));
+    assert_eq!(engine.status().rt_violations, 0);
+    engine.transport(TransportCommand::Stop);
+    eprintln!(
+        "demo song: rerouted (second output: {second_output}, instrument sidechain: {}, effect sidechain: {}), peak {:.4}",
+        has_aux_in(&instrument_layout),
+        has_aux_in(&effect_layout),
+        peak(&rerouted[0])
+    );
+
     // Its plugins' states go into the model, and the model survives the trip through a file.
     let applied = engine.capture_plugin_states().unwrap();
     assert_eq!(

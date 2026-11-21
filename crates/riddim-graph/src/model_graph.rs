@@ -33,8 +33,9 @@ pub enum NodeKind {
     Source(TrackId),
     /// The summing point of a bus or of the master.
     BusInput(TrackId),
-    /// A plugin. Input port 0 is its main input and port 1 its sidechain; output port 0 is its
-    /// main output and the ports after it its extra outputs, in the plugin's own order.
+    /// A plugin. Its input ports are its main input (if it has one) and its sidechain (if that
+    /// is switched on); output port 0 is its main output and the ports after it its extra
+    /// outputs, in the plugin's own order.
     Plugin(TrackId, SlotId),
     /// Fader, pan, mute and meter.
     Strip(TrackId),
@@ -52,8 +53,13 @@ pub enum NodeKind {
 /// What the graph needs to know about a loaded plugin.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PluginPorts {
-    /// Channel count of each active audio input bus (the first is the main input).
+    /// Channel count of each active audio input bus, in the plugin's order.
     pub inputs: Vec<u32>,
+    /// Whether the first of `inputs` is the plugin's main input. (An instrument may have a
+    /// sidechain input and no main one.)
+    pub main_input: bool,
+    /// Which of `inputs` is the sidechain, if the plugin has one and it is switched on.
+    pub sidechain: Option<usize>,
     /// Channel count of each active audio output bus (the first is the main output).
     pub outputs: Vec<u32>,
     pub latency: u32,
@@ -116,7 +122,7 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
     let mut sends: Vec<(NodeIndex, TrackId)> = Vec::new();
     // Connections between tracks that can only be made once every track has its nodes.
     let mut plugin_outputs: Vec<(NodeIndex, usize, TrackId)> = Vec::new();
-    let mut sidechains: Vec<(NodeIndex, TrackId, bool)> = Vec::new();
+    let mut sidechains: Vec<(NodeIndex, usize, TrackId, bool)> = Vec::new();
     let mut note_feeds: Vec<(NodeIndex, TrackId)> = Vec::new();
     // Per track: the signal just before the strip, the strip, and where its notes end up.
     let mut pre_fader: HashMap<TrackId, NodeIndex> = HashMap::new();
@@ -171,7 +177,7 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
                     event_output: ports.emits_events,
                 },
             );
-            if let (Some(source), false) = (audio, ports.inputs.is_empty()) {
+            if let (Some(source), true) = (audio, ports.main_input) {
                 graph.connect(source, node, 0);
             }
             if let (Some(source), true) = (events, ports.takes_events) {
@@ -186,9 +192,9 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
                 note_feeds.push((node, from));
                 fed = true;
             }
-            // A sidechain needs the plugin to have a second input bus, switched on.
-            if let (Some(sidechain), true) = (slot.sidechain, ports.inputs.len() > 1) {
-                sidechains.push((node, sidechain.source, sidechain.pre_fader));
+            // A sidechain needs the plugin to have a sidechain input, switched on.
+            if let (Some(sidechain), Some(port)) = (slot.sidechain, ports.sidechain) {
+                sidechains.push((node, port, sidechain.source, sidechain.pre_fader));
             }
             // Extra outputs the plugin actually has; one that is routed but missing (the
             // plugin could not switch the bus on) is simply not connected.
@@ -278,7 +284,7 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
             graph.connect_port(plugin, port, bus, 0);
         }
     }
-    for (plugin, source, before_fader) in sidechains {
+    for (plugin, port, source, before_fader) in sidechains {
         // A pre-fader tap on a track with no audio yet (an instrument whose plugin is missing)
         // has nothing to listen to.
         let taps = if before_fader {
@@ -287,7 +293,7 @@ pub fn build(model: &Model, plugins: &HashMap<SlotId, PluginPorts>) -> ModelGrap
             &post_fader
         };
         if let Some(&tap) = taps.get(&source) {
-            graph.connect(tap, plugin, 1);
+            graph.connect(tap, plugin, port);
         }
     }
     for (plugin, source) in note_feeds {
@@ -324,6 +330,8 @@ mod tests {
     fn effect(latency: u32) -> PluginPorts {
         PluginPorts {
             inputs: vec![2],
+            main_input: true,
+            sidechain: None,
             outputs: vec![2],
             latency,
             takes_events: false,
@@ -334,6 +342,8 @@ mod tests {
     fn instrument() -> PluginPorts {
         PluginPorts {
             inputs: vec![],
+            main_input: false,
+            sidechain: None,
             outputs: vec![2],
             latency: 0,
             takes_events: true,
@@ -630,6 +640,8 @@ mod tests {
 
         let instrument = |outputs: Vec<u32>, emits_events| PluginPorts {
             inputs: vec![],
+            main_input: false,
+            sidechain: None,
             outputs,
             latency: 0,
             takes_events: true,
@@ -641,6 +653,8 @@ mod tests {
                 SlotId(30),
                 PluginPorts {
                     inputs: vec![2, 2],
+                    main_input: true,
+                    sidechain: Some(1),
                     outputs: vec![2],
                     latency: 32,
                     takes_events: false,
@@ -688,9 +702,10 @@ mod tests {
             .all(|i| i.sources.iter().all(|s| s.delay == 0)));
         assert_eq!(plan.max_latency, 32);
 
-        // A sidechain on a plugin that has no second input is left unconnected.
+        // A sidechain on a plugin that has no sidechain input is left unconnected.
         let mut narrow = plugins.clone();
         narrow.get_mut(&SlotId(30)).unwrap().inputs = vec![2];
+        narrow.get_mut(&SlotId(30)).unwrap().sidechain = None;
         let graph = build(&model, &narrow);
         let compressor = graph
             .index_of(NodeKind::Plugin(TrackId(3), SlotId(30)))
@@ -700,6 +715,51 @@ mod tests {
             .edges
             .iter()
             .all(|e| !(e.to == compressor && e.to_port == 1)));
+        compile(&graph.spec).unwrap();
+    }
+
+    #[test]
+    fn an_instrument_whose_only_input_is_a_sidechain_is_keyed_on_that_input() {
+        use riddim_model::Sidechain;
+        // Surge XT is like this: no main input, one auxiliary "Sidechain" input.
+        let mut model = session();
+        model
+            .apply(&Op::InsertPlugin {
+                track: TrackId(2),
+                index: 0,
+                slot: slot(10),
+            })
+            .unwrap();
+        model
+            .apply(&Op::SetPluginRouting {
+                track: TrackId(2),
+                slot: SlotId(10),
+                outputs: vec![],
+                sidechain: Some(Sidechain {
+                    source: TrackId(1),
+                    pre_fader: true,
+                }),
+            })
+            .unwrap();
+        let keyed = PluginPorts {
+            inputs: vec![2],
+            main_input: false,
+            sidechain: Some(0),
+            ..instrument()
+        };
+        let graph = build(&model, &HashMap::from([(SlotId(10), keyed)]));
+        let synth = graph
+            .index_of(NodeKind::Plugin(TrackId(2), SlotId(10)))
+            .unwrap();
+        let into: Vec<&Edge> = graph.spec.edges.iter().filter(|e| e.to == synth).collect();
+        // One audio connection into the synth: the key, on its only input, from before
+        // track 1's fader.
+        assert_eq!(into.len(), 1);
+        assert_eq!(
+            into[0].from,
+            graph.index_of(NodeKind::Source(TrackId(1))).unwrap()
+        );
+        assert_eq!(into[0].to_port, 0);
         compile(&graph.spec).unwrap();
     }
 

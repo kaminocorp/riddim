@@ -6,6 +6,43 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 
 ## [Unreleased]
 
+### Phase 4: v1
+
+#### Added
+- **Multi-out instruments**: a plugin's extra output buses routed to bus tracks, each with its own fader, inserts and sends.
+- **Sidechains**: a plugin's sidechain input fed from any track, pre- or post-fader, aligned with its main input.
+- **Plugin MIDI out**: an instrument track can also play the notes that come out of another track's plugins.
+- **Loop recording with takes**: every time round the loop becomes a take, cut from one continuous file; the newest whole take is audible, the rest muted. MIDI likewise.
+- **Punch recording**: a take confined to a range, ending by itself while the transport plays on, with what was on the track trimmed or split to make room in the same undoable edit.
+- **Parallel rendering**: render threads share the plan's steps with the audio thread, lock-free; the output is identical bit for bit whatever the thread count. On macOS they join the device's audio workgroup (*unverified on macOS*).
+- **Runtime buffer-size changes**: `Engine::set_buffer_size` / `riddim_set_buffer_size`, 16 to 4096 frames, without reopening the project.
+- **Read-ahead streaming**: long files are played from disk a page at a time; a disk that falls behind is heard as silence and counted, never waited for.
+- **Events**: `plugin_restarted`, `plugin_gesture`, `plugin_params_changed`, `plugin_state_dirty`, `plugin_editor_resize`, `jumped`, `xrun`, `load`, `playback_starved`, `stream_changed`; take numbers on `recording_finished`. The whole set is documented in [`docs/api/events.md`](docs/api/events.md).
+- **Status**: DSP load, lost messages, frames of streamed playback missed.
+- **Private aggregate devices** on macOS, so input and output can be different devices (*unverified on macOS*).
+- **A stress run** (`scripts/stress.sh`): a 34-plugin project at a 64-frame buffer with render threads, churned, on a slow disk.
+- **`riddim` CLI**: `session record --loop / --punch`, `session apply` (ops from a JSON file), `--threads` for renders, `--render-threads` and `--switch-buffer` for live runs.
+
+#### Changed
+- Recording is counted in frames rolled since the take began rather than in timeline position, so the loop can wrap during it.
+- Plugins are restarted (deactivated, reconfigured, activated; the instance kept) when their buses or the block size change, or when they ask.
+- Plugin latency is polled on every pump, not only when announced.
+- The plugin host loads at most one plugin per pump, so an application pumping from its UI thread gets a turn in between.
+- The timer-driven device counts late blocks as xruns.
+- The transport cannot be located while recording.
+
+#### Fixed
+- A slot emptied and refilled before the audio thread had let go of the old plugin ended with the new instance unloaded in its place.
+- Parameter changes still waiting for a plugin when it was restarted were lost.
+- Record pressed straight after Stop, before the finished take had come back, was dropped.
+- Notes played during a count-in were placed at the start of the take.
+
+#### Verified
+- On Linux: a second plugin output through its own bus; sidechains; one instrument playing another's notes; four loop takes placed and cut to the sample through a simulated loopback; a punch that replaces the middle of a clip and undoes exactly; a 23-track project bouncing to the same bytes with 0, 1, 2, 3 and 7 render threads; the same project playing identically at buffer sizes from 32 to 2048 frames after live changes; a streamed file playing the same samples as one held in memory; every stageable event; the stress run under RealtimeSanitizer.
+
+#### Not verified
+- Anything on a Mac or on real audio hardware, including audio workgroups, aggregate devices and buffer-size changes on CoreAudio; nothing with Kontakt, Superior Drummer 3, EZbass or Helix Native. The phase's first, second and fourth exit criteria cannot be met from here. See [`docs/phases/p4-v1.md`](docs/phases/p4-v1.md).
+
 ### Phase 3: mix
 
 #### Added

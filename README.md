@@ -25,7 +25,7 @@ Riddim is a native audio engine written in Rust. It handles playback, recording,
 | `crates/riddim-rt` | Real-time building blocks and the guard that tests them |
 | `crates/riddim-cli` | `riddim`, a headless tool for exercising all of the above |
 | `fixtures/` | Test plugins and test support; never shipped |
-| `docs/` | Vision, decisions, per-phase notes |
+| `docs/` | Vision, decisions, per-phase notes, the event reference (`docs/api/events.md`) |
 
 ## Building
 
@@ -36,6 +36,7 @@ cargo build --workspace
 cargo test --workspace
 scripts/ci.sh            # what CI runs, plus the heavier checks kept out of CI
 scripts/rtsan.sh         # the real-time sections under RealtimeSanitizer
+scripts/stress.sh 60     # a minute of graph churn on a slow disk, under the sanitizer
 ```
 
 Then, for example:
@@ -51,6 +52,9 @@ cargo run -p riddim-cli -- session new mix.json --instrument "Surge XT" --sequen
     --send-effect "Surge XT Effects" --fade-in 4
 cargo run -p riddim-cli -- session render mix.json -o mix.wav --tail 2
 cargo run -p riddim-cli -- session render mix.json -o return.wav --stem 1000
+cargo run -p riddim-cli -- session record song.json --loop 0:8       # a take per time round
+cargo run -p riddim-cli -- session record song.json --punch 4:8      # replace two bars
+cargo run -p riddim-cli -- session play mix.json --switch-buffer 256 --render-threads 4
 ```
 
 `riddim --help` lists the commands.

@@ -2327,7 +2327,11 @@ impl Control {
                                     Box::new(DelayLine::new(outputs, loaded.ports.latency as usize))
                                 }),
                                 was_bypassed: false,
-                                main_in: loaded.ports.inputs.first().copied().unwrap_or(0) as usize,
+                                main_in: if loaded.ports.main_input {
+                                    loaded.ports.inputs.first().copied().unwrap_or(0) as usize
+                                } else {
+                                    0
+                                },
                                 main_out: loaded.ports.outputs.first().copied().unwrap_or(0)
                                     as usize,
                             })));

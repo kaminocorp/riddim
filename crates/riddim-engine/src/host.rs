@@ -12,7 +12,7 @@ use std::sync::Arc;
 use riddim_graph::model_graph::PluginPorts;
 use riddim_model::{PluginRef, SlotId};
 use riddim_plugin::{
-    ActivateConfig, BusDirection, PluginDescriptor, PluginEvent, PluginFormat, PluginId,
+    ActivateConfig, BusDirection, BusKind, PluginDescriptor, PluginEvent, PluginFormat, PluginId,
     PluginInstance, PluginKind, PluginProcessor, StateBlob,
 };
 
@@ -117,8 +117,17 @@ fn configure_buses(instance: &mut dyn PluginInstance, buses: BusRequest) {
             let _ = instance.set_bus_active(BusDirection::Output, index, wanted);
         }
     }
-    for (index, bus) in layout.audio_inputs.iter().enumerate().skip(1) {
-        let wanted = index == 1 && buses.sidechain;
+    // The sidechain is the plugin's first auxiliary input, wherever it comes in its list (an
+    // instrument may have no main input in front of it). Other auxiliary inputs stay off.
+    let sidechain = layout
+        .audio_inputs
+        .iter()
+        .position(|bus| bus.kind == BusKind::Aux);
+    for (index, bus) in layout.audio_inputs.iter().enumerate() {
+        if bus.kind != BusKind::Aux {
+            continue;
+        }
+        let wanted = buses.sidechain && Some(index) == sidechain;
         if bus.active != wanted {
             let _ = instance.set_bus_active(BusDirection::Input, index, wanted);
         }
@@ -134,8 +143,16 @@ fn ports_of(instance: &dyn PluginInstance) -> PluginPorts {
             .map(|b| b.channels)
             .collect::<Vec<u32>>()
     };
+    let active_inputs: Vec<&riddim_plugin::BusInfo> =
+        layout.audio_inputs.iter().filter(|b| b.active).collect();
     PluginPorts {
         inputs: active(&layout.audio_inputs),
+        main_input: active_inputs
+            .first()
+            .is_some_and(|bus| bus.kind == BusKind::Main),
+        sidechain: active_inputs
+            .iter()
+            .position(|bus| bus.kind == BusKind::Aux),
         outputs: active(&layout.audio_outputs),
         latency: instance.latency_samples(),
         takes_events: layout.event_inputs > 0,
