@@ -1,0 +1,46 @@
+name: macOS
+
+# Builds and tests on a real Mac: the VST3 host through CFBundle, the Audio Unit host against
+# Apple's built-in units, editor windows, and CoreAudio device listing.
+#
+# macOS runner minutes are billed at ten times the Linux rate on private repositories, so this
+# does not run on every push. Trigger it by adding the `mac-ci` label to a pull request (remove
+# and re-add to run again), or from the Actions tab once this file is on the default branch.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: build + test (Apple Silicon)
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'mac-ci'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+      - name: Machine
+        run: |
+          sw_vers
+          uname -m
+          system_profiler SPAudioDataType || true
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace -- --nocapture

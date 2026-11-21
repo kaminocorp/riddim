@@ -54,13 +54,20 @@ impl Module {
         // signature; the module's entry function has already run.
         let factory = unsafe {
             let get: GetFactoryFn = binary.symbol(b"GetPluginFactory\0").ok_or_else(|| {
-                PluginError::Load(format!("{} does not export GetPluginFactory", key.display()))
+                PluginError::Load(format!(
+                    "{} does not export GetPluginFactory",
+                    key.display()
+                ))
             })?;
             ComPtr::from_raw(get())
         }
         .ok_or_else(|| PluginError::Load(format!("{} returned no factory", key.display())))?;
 
-        let module = Rc::new(Module { path: key.clone(), factory, _binary: binary });
+        let module = Rc::new(Module {
+            path: key.clone(),
+            factory,
+            _binary: binary,
+        });
         LOADED.with(|m| m.borrow_mut().insert(key, module.clone()));
         Ok(module)
     }
@@ -121,8 +128,11 @@ impl Module {
                     vendor = factory_vendor.clone();
                 }
 
-                let categories: Vec<String> =
-                    sub_categories.split('|').filter(|s| !s.is_empty()).map(String::from).collect();
+                let categories: Vec<String> = sub_categories
+                    .split('|')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
                 out.push(ClassEntry {
                     cid: info.cid,
                     descriptor: PluginDescriptor {
@@ -198,10 +208,14 @@ pub fn default_search_paths() -> Vec<PathBuf> {
 /// Finds `.vst3` bundles (and single-file modules) under `dirs`, without loading anything.
 pub fn find_bundles(dirs: &[PathBuf]) -> Vec<PathBuf> {
     fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_vst3 = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("vst3"));
+            let is_vst3 = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("vst3"));
             if is_vst3 {
                 out.push(path);
             } else if path.is_dir() && depth < 8 {
@@ -234,7 +248,9 @@ mod platform {
             // SAFETY: loading a plugin runs its initialisers; that is the point of loading it.
             let library = unsafe { libloading::Library::new(&file) }
                 .map_err(|e| PluginError::Load(format!("{}: {e}", file.display())))?;
-            let binary = Binary { library: std::mem::ManuallyDrop::new(library) };
+            let binary = Binary {
+                library: std::mem::ManuallyDrop::new(library),
+            };
             binary.run_entry(&file)?;
             Ok(binary)
         }
@@ -246,7 +262,10 @@ mod platform {
             unsafe {
                 if let Some(init) = self.symbol::<InitFn>(b"InitDll\0") {
                     if !init() {
-                        return Err(PluginError::Load(format!("{}: InitDll failed", file.display())));
+                        return Err(PluginError::Load(format!(
+                            "{}: InitDll failed",
+                            file.display()
+                        )));
                     }
                 }
             }
@@ -333,7 +352,9 @@ mod platform {
             if !unsafe { bundle.load_executable_and_return_error(std::ptr::null_mut()) } {
                 return Err(err("the bundle executable could not be loaded"));
             }
-            let binary = Binary { bundle: std::mem::ManuallyDrop::new(bundle) };
+            let binary = Binary {
+                bundle: std::mem::ManuallyDrop::new(bundle),
+            };
 
             type EntryFn = unsafe extern "system" fn(*mut c_void) -> bool;
             // SAFETY: bundleEntry takes the CFBundleRef of the bundle being loaded.
@@ -357,7 +378,10 @@ mod platform {
             if ptr.is_null() {
                 return None;
             }
-            debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*const c_void>());
+            debug_assert_eq!(
+                std::mem::size_of::<T>(),
+                std::mem::size_of::<*const c_void>()
+            );
             // SAFETY: T is a function pointer type per the caller's contract, and function
             // pointers have the same size and representation as data pointers on macOS.
             Some(unsafe { std::mem::transmute_copy::<*const c_void, T>(&(ptr as *const c_void)) })

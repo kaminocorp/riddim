@@ -61,7 +61,10 @@ pub struct PluginId {
 
 impl PluginId {
     pub fn new(format: PluginFormat, uid: impl Into<String>) -> Self {
-        Self { format, uid: uid.into() }
+        Self {
+            format,
+            uid: uid.into(),
+        }
     }
 }
 
@@ -74,12 +77,16 @@ impl fmt::Display for PluginId {
 impl FromStr for PluginId {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        let (format, uid) =
-            s.split_once(':').ok_or_else(|| format!("expected '<format>:<id>', got '{s}'"))?;
+        let (format, uid) = s
+            .split_once(':')
+            .ok_or_else(|| format!("expected '<format>:<id>', got '{s}'"))?;
         if uid.is_empty() {
             return Err(format!("empty plugin id in '{s}'"));
         }
-        Ok(PluginId { format: format.parse()?, uid: uid.to_string() })
+        Ok(PluginId {
+            format: format.parse()?,
+            uid: uid.to_string(),
+        })
     }
 }
 
@@ -149,12 +156,20 @@ pub struct BusLayout {
 impl BusLayout {
     /// Total channels across active input buses: the length of `ProcessContext::inputs`.
     pub fn active_input_channels(&self) -> usize {
-        self.audio_inputs.iter().filter(|b| b.active).map(|b| b.channels as usize).sum()
+        self.audio_inputs
+            .iter()
+            .filter(|b| b.active)
+            .map(|b| b.channels as usize)
+            .sum()
     }
 
     /// Total channels across active output buses: the length of `ProcessContext::outputs`.
     pub fn active_output_channels(&self) -> usize {
-        self.audio_outputs.iter().filter(|b| b.active).map(|b| b.channels as usize).sum()
+        self.audio_outputs
+            .iter()
+            .filter(|b| b.active)
+            .map(|b| b.channels as usize)
+            .sum()
     }
 }
 

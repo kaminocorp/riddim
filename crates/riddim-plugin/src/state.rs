@@ -58,7 +58,9 @@ impl StateBlob {
         }
         let version = r.u32()?;
         if version != VERSION {
-            return Err(PluginError::State(format!("unsupported state version {version}")));
+            return Err(PluginError::State(format!(
+                "unsupported state version {version}"
+            )));
         }
         let format = format_from_code(r.take(1)?[0])?;
         let uid_len = r.u32()? as usize;
@@ -70,7 +72,10 @@ impl StateBlob {
         if r.pos != bytes.len() {
             return Err(PluginError::State("trailing bytes after state".into()));
         }
-        Ok(StateBlob { plugin: PluginId { format, uid }, data })
+        Ok(StateBlob {
+            plugin: PluginId { format, uid },
+            data,
+        })
     }
 }
 
@@ -126,14 +131,20 @@ mod tests {
 
     #[test]
     fn container_round_trips() {
-        let blob = StateBlob::new(PluginId::new(PluginFormat::Vst3, "ABCDEF"), vec![1, 2, 3, 255]);
+        let blob = StateBlob::new(
+            PluginId::new(PluginFormat::Vst3, "ABCDEF"),
+            vec![1, 2, 3, 255],
+        );
         let bytes = blob.to_bytes();
         assert_eq!(StateBlob::from_bytes(&bytes).unwrap(), blob);
     }
 
     #[test]
     fn rejects_garbage_and_truncation() {
-        let blob = StateBlob::new(PluginId::new(PluginFormat::AudioUnit, "aumu:x:y"), vec![9; 40]);
+        let blob = StateBlob::new(
+            PluginId::new(PluginFormat::AudioUnit, "aumu:x:y"),
+            vec![9; 40],
+        );
         let bytes = blob.to_bytes();
         assert!(StateBlob::from_bytes(&bytes[..bytes.len() - 1]).is_err());
         assert!(StateBlob::from_bytes(b"nope").is_err());
@@ -147,6 +158,8 @@ mod tests {
         let id = PluginId::new(PluginFormat::Vst3, "A");
         let blob = StateBlob::new(id.clone(), vec![]);
         assert!(blob.expect_plugin(&id).is_ok());
-        assert!(blob.expect_plugin(&PluginId::new(PluginFormat::Vst3, "B")).is_err());
+        assert!(blob
+            .expect_plugin(&PluginId::new(PluginFormat::Vst3, "B"))
+            .is_err());
     }
 }

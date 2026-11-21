@@ -13,11 +13,27 @@ riddim-rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 vst3.workspace = true
-libloading.workspace = true
 crossbeam-queue.workspace = true
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+libloading.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+block2.workspace = true
+objc2-foundation.workspace = true
+objc2-core-foundation.workspace = true
+objc2-app-kit.workspace = true
+objc2-audio-toolbox.workspace = true
+objc2-core-audio-kit.workspace = true
+objc2-core-audio-types.workspace = true
 
 [dev-dependencies]
 riddim-test-support.workspace = true
+
+[[test]]
+name = "mac_editor"
+harness = false
 
 [lints]
 workspace = true

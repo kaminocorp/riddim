@@ -28,11 +28,17 @@ pub const SCANNER_ENV: &str = "RIDDIM_SCAN";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScanMessage {
-    Plugin { descriptor: PluginDescriptor },
+    Plugin {
+        descriptor: PluginDescriptor,
+    },
     /// The bundle loaded but could not be scanned.
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// Always the last line of a scan that ran to the end.
-    Done { count: usize },
+    Done {
+        count: usize,
+    },
 }
 
 /// What scanning one target produced.
@@ -108,7 +114,9 @@ pub fn run_scanner(target: &ScanTarget, out: &mut dyn Write) -> i32 {
             0
         }
         Err(error) => {
-            emit(&ScanMessage::Error { message: error.to_string() });
+            emit(&ScanMessage::Error {
+                message: error.to_string(),
+            });
             1
         }
     }
@@ -129,7 +137,11 @@ pub struct Scanner {
 impl Scanner {
     /// Uses the scanner at `executable`.
     pub fn new(executable: impl Into<PathBuf>) -> Self {
-        Self { executable: executable.into(), timeout: Duration::from_secs(120), env: Vec::new() }
+        Self {
+            executable: executable.into(),
+            timeout: Duration::from_secs(120),
+            env: Vec::new(),
+        }
     }
 
     /// Finds the scanner: `$RIDDIM_SCAN`, else next to the running executable.
@@ -175,7 +187,10 @@ impl Scanner {
             command.arg(path);
         }
         command.envs(self.env.iter().map(|(k, v)| (k, v)));
-        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -190,11 +205,16 @@ impl Scanner {
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
         let out_reader = std::thread::spawn(move || {
-            BufReader::new(stdout).lines().map_while(|l| l.ok()).collect::<Vec<String>>()
+            BufReader::new(stdout)
+                .lines()
+                .map_while(|l| l.ok())
+                .collect::<Vec<String>>()
         });
         let err_reader = std::thread::spawn(move || {
             let mut text = String::new();
-            let _ = BufReader::new(stderr).take(64 * 1024).read_to_string(&mut text);
+            let _ = BufReader::new(stderr)
+                .take(64 * 1024)
+                .read_to_string(&mut text);
             text
         });
 
@@ -213,7 +233,9 @@ impl Scanner {
         };
         let lines = out_reader.join().unwrap_or_default();
         let stderr_text = err_reader.join().unwrap_or_default();
-        let Some(status) = status else { return ScanOutcome::TimedOut };
+        let Some(status) = status else {
+            return ScanOutcome::TimedOut;
+        };
 
         let mut plugins = Vec::new();
         let mut reported_error = None;
@@ -268,10 +290,16 @@ pub fn default_targets(extra_vst3_dirs: &[PathBuf]) -> Vec<ScanTarget> {
     dirs.extend(extra_vst3_dirs.iter().cloned());
     let mut targets: Vec<ScanTarget> = format::vst3::find_bundles(&dirs)
         .into_iter()
-        .map(|path| ScanTarget { format: PluginFormat::Vst3, path: Some(path) })
+        .map(|path| ScanTarget {
+            format: PluginFormat::Vst3,
+            path: Some(path),
+        })
         .collect();
     if cfg!(target_os = "macos") {
-        targets.push(ScanTarget { format: PluginFormat::AudioUnit, path: None });
+        targets.push(ScanTarget {
+            format: PluginFormat::AudioUnit,
+            path: None,
+        });
     }
     targets
 }
@@ -320,14 +348,19 @@ mod tests {
     #[test]
     fn missing_scanner_is_a_failure_not_a_panic() {
         let scanner = Scanner::new("/nonexistent/riddim-scan");
-        let target = ScanTarget { format: PluginFormat::Vst3, path: Some("/tmp/x.vst3".into()) };
+        let target = ScanTarget {
+            format: PluginFormat::Vst3,
+            path: Some("/tmp/x.vst3".into()),
+        };
         assert!(matches!(scanner.scan(&target), ScanOutcome::Failed(_)));
     }
 
     #[test]
     fn scanning_a_missing_bundle_reports_an_error_message() {
-        let target =
-            ScanTarget { format: PluginFormat::Vst3, path: Some("/nonexistent/Nope.vst3".into()) };
+        let target = ScanTarget {
+            format: PluginFormat::Vst3,
+            path: Some("/nonexistent/Nope.vst3".into()),
+        };
         let mut out = Vec::new();
         assert_eq!(run_scanner(&target, &mut out), 1);
         let text = String::from_utf8(out).unwrap();

@@ -51,7 +51,11 @@ impl Report {
     }
 
     fn add(&mut self, name: &'static str, verdict: Verdict, detail: impl Into<String>) {
-        self.steps.push(Step { name, verdict, detail: detail.into() });
+        self.steps.push(Step {
+            name,
+            verdict,
+            detail: detail.into(),
+        });
     }
 }
 
@@ -67,7 +71,11 @@ impl fmt::Display for Report {
             };
             writeln!(f, "  [{mark}] {:<22} {}", step.name, step.detail)?;
         }
-        write!(f, "  => {}", if self.passed() { "passed" } else { "FAILED" })
+        write!(
+            f,
+            "  => {}",
+            if self.passed() { "passed" } else { "FAILED" }
+        )
     }
 }
 
@@ -83,7 +91,11 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { sample_rate: 48_000.0, block: 128, sound_wait_blocks: 400 }
+        Self {
+            sample_rate: 48_000.0,
+            block: 128,
+            sound_wait_blocks: 400,
+        }
     }
 }
 
@@ -126,7 +138,10 @@ impl Driver {
     fn fill_noise(&mut self) {
         for channel in &mut self.inputs {
             for sample in channel.iter_mut() {
-                self.seed = self.seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                self.seed = self
+                    .seed
+                    .wrapping_mul(1_664_525)
+                    .wrapping_add(1_013_904_223);
                 *sample = ((self.seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.25;
             }
         }
@@ -177,7 +192,10 @@ impl Driver {
 /// plugin instances (the main thread on macOS).
 pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
     let mut report = Report {
-        plugin: format!("{} [{}] by {}", descriptor.name, descriptor.id, descriptor.vendor),
+        plugin: format!(
+            "{} [{}] by {}",
+            descriptor.name, descriptor.id, descriptor.vendor
+        ),
         steps: Vec::new(),
     };
 
@@ -196,13 +214,24 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
     let describe = |buses: &[crate::BusInfo]| {
         buses
             .iter()
-            .map(|b| format!("{}:{}ch{}", b.name, b.channels, if b.active { "" } else { " (off)" }))
+            .map(|b| {
+                format!(
+                    "{}:{}ch{}",
+                    b.name,
+                    b.channels,
+                    if b.active { "" } else { " (off)" }
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
     report.add(
         "buses",
-        if layout.audio_outputs.is_empty() { Verdict::Fail } else { Verdict::Pass },
+        if layout.audio_outputs.is_empty() {
+            Verdict::Fail
+        } else {
+            Verdict::Pass
+        },
         format!(
             "in [{}] out [{}] events in/out {}/{}",
             describe(&layout.audio_inputs),
@@ -213,17 +242,28 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
     );
 
     let params = instance.params();
-    let readable = params.iter().filter(|p| instance.param_value(p.id).is_some()).count();
+    let readable = params
+        .iter()
+        .filter(|p| instance.param_value(p.id).is_some())
+        .count();
     let unique: std::collections::HashSet<u32> = params.iter().map(|p| p.id).collect();
     let params_ok = readable == params.len() && unique.len() == params.len();
     report.add(
         "parameters",
-        if params_ok { Verdict::Pass } else { Verdict::Fail },
+        if params_ok {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
         format!(
             "{} parameters, {} automatable{}",
             params.len(),
             params.iter().filter(|p| p.flags.automatable).count(),
-            if unique.len() != params.len() { ", DUPLICATE IDS" } else { "" }
+            if unique.len() != params.len() {
+                ", DUPLICATE IDS"
+            } else {
+                ""
+            }
         ),
     );
 
@@ -242,7 +282,11 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
     report.add(
         "editor",
         Verdict::Info,
-        if instance.has_editor() { "has an editor (not opened by this check)" } else { "none" },
+        if instance.has_editor() {
+            "has an editor (not opened by this check)"
+        } else {
+            "none"
+        },
     );
 
     let config = ActivateConfig {
@@ -271,26 +315,41 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
     }
     report.add(
         "process idle",
-        if driver.failed_blocks == 0 && !driver.non_finite { Verdict::Pass } else { Verdict::Fail },
+        if driver.failed_blocks == 0 && !driver.non_finite {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
         format!("16 blocks, {} failed", driver.failed_blocks),
     );
 
     // Make it do its job.
     let is_instrument = descriptor.kind == PluginKind::Instrument || layout.event_inputs > 0;
     if is_instrument {
-        let notes =
-            [Event::note_on(0, 0, 60, 0.8), Event::note_on(0, 0, 64, 0.8), Event::note_on(0, 0, 67, 0.8)];
+        let notes = [
+            Event::note_on(0, 0, 60, 0.8),
+            Event::note_on(0, 0, 64, 0.8),
+            Event::note_on(0, 0, 67, 0.8),
+        ];
         let mut peak = driver.block(&notes);
         let mut waited = 1;
         while peak < 1e-5 && waited < options.sound_wait_blocks {
             peak = peak.max(driver.block(&[]));
             waited += 1;
         }
-        let offs = [Event::note_off(0, 0, 60), Event::note_off(0, 0, 64), Event::note_off(0, 0, 67)];
+        let offs = [
+            Event::note_off(0, 0, 60),
+            Event::note_off(0, 0, 64),
+            Event::note_off(0, 0, 67),
+        ];
         driver.block(&offs);
         report.add(
             "sound",
-            if peak >= 1e-5 { Verdict::Pass } else { Verdict::Fail },
+            if peak >= 1e-5 {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
             format!("peak {peak:.4} after {waited} block(s) of a C major triad"),
         );
     } else {
@@ -301,42 +360,78 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
         }
         report.add(
             "sound",
-            if driver.failed_blocks == 0 { Verdict::Pass } else { Verdict::Fail },
+            if driver.failed_blocks == 0 {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
             format!("noise in, peak {peak:.4} out over 32 blocks"),
         );
     }
 
     // Automation: move the first few automatable parameters mid-block and put them back.
-    let automatable: Vec<_> =
-        params.iter().filter(|p| p.flags.automatable && !p.flags.bypass).take(8).collect();
+    let automatable: Vec<_> = params
+        .iter()
+        .filter(|p| p.flags.automatable && !p.flags.bypass)
+        .take(8)
+        .collect();
     if automatable.is_empty() {
         report.add("automation", Verdict::Skip, "no automatable parameters");
     } else {
         let half = options.block / 2;
         for param in &automatable {
-            driver.block(&[Event::param(0, param.id, 0.0), Event::param(half, param.id, 1.0)]);
+            driver.block(&[
+                Event::param(0, param.id, 0.0),
+                Event::param(half, param.id, 1.0),
+            ]);
             driver.block(&[Event::param(0, param.id, param.default)]);
         }
         report.add(
             "automation",
-            if driver.failed_blocks == 0 && !driver.non_finite { Verdict::Pass } else { Verdict::Fail },
-            format!("swept {} parameter(s) with sample offsets", automatable.len()),
+            if driver.failed_blocks == 0 && !driver.non_finite {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            format!(
+                "swept {} parameter(s) with sample offsets",
+                automatable.len()
+            ),
         );
     }
 
     report.add(
         "output is finite",
-        if driver.non_finite { Verdict::Fail } else { Verdict::Pass },
-        if driver.non_finite { "NaN or infinity in the output" } else { "" },
+        if driver.non_finite {
+            Verdict::Fail
+        } else {
+            Verdict::Pass
+        },
+        if driver.non_finite {
+            "NaN or infinity in the output"
+        } else {
+            ""
+        },
     );
     if riddim_rt::guard::allocator_installed() {
         report.add(
             "host rt-safety",
-            if driver.rt_violations == 0 { Verdict::Pass } else { Verdict::Fail },
-            format!("{} heap operation(s) on the host side of process", driver.rt_violations),
+            if driver.rt_violations == 0 {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            format!(
+                "{} heap operation(s) on the host side of process",
+                driver.rt_violations
+            ),
         );
     } else {
-        report.add("host rt-safety", Verdict::Skip, "the checking allocator is not installed");
+        report.add(
+            "host rt-safety",
+            Verdict::Skip,
+            "the checking allocator is not installed",
+        );
     }
     instance.deactivate(driver.processor);
 
@@ -344,7 +439,11 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
     match instance.save_state() {
         Err(e) => report.add("state save", Verdict::Fail, e.to_string()),
         Ok(saved) => {
-            report.add("state save", Verdict::Pass, format!("{} bytes", saved.data.len()));
+            report.add(
+                "state save",
+                Verdict::Pass,
+                format!("{} bytes", saved.data.len()),
+            );
             match instantiate(descriptor) {
                 Err(e) => report.add("state restore", Verdict::Fail, e.to_string()),
                 Ok(mut second) => match second.restore_state(&saved) {
@@ -383,7 +482,11 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
     }
 
     // Reactivate at another rate and block size, as a device change would.
-    let other = ActivateConfig { sample_rate: 44_100.0, max_block: 512, mode: ProcessMode::Realtime };
+    let other = ActivateConfig {
+        sample_rate: 44_100.0,
+        max_block: 512,
+        mode: ProcessMode::Realtime,
+    };
     match Driver::new(instance.as_mut(), &other) {
         Err(e) => report.add("reactivate", Verdict::Fail, e.to_string()),
         Ok(mut driver) => {
@@ -392,7 +495,11 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
             }
             report.add(
                 "reactivate",
-                if driver.failed_blocks == 0 && !driver.non_finite { Verdict::Pass } else { Verdict::Fail },
+                if driver.failed_blocks == 0 && !driver.non_finite {
+                    Verdict::Pass
+                } else {
+                    Verdict::Fail
+                },
                 "44100 Hz, 512 frames",
             );
             instance.deactivate(driver.processor);
@@ -401,6 +508,10 @@ pub fn run(descriptor: &PluginDescriptor, options: &Options) -> Report {
 
     let mut pending = Vec::new();
     instance.poll_events(&mut pending);
-    report.add("notifications", Verdict::Info, format!("{} pending at the end", pending.len()));
+    report.add(
+        "notifications",
+        Verdict::Info,
+        format!("{} pending at the end", pending.len()),
+    );
     report
 }

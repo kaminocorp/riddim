@@ -6,7 +6,11 @@ use vst3::Steinberg::{char16, TUID};
 
 /// Reads a NUL-terminated 8-bit string out of a fixed array (lossy for non-UTF-8 bytes).
 pub fn from_char8(chars: &[c_char]) -> String {
-    let bytes: Vec<u8> = chars.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    let bytes: Vec<u8> = chars
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 

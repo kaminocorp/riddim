@@ -12,8 +12,18 @@ pub struct Event {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EventBody {
     /// `velocity` is 0..=1. `note_id` is -1 when the sender does not track note identities.
-    NoteOn { channel: u8, key: u8, velocity: f32, note_id: i32 },
-    NoteOff { channel: u8, key: u8, velocity: f32, note_id: i32 },
+    NoteOn {
+        channel: u8,
+        key: u8,
+        velocity: f32,
+        note_id: i32,
+    },
+    NoteOff {
+        channel: u8,
+        key: u8,
+        velocity: f32,
+        note_id: i32,
+    },
     /// Any other channel-voice MIDI message (controllers, pitch bend, pressure, program change),
     /// as raw status and data bytes. `len` is 2 or 3.
     Midi { data: [u8; 3], len: u8 },
@@ -24,15 +34,34 @@ pub enum EventBody {
 
 impl Event {
     pub fn note_on(offset: u32, channel: u8, key: u8, velocity: f32) -> Self {
-        Event { offset, body: EventBody::NoteOn { channel, key, velocity, note_id: -1 } }
+        Event {
+            offset,
+            body: EventBody::NoteOn {
+                channel,
+                key,
+                velocity,
+                note_id: -1,
+            },
+        }
     }
 
     pub fn note_off(offset: u32, channel: u8, key: u8) -> Self {
-        Event { offset, body: EventBody::NoteOff { channel, key, velocity: 0.0, note_id: -1 } }
+        Event {
+            offset,
+            body: EventBody::NoteOff {
+                channel,
+                key,
+                velocity: 0.0,
+                note_id: -1,
+            },
+        }
     }
 
     pub fn param(offset: u32, id: u32, value: f64) -> Self {
-        Event { offset, body: EventBody::Param { id, value } }
+        Event {
+            offset,
+            body: EventBody::Param { id, value },
+        }
     }
 
     /// Builds an event from a raw channel-voice MIDI message. Note-on with velocity 0 becomes a
@@ -51,14 +80,28 @@ impl Event {
         let d1 = bytes[1] & 0x7F;
         let d2 = if needed == 3 { bytes[2] & 0x7F } else { 0 };
         let body = match kind {
-            0x90 if d2 > 0 => {
-                EventBody::NoteOn { channel, key: d1, velocity: d2 as f32 / 127.0, note_id: -1 }
-            }
-            0x90 => EventBody::NoteOff { channel, key: d1, velocity: 0.0, note_id: -1 },
-            0x80 => {
-                EventBody::NoteOff { channel, key: d1, velocity: d2 as f32 / 127.0, note_id: -1 }
-            }
-            _ => EventBody::Midi { data: [status, d1, d2], len: needed as u8 },
+            0x90 if d2 > 0 => EventBody::NoteOn {
+                channel,
+                key: d1,
+                velocity: d2 as f32 / 127.0,
+                note_id: -1,
+            },
+            0x90 => EventBody::NoteOff {
+                channel,
+                key: d1,
+                velocity: 0.0,
+                note_id: -1,
+            },
+            0x80 => EventBody::NoteOff {
+                channel,
+                key: d1,
+                velocity: d2 as f32 / 127.0,
+                note_id: -1,
+            },
+            _ => EventBody::Midi {
+                data: [status, d1, d2],
+                len: needed as u8,
+            },
         };
         Some(Event { offset, body })
     }
@@ -67,12 +110,21 @@ impl Event {
     pub fn to_midi(&self) -> Option<([u8; 3], usize)> {
         let vel = |v: f32| (v.clamp(0.0, 1.0) * 127.0).round() as u8;
         match self.body {
-            EventBody::NoteOn { channel, key, velocity, .. } => {
-                Some(([0x90 | (channel & 0x0F), key & 0x7F, vel(velocity).max(1)], 3))
-            }
-            EventBody::NoteOff { channel, key, velocity, .. } => {
-                Some(([0x80 | (channel & 0x0F), key & 0x7F, vel(velocity)], 3))
-            }
+            EventBody::NoteOn {
+                channel,
+                key,
+                velocity,
+                ..
+            } => Some((
+                [0x90 | (channel & 0x0F), key & 0x7F, vel(velocity).max(1)],
+                3,
+            )),
+            EventBody::NoteOff {
+                channel,
+                key,
+                velocity,
+                ..
+            } => Some(([0x80 | (channel & 0x0F), key & 0x7F, vel(velocity)], 3)),
             EventBody::Midi { data, len } => Some((data, len as usize)),
             EventBody::Param { .. } => None,
         }
@@ -90,7 +142,10 @@ pub struct EventBuffer {
 impl EventBuffer {
     /// Allocates room for `capacity` events. Call off the audio thread.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { events: Vec::with_capacity(capacity), dropped: 0 }
+        Self {
+            events: Vec::with_capacity(capacity),
+            dropped: 0,
+        }
     }
 
     #[inline]
@@ -156,11 +211,25 @@ mod tests {
     #[test]
     fn midi_round_trip() {
         let on = Event::from_midi(3, &[0x91, 60, 100]).unwrap();
-        assert!(matches!(on.body, EventBody::NoteOn { channel: 1, key: 60, .. }));
+        assert!(matches!(
+            on.body,
+            EventBody::NoteOn {
+                channel: 1,
+                key: 60,
+                ..
+            }
+        ));
         assert_eq!(on.to_midi().unwrap(), ([0x91, 60, 100], 3));
 
         let off = Event::from_midi(0, &[0x90, 60, 0]).unwrap();
-        assert!(matches!(off.body, EventBody::NoteOff { channel: 0, key: 60, .. }));
+        assert!(matches!(
+            off.body,
+            EventBody::NoteOff {
+                channel: 0,
+                key: 60,
+                ..
+            }
+        ));
 
         let cc = Event::from_midi(0, &[0xB0, 64, 127]).unwrap();
         assert_eq!(cc.to_midi().unwrap(), ([0xB0, 64, 127], 3));

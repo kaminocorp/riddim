@@ -9,6 +9,7 @@ pub mod atomic;
 pub mod denormal;
 pub mod garbage;
 pub mod guard;
+pub mod planar;
 pub mod smooth;
 
 /// Wait-free single-producer single-consumer ring buffer (re-export of `rtrb`).

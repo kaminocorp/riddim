@@ -50,6 +50,11 @@ fn fixture_libraries() -> &'static Vec<(String, PathBuf)> {
             "riddim-testplug",
             "-p",
             "riddim-crashplug",
+            "-p",
+            "riddim-plugin",
+            "--bin",
+            "riddim-scan",
+            "--lib",
         ]);
         if !cfg!(debug_assertions) {
             command.arg("--release");
@@ -69,6 +74,12 @@ fn fixture_libraries() -> &'static Vec<(String, PathBuf)> {
                 continue;
             };
             if message["reason"] != "compiler-artifact" {
+                continue;
+            }
+            if message["target"]["name"] == "riddim-scan" {
+                if let Some(executable) = message["executable"].as_str() {
+                    libraries.push(("riddim-scan".to_string(), PathBuf::from(executable)));
+                }
                 continue;
             }
             let is_cdylib = message["target"]["kind"]
@@ -153,6 +164,15 @@ fn write_if_changed(path: &Path, bytes: &[u8]) {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, bytes).unwrap();
     std::fs::rename(&tmp, path).unwrap();
+}
+
+/// The scanner child-process executable, built on demand.
+pub fn scanner_exe() -> PathBuf {
+    fixture_libraries()
+        .iter()
+        .find(|(name, _)| name == "riddim-scan")
+        .map(|(_, path)| path.clone())
+        .expect("cargo did not report the riddim-scan executable")
 }
 
 /// The bundle holding the test synth, delay and gain plugins.

@@ -1,0 +1,110 @@
+//! Turning what the user typed into a plugin descriptor.
+
+use std::path::{Path, PathBuf};
+
+use riddim_plugin::scan::{default_targets, ScanOutcome, ScanTarget, Scanner};
+use riddim_plugin::{PluginDescriptor, PluginFormat, PluginId, PluginKind};
+
+/// Scans one bundle out of process.
+pub fn scan_bundle(scanner: &Scanner, path: &Path) -> Result<Vec<PluginDescriptor>, String> {
+    let target = ScanTarget {
+        format: PluginFormat::Vst3,
+        path: Some(path.to_path_buf()),
+    };
+    match scanner.scan(&target) {
+        ScanOutcome::Ok(plugins) => Ok(plugins),
+        ScanOutcome::Failed(why) => Err(format!("{}: {why}", path.display())),
+        ScanOutcome::Crashed(why) => {
+            Err(format!("{}: the scanner crashed ({why})", path.display()))
+        }
+        ScanOutcome::TimedOut => Err(format!("{}: the scanner timed out", path.display())),
+    }
+}
+
+/// Scans everything in the default locations plus `extra_dirs`, reporting failures on stderr.
+pub fn scan_everything(scanner: &Scanner, extra_dirs: &[PathBuf]) -> Vec<PluginDescriptor> {
+    let targets = default_targets(extra_dirs);
+    let report = scanner.scan_all(&targets, |_, _| {});
+    for (target, outcome) in &report.failures {
+        let what = target
+            .path
+            .as_ref()
+            .map_or_else(|| target.format.to_string(), |p| p.display().to_string());
+        eprintln!("warning: {what} did not scan: {outcome:?}");
+    }
+    report.plugins
+}
+
+/// Finds the plugin the user means.
+///
+/// `spec` may be:
+/// * a path to a `.vst3` bundle, optionally followed by `#name` to pick one plugin from it;
+/// * a full id such as `vst3:<32 hex digits>` or `au:aumu:dls :appl`;
+/// * part of a plugin name (case-insensitive), which must match exactly one scanned plugin.
+pub fn resolve(
+    spec: &str,
+    scanner: &Scanner,
+    extra_dirs: &[PathBuf],
+) -> Result<PluginDescriptor, String> {
+    let (path_part, pick) = match spec.split_once('#') {
+        Some((path, pick)) => (path, Some(pick)),
+        None => (spec, None),
+    };
+    if Path::new(path_part).exists() {
+        let plugins = scan_bundle(scanner, Path::new(path_part))?;
+        return pick_one(plugins, pick.unwrap_or(""), spec);
+    }
+
+    if let Ok(id) = spec.parse::<PluginId>() {
+        if id.format == PluginFormat::AudioUnit {
+            // Audio Units are looked up in the system registry at instantiation; no scan needed.
+            return Ok(PluginDescriptor {
+                id,
+                name: spec.to_string(),
+                vendor: String::new(),
+                version: String::new(),
+                kind: if spec.starts_with("au:aumu") {
+                    PluginKind::Instrument
+                } else {
+                    PluginKind::Effect
+                },
+                categories: Vec::new(),
+                path: None,
+            });
+        }
+        return scan_everything(scanner, extra_dirs)
+            .into_iter()
+            .find(|d| d.id == id)
+            .ok_or_else(|| format!("no installed plugin has the id {id}"));
+    }
+
+    pick_one(scan_everything(scanner, extra_dirs), spec, spec)
+}
+
+fn pick_one(
+    plugins: Vec<PluginDescriptor>,
+    needle: &str,
+    spec: &str,
+) -> Result<PluginDescriptor, String> {
+    let needle = needle.to_lowercase();
+    let mut matches: Vec<PluginDescriptor> = plugins
+        .into_iter()
+        .filter(|d| d.name.to_lowercase().contains(&needle))
+        .collect();
+    // An exact name beats a substring.
+    if let Some(exact) = matches.iter().position(|d| d.name.to_lowercase() == needle) {
+        return Ok(matches.swap_remove(exact));
+    }
+    match matches.len() {
+        0 => Err(format!("no plugin matches '{spec}'")),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            let mut message = format!("'{spec}' is ambiguous; it matches:\n");
+            for d in &matches {
+                message.push_str(&format!("  {}  ({})\n", d.name, d.id));
+            }
+            message.push_str("use the id, or path#name, to pick one");
+            Err(message)
+        }
+    }
+}

@@ -62,10 +62,17 @@ pub enum Tail {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PluginEvent {
     /// The user grabbed a control in the plugin's editor.
-    ParamGestureBegin { id: ParamId },
+    ParamGestureBegin {
+        id: ParamId,
+    },
     /// The editor changed a parameter. The host must forward the value to the processor.
-    ParamChanged { id: ParamId, value: f64 },
-    ParamGestureEnd { id: ParamId },
+    ParamChanged {
+        id: ParamId,
+        value: f64,
+    },
+    ParamGestureEnd {
+        id: ParamId,
+    },
     /// Several parameter values changed at once (a preset load, say); re-read what you cache.
     ParamValuesChanged,
     /// Parameter names, ranges or the list itself changed.
@@ -80,7 +87,10 @@ pub enum PluginEvent {
     StateDirty,
     /// The editor wants this size (in points). The window host answers with
     /// [`PluginInstance::set_editor_size`].
-    EditorResizeRequest { width: u32, height: u32 },
+    EditorResizeRequest {
+        width: u32,
+        height: u32,
+    },
 }
 
 /// Editor size in points.

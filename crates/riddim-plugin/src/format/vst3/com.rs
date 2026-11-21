@@ -14,13 +14,14 @@ use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
 use vst3::Steinberg::Vst::{
-    IAttributeList, IAttributeListTrait, IAttributeList_::AttrID, IComponentHandler, IComponentHandler2,
-    IComponentHandler2Trait, IComponentHandlerTrait, IEventList, IEventListTrait, IHostApplication,
-    IHostApplicationTrait, IMessage, IMessageTrait, IParamValueQueue, IParamValueQueueTrait,
-    IParameterChanges, IParameterChangesTrait, ParamID, ParamValue, String128, TChar,
+    IAttributeList, IAttributeListTrait, IAttributeList_::AttrID, IComponentHandler,
+    IComponentHandler2, IComponentHandler2Trait, IComponentHandlerTrait, IEventList,
+    IEventListTrait, IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait,
+    IParamValueQueue, IParamValueQueueTrait, IParameterChanges, IParameterChangesTrait, ParamID,
+    ParamValue, String128, TChar,
 };
 use vst3::Steinberg::{
-    kInvalidArgument, kNoInterface, kResultFalse, kResultOk, kResultTrue, int32, int64, tresult,
+    int32, int64, kInvalidArgument, kNoInterface, kResultFalse, kResultOk, kResultTrue, tresult,
     uint32, FIDString, IBStream, IBStreamTrait, IPlugFrame, IPlugFrameTrait, IPlugView, TBool,
     ViewRect, TUID,
 };
@@ -41,7 +42,10 @@ pub struct MemoryStream {
 
 impl MemoryStream {
     pub fn new(data: Vec<u8>) -> ComWrapper<MemoryStream> {
-        ComWrapper::new(MemoryStream { data: RefCell::new(data), pos: Cell::new(0) })
+        ComWrapper::new(MemoryStream {
+            data: RefCell::new(data),
+            pos: Cell::new(0),
+        })
     }
 
     pub fn empty() -> ComWrapper<MemoryStream> {
@@ -145,7 +149,9 @@ pub struct HostApplication {
 
 impl HostApplication {
     pub fn new(name: &str) -> ComWrapper<HostApplication> {
-        ComWrapper::new(HostApplication { name: name.to_string() })
+        ComWrapper::new(HostApplication {
+            name: name.to_string(),
+        })
     }
 }
 
@@ -183,7 +189,9 @@ impl IHostApplicationTrait for HostApplication {
                 return kResultOk;
             }
             if *cid == IAttributeList::IID && *iid == IAttributeList::IID {
-                let list = HostAttributeList::new().to_com_ptr::<IAttributeList>().unwrap();
+                let list = HostAttributeList::new()
+                    .to_com_ptr::<IAttributeList>()
+                    .unwrap();
                 *obj = list.into_raw() as *mut c_void;
                 return kResultOk;
             }
@@ -200,7 +208,10 @@ pub struct HostMessage {
 
 impl HostMessage {
     pub fn new() -> ComWrapper<HostMessage> {
-        ComWrapper::new(HostMessage { id: RefCell::new(None), attributes: HostAttributeList::new() })
+        ComWrapper::new(HostMessage {
+            id: RefCell::new(None),
+            attributes: HostAttributeList::new(),
+        })
     }
 }
 
@@ -229,7 +240,10 @@ impl IMessageTrait for HostMessage {
 
     unsafe fn getAttributes(&self) -> *mut IAttributeList {
         // Borrowed pointer: the SDK's own HostMessage does not add a reference here either.
-        self.attributes.as_com_ref::<IAttributeList>().unwrap().as_ptr()
+        self.attributes
+            .as_com_ref::<IAttributeList>()
+            .unwrap()
+            .as_ptr()
     }
 }
 
@@ -247,7 +261,9 @@ pub struct HostAttributeList {
 
 impl HostAttributeList {
     pub fn new() -> ComWrapper<HostAttributeList> {
-        ComWrapper::new(HostAttributeList { values: RefCell::new(HashMap::new()) })
+        ComWrapper::new(HostAttributeList {
+            values: RefCell::new(HashMap::new()),
+        })
     }
 
     unsafe fn key(id: AttrID) -> Option<Vec<u8>> {
@@ -266,13 +282,17 @@ impl Class for HostAttributeList {
 
 impl IAttributeListTrait for HostAttributeList {
     unsafe fn setInt(&self, id: AttrID, value: int64) -> tresult {
-        let Some(key) = (unsafe { Self::key(id) }) else { return kInvalidArgument };
+        let Some(key) = (unsafe { Self::key(id) }) else {
+            return kInvalidArgument;
+        };
         self.values.borrow_mut().insert(key, AttrValue::Int(value));
         kResultTrue
     }
 
     unsafe fn getInt(&self, id: AttrID, value: *mut int64) -> tresult {
-        let Some(key) = (unsafe { Self::key(id) }) else { return kInvalidArgument };
+        let Some(key) = (unsafe { Self::key(id) }) else {
+            return kInvalidArgument;
+        };
         match self.values.borrow().get(&key) {
             Some(AttrValue::Int(v)) if !value.is_null() => {
                 // SAFETY: checked non-null.
@@ -284,13 +304,19 @@ impl IAttributeListTrait for HostAttributeList {
     }
 
     unsafe fn setFloat(&self, id: AttrID, value: f64) -> tresult {
-        let Some(key) = (unsafe { Self::key(id) }) else { return kInvalidArgument };
-        self.values.borrow_mut().insert(key, AttrValue::Float(value));
+        let Some(key) = (unsafe { Self::key(id) }) else {
+            return kInvalidArgument;
+        };
+        self.values
+            .borrow_mut()
+            .insert(key, AttrValue::Float(value));
         kResultTrue
     }
 
     unsafe fn getFloat(&self, id: AttrID, value: *mut f64) -> tresult {
-        let Some(key) = (unsafe { Self::key(id) }) else { return kInvalidArgument };
+        let Some(key) = (unsafe { Self::key(id) }) else {
+            return kInvalidArgument;
+        };
         match self.values.borrow().get(&key) {
             Some(AttrValue::Float(v)) if !value.is_null() => {
                 // SAFETY: checked non-null.
@@ -302,7 +328,9 @@ impl IAttributeListTrait for HostAttributeList {
     }
 
     unsafe fn setString(&self, id: AttrID, string: *const TChar) -> tresult {
-        let Some(key) = (unsafe { Self::key(id) }) else { return kInvalidArgument };
+        let Some(key) = (unsafe { Self::key(id) }) else {
+            return kInvalidArgument;
+        };
         if string.is_null() {
             return kInvalidArgument;
         }
@@ -316,12 +344,16 @@ impl IAttributeListTrait for HostAttributeList {
             }
         }
         units.push(0);
-        self.values.borrow_mut().insert(key, AttrValue::String(units));
+        self.values
+            .borrow_mut()
+            .insert(key, AttrValue::String(units));
         kResultTrue
     }
 
     unsafe fn getString(&self, id: AttrID, string: *mut TChar, size_in_bytes: uint32) -> tresult {
-        let Some(key) = (unsafe { Self::key(id) }) else { return kInvalidArgument };
+        let Some(key) = (unsafe { Self::key(id) }) else {
+            return kInvalidArgument;
+        };
         let capacity = size_in_bytes as usize / std::mem::size_of::<TChar>();
         if string.is_null() || capacity == 0 {
             return kInvalidArgument;
@@ -341,14 +373,19 @@ impl IAttributeListTrait for HostAttributeList {
     }
 
     unsafe fn setBinary(&self, id: AttrID, data: *const c_void, size_in_bytes: uint32) -> tresult {
-        let Some(key) = (unsafe { Self::key(id) }) else { return kInvalidArgument };
+        let Some(key) = (unsafe { Self::key(id) }) else {
+            return kInvalidArgument;
+        };
         let bytes = if data.is_null() || size_in_bytes == 0 {
             Vec::new()
         } else {
             // SAFETY: the plugin promises `data` holds `size_in_bytes` readable bytes.
-            unsafe { std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize) }.to_vec()
+            unsafe { std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize) }
+                .to_vec()
         };
-        self.values.borrow_mut().insert(key, AttrValue::Binary(bytes));
+        self.values
+            .borrow_mut()
+            .insert(key, AttrValue::Binary(bytes));
         kResultTrue
     }
 
@@ -358,7 +395,9 @@ impl IAttributeListTrait for HostAttributeList {
         data: *mut *const c_void,
         size_in_bytes: *mut uint32,
     ) -> tresult {
-        let Some(key) = (unsafe { Self::key(id) }) else { return kInvalidArgument };
+        let Some(key) = (unsafe { Self::key(id) }) else {
+            return kInvalidArgument;
+        };
         if data.is_null() || size_in_bytes.is_null() {
             return kInvalidArgument;
         }
@@ -428,12 +467,14 @@ impl Class for ComponentHandler {
 
 impl IComponentHandlerTrait for ComponentHandler {
     unsafe fn beginEdit(&self, id: ParamID) -> tresult {
-        self.notifications.push(PluginEvent::ParamGestureBegin { id });
+        self.notifications
+            .push(PluginEvent::ParamGestureBegin { id });
         kResultOk
     }
 
     unsafe fn performEdit(&self, id: ParamID, value: ParamValue) -> tresult {
-        self.notifications.push(PluginEvent::ParamChanged { id, value });
+        self.notifications
+            .push(PluginEvent::ParamChanged { id, value });
         kResultOk
     }
 
@@ -443,7 +484,9 @@ impl IComponentHandlerTrait for ComponentHandler {
     }
 
     unsafe fn restartComponent(&self, flags: int32) -> tresult {
-        self.notifications.restart_flags.fetch_or(flags, std::sync::atomic::Ordering::AcqRel);
+        self.notifications
+            .restart_flags
+            .fetch_or(flags, std::sync::atomic::Ordering::AcqRel);
         kResultOk
     }
 }
@@ -493,7 +536,8 @@ impl IPlugFrameTrait for PlugFrame {
         let rect = unsafe { *new_size };
         let width = (rect.right - rect.left).max(0) as u32;
         let height = (rect.bottom - rect.top).max(0) as u32;
-        self.notifications.push(PluginEvent::EditorResizeRequest { width, height });
+        self.notifications
+            .push(PluginEvent::EditorResizeRequest { width, height });
         kResultTrue
     }
 }
@@ -516,7 +560,9 @@ unsafe impl Sync for EventList {}
 
 impl EventList {
     pub fn with_capacity(capacity: usize) -> ComWrapper<EventList> {
-        ComWrapper::new(EventList { events: UnsafeCell::new(Vec::with_capacity(capacity)) })
+        ComWrapper::new(EventList {
+            events: UnsafeCell::new(Vec::with_capacity(capacity)),
+        })
     }
 
     /// # Safety
@@ -607,7 +653,10 @@ impl ParamValueQueue {
             points[last] = (points[last].0.max(offset), value);
             return last;
         }
-        let at = points.iter().position(|p| p.0 > offset).unwrap_or(points.len());
+        let at = points
+            .iter()
+            .position(|p| p.0 > offset)
+            .unwrap_or(points.len());
         points.insert(at, (offset, value));
         at
     }
@@ -741,7 +790,10 @@ impl IParameterChangesTrait for ParamChanges {
             return std::ptr::null_mut();
         }
         // Borrowed pointer, as the SDK's ParameterChanges returns.
-        self.queues[index as usize].as_com_ref::<IParamValueQueue>().unwrap().as_ptr()
+        self.queues[index as usize]
+            .as_com_ref::<IParamValueQueue>()
+            .unwrap()
+            .as_ptr()
     }
 
     unsafe fn addParameterData(

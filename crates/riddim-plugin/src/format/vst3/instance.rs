@@ -107,7 +107,8 @@ impl Vst3Instance {
         if controller.is_none() {
             let mut controller_cid: TUID = [0; 16];
             // SAFETY: valid out-pointer to a 16-byte id.
-            let has_cid = unsafe { component.getControllerClassId(&mut controller_cid) } == kResultOk;
+            let has_cid =
+                unsafe { component.getControllerClassId(&mut controller_cid) } == kResultOk;
             if has_cid {
                 if let Some(c) = module.create_instance::<IEditController>(&controller_cid) {
                     // SAFETY: as for the component.
@@ -162,7 +163,9 @@ impl Vst3Instance {
 
     /// Hands the component's state to the controller so both halves agree.
     fn sync_controller_to_component(&mut self) {
-        let Some(controller) = &self.controller else { return };
+        let Some(controller) = &self.controller else {
+            return;
+        };
         if !self.controller_is_separate {
             return;
         }
@@ -183,7 +186,11 @@ impl Vst3Instance {
         unsafe {
             for index in 0..self.component.getBusCount(MEDIA_AUDIO, direction) {
                 let mut info: VstBusInfo = std::mem::zeroed();
-                if self.component.getBusInfo(MEDIA_AUDIO, direction, index, &mut info) != kResultOk {
+                if self
+                    .component
+                    .getBusInfo(MEDIA_AUDIO, direction, index, &mut info)
+                    != kResultOk
+                {
                     continue;
                 }
                 let is_main = info.busType as i32 == BUS_TYPE_MAIN;
@@ -215,10 +222,18 @@ impl Vst3Instance {
             event_outputs,
         };
         // Keep the user's activation choices across a re-read.
-        for (new, old) in layout.audio_inputs.iter_mut().zip(&self.layout.audio_inputs) {
+        for (new, old) in layout
+            .audio_inputs
+            .iter_mut()
+            .zip(&self.layout.audio_inputs)
+        {
             new.active = old.active;
         }
-        for (new, old) in layout.audio_outputs.iter_mut().zip(&self.layout.audio_outputs) {
+        for (new, old) in layout
+            .audio_outputs
+            .iter_mut()
+            .zip(&self.layout.audio_outputs)
+        {
             new.active = old.active;
         }
         layout
@@ -232,7 +247,8 @@ impl Vst3Instance {
                 (0..count)
                     .map(|i| {
                         let mut arr: SpeakerArrangement = 0;
-                        self.processor.getBusArrangement(direction, i as i32, &mut arr);
+                        self.processor
+                            .getBusArrangement(direction, i as i32, &mut arr);
                         arr
                     })
                     .collect()
@@ -248,16 +264,20 @@ impl Vst3Instance {
                 outs.len() as i32,
             );
             for (i, bus) in self.layout.audio_inputs.iter().enumerate() {
-                self.component.activateBus(MEDIA_AUDIO, DIR_INPUT, i as i32, bus.active as u8);
+                self.component
+                    .activateBus(MEDIA_AUDIO, DIR_INPUT, i as i32, bus.active as u8);
             }
             for (i, bus) in self.layout.audio_outputs.iter().enumerate() {
-                self.component.activateBus(MEDIA_AUDIO, DIR_OUTPUT, i as i32, bus.active as u8);
+                self.component
+                    .activateBus(MEDIA_AUDIO, DIR_OUTPUT, i as i32, bus.active as u8);
             }
             for i in 0..self.layout.event_inputs {
-                self.component.activateBus(MEDIA_EVENT, DIR_INPUT, i as i32, 1);
+                self.component
+                    .activateBus(MEDIA_EVENT, DIR_INPUT, i as i32, 1);
             }
             for i in 0..self.layout.event_outputs {
-                self.component.activateBus(MEDIA_EVENT, DIR_OUTPUT, i as i32, 1);
+                self.component
+                    .activateBus(MEDIA_EVENT, DIR_OUTPUT, i as i32, 1);
             }
         }
         // Channel counts can change once arrangements are applied.
@@ -267,7 +287,11 @@ impl Vst3Instance {
     /// Re-reads which MIDI controllers the plugin maps to parameters.
     fn refresh_midi_map(&self) {
         self.midi_map.clear();
-        let Some(mapping) = self.controller.as_ref().and_then(|c| c.cast::<IMidiMapping>()) else {
+        let Some(mapping) = self
+            .controller
+            .as_ref()
+            .and_then(|c| c.cast::<IMidiMapping>())
+        else {
             return;
         };
         for channel in 0..MidiMap::CHANNELS {
@@ -275,7 +299,12 @@ impl Vst3Instance {
                 let mut id: ParamID = 0;
                 // SAFETY: valid out-pointer.
                 let mapped = unsafe {
-                    mapping.getMidiControllerAssignment(0, channel as i16, controller as i16, &mut id)
+                    mapping.getMidiControllerAssignment(
+                        0,
+                        channel as i16,
+                        controller as i16,
+                        &mut id,
+                    )
                 } == kResultTrue;
                 if mapped {
                     self.midi_map.set(channel, controller, Some(id));
@@ -310,7 +339,9 @@ impl PluginInstance for Vst3Instance {
         active: bool,
     ) -> Result<()> {
         if self.active {
-            return Err(PluginError::InvalidState("buses can only change while inactive"));
+            return Err(PluginError::InvalidState(
+                "buses can only change while inactive",
+            ));
         }
         let buses = match direction {
             BusDirection::Input => &mut self.layout.audio_inputs,
@@ -388,7 +419,9 @@ impl PluginInstance for Vst3Instance {
     }
 
     fn params(&self) -> Vec<ParamInfo> {
-        let Some(controller) = &self.controller else { return Vec::new() };
+        let Some(controller) = &self.controller else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         // SAFETY: valid out-pointer to a zero-initialised POD struct.
         unsafe {
@@ -444,7 +477,8 @@ impl PluginInstance for Vst3Instance {
         let controller = match &self.controller {
             Some(c) if self.controller_is_separate => {
                 // A controller with nothing of its own to save is normal.
-                self.stream_state(|s| unsafe { c.getState(s) }).unwrap_or_default()
+                self.stream_state(|s| unsafe { c.getState(s) })
+                    .unwrap_or_default()
             }
             _ => Vec::new(),
         };
@@ -460,7 +494,10 @@ impl PluginInstance for Vst3Instance {
 
     fn restore_state(&mut self, state: &StateBlob) -> Result<()> {
         state.expect_plugin(&self.descriptor.id)?;
-        let mut r = Reader { bytes: &state.data, pos: 0 };
+        let mut r = Reader {
+            bytes: &state.data,
+            pos: 0,
+        };
         if r.take(4)? != STATE_MAGIC {
             return Err(PluginError::State("not a VST3 state payload".into()));
         }
@@ -544,8 +581,10 @@ impl PluginInstance for Vst3Instance {
         if self.view.is_some() {
             return Err(PluginError::InvalidState("the editor is already open"));
         }
-        let controller =
-            self.controller.as_ref().ok_or(PluginError::Unsupported("this plugin has no editor"))?;
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or(PluginError::Unsupported("this plugin has no editor"))?;
         let (parent_ptr, platform_type): (*mut c_void, &[u8]) = match parent {
             ParentWindow::AppKit(view) => (view.as_ptr(), b"NSView\0"),
             ParentWindow::Win32(hwnd) => (hwnd.as_ptr(), b"HWND\0"),
@@ -562,7 +601,9 @@ impl PluginInstance for Vst3Instance {
             let view = ComPtr::from_raw(controller.createView(c"editor".as_ptr()))
                 .ok_or(PluginError::Unsupported("this plugin has no editor"))?;
             if view.isPlatformTypeSupported(platform_type) != kResultTrue {
-                return Err(PluginError::Unsupported("the editor does not support this window type"));
+                return Err(PluginError::Unsupported(
+                    "the editor does not support this window type",
+                ));
             }
             let frame = self.plug_frame.to_com_ptr::<IPlugFrame>().unwrap();
             view.setFrame(frame.as_ptr());
@@ -573,7 +614,12 @@ impl PluginInstance for Vst3Instance {
                     self.descriptor.name
                 )));
             }
-            let mut rect = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+            let mut rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
             view.getSize(&mut rect);
             self.view = Some(view);
             Ok(EditorSize {
@@ -599,13 +645,22 @@ impl PluginInstance for Vst3Instance {
 
     fn editor_resizable(&self) -> bool {
         // SAFETY: plain query on a live view.
-        self.view.as_ref().is_some_and(|v| unsafe { v.canResize() } == kResultTrue)
+        self.view
+            .as_ref()
+            .is_some_and(|v| unsafe { v.canResize() } == kResultTrue)
     }
 
     fn set_editor_size(&mut self, size: EditorSize) -> Result<EditorSize> {
-        let view = self.view.as_ref().ok_or(PluginError::InvalidState("the editor is not open"))?;
-        let mut rect =
-            ViewRect { left: 0, top: 0, right: size.width as i32, bottom: size.height as i32 };
+        let view = self
+            .view
+            .as_ref()
+            .ok_or(PluginError::InvalidState("the editor is not open"))?;
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: size.width as i32,
+            bottom: size.height as i32,
+        };
         // SAFETY: valid pointer to a local rect; the view is live.
         unsafe {
             if view.canResize() == kResultTrue {

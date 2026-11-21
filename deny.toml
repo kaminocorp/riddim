@@ -1,0 +1,42 @@
+# Dependency policy (vision §6.2): permissive licences only, so the commercial edition stays
+# possible. Any GPL-family dependency would block it, so those are simply not on the list.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # File-level copyleft: fine for unmodified dependencies (vision §6.2).
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Our own crates are AGPL-3.0-only and never published to a registry.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+yanked = "deny"

@@ -6,12 +6,12 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use vst3::Steinberg::kResultOk;
 use vst3::Steinberg::Vst::{
     AudioBusBuffers, AudioBusBuffers__type0, Event as VstEvent, Event__type0, IAudioProcessor,
     IAudioProcessorTrait, IEventList, IParameterChanges, LegacyMIDICCOutEvent, NoteOffEvent,
     NoteOnEvent, PolyPressureEvent, ProcessContext as VstProcessContext, ProcessData,
 };
-use vst3::Steinberg::kResultOk;
 use vst3::{ComPtr, ComWrapper};
 
 use super::com::{EventList, ParamChanges};
@@ -59,7 +59,9 @@ impl MidiMap {
 
     pub fn new() -> Self {
         let table = (0..Self::CHANNELS * Self::CONTROLLERS).map(|_| AtomicU32::new(Self::NONE));
-        Self { table: table.collect() }
+        Self {
+            table: table.collect(),
+        }
     }
 
     pub fn clear(&self) {
@@ -75,7 +77,10 @@ impl MidiMap {
 
     #[inline]
     pub fn get(&self, channel: usize, controller: usize) -> Option<u32> {
-        let id = self.table.get(channel * Self::CONTROLLERS + controller)?.load(Ordering::Relaxed);
+        let id = self
+            .table
+            .get(channel * Self::CONTROLLERS + controller)?
+            .load(Ordering::Relaxed);
         (id != Self::NONE).then_some(id)
     }
 }
@@ -126,7 +131,11 @@ fn slots(buses: &[BusInfo]) -> (Vec<BusSlot>, usize) {
     let slots = buses
         .iter()
         .map(|bus| {
-            let slot = BusSlot { first, channels: bus.channels as usize, active: bus.active };
+            let slot = BusSlot {
+                first,
+                channels: bus.channels as usize,
+                active: bus.active,
+            };
             first += slot.channels;
             slot
         })
@@ -138,7 +147,9 @@ fn empty_bus() -> AudioBusBuffers {
     AudioBusBuffers {
         numChannels: 0,
         silenceFlags: 0,
-        __field0: AudioBusBuffers__type0 { channelBuffers32: std::ptr::null_mut() },
+        __field0: AudioBusBuffers__type0 {
+            channelBuffers32: std::ptr::null_mut(),
+        },
     }
 }
 
@@ -192,28 +203,48 @@ impl Vst3Processor {
         for event in events {
             let offset = event.offset.min(self.max_block.saturating_sub(1) as u32) as i32;
             match event.body {
-                EventBody::NoteOn { channel, key, velocity, note_id } => {
-                    push_event(list, offset, EVENT_NOTE_ON, Event__type0 {
-                        noteOn: NoteOnEvent {
-                            channel: channel as i16,
-                            pitch: key as i16,
-                            tuning: 0.0,
-                            velocity,
-                            length: 0,
-                            noteId: note_id,
+                EventBody::NoteOn {
+                    channel,
+                    key,
+                    velocity,
+                    note_id,
+                } => {
+                    push_event(
+                        list,
+                        offset,
+                        EVENT_NOTE_ON,
+                        Event__type0 {
+                            noteOn: NoteOnEvent {
+                                channel: channel as i16,
+                                pitch: key as i16,
+                                tuning: 0.0,
+                                velocity,
+                                length: 0,
+                                noteId: note_id,
+                            },
                         },
-                    });
+                    );
                 }
-                EventBody::NoteOff { channel, key, velocity, note_id } => {
-                    push_event(list, offset, EVENT_NOTE_OFF, Event__type0 {
-                        noteOff: NoteOffEvent {
-                            channel: channel as i16,
-                            pitch: key as i16,
-                            velocity,
-                            noteId: note_id,
-                            tuning: 0.0,
+                EventBody::NoteOff {
+                    channel,
+                    key,
+                    velocity,
+                    note_id,
+                } => {
+                    push_event(
+                        list,
+                        offset,
+                        EVENT_NOTE_OFF,
+                        Event__type0 {
+                            noteOff: NoteOffEvent {
+                                channel: channel as i16,
+                                pitch: key as i16,
+                                velocity,
+                                noteId: note_id,
+                                tuning: 0.0,
+                            },
                         },
-                    });
+                    );
                 }
                 EventBody::Midi { data, .. } => {
                     let channel = (data[0] & 0x0F) as usize;
@@ -228,14 +259,19 @@ impl Vst3Processor {
                         }
                         0xC0 => Some((CTRL_PROGRAM_CHANGE, data[1] as f64 / 127.0)),
                         0xA0 => {
-                            push_event(list, offset, EVENT_POLY_PRESSURE, Event__type0 {
-                                polyPressure: PolyPressureEvent {
-                                    channel: channel as i16,
-                                    pitch: data[1] as i16,
-                                    pressure: data[2] as f32 / 127.0,
-                                    noteId: -1,
+                            push_event(
+                                list,
+                                offset,
+                                EVENT_POLY_PRESSURE,
+                                Event__type0 {
+                                    polyPressure: PolyPressureEvent {
+                                        channel: channel as i16,
+                                        pitch: data[1] as i16,
+                                        pressure: data[2] as f32 / 127.0,
+                                        noteId: -1,
+                                    },
                                 },
-                            });
+                            );
                             None
                         }
                         _ => None,
@@ -291,7 +327,9 @@ impl Vst3Processor {
         for queue in self.out_params.used() {
             // SAFETY: as above.
             if let Some((offset, value)) = unsafe { queue.last() } {
-                context.events_out.push(Event::param(offset.max(0) as u32, queue.id(), value));
+                context
+                    .events_out
+                    .push(Event::param(offset.max(0) as u32, queue.id(), value));
             }
         }
     }
@@ -377,7 +415,11 @@ impl PluginProcessor for Vst3Processor {
         let mut next = 0;
         for (bus, slot) in self.in_buses.iter_mut().zip(&self.in_slots) {
             for c in 0..slot.channels {
-                let src = if slot.active { context.inputs.get(next) } else { None };
+                let src = if slot.active {
+                    context.inputs.get(next)
+                } else {
+                    None
+                };
                 self.in_ptrs[slot.first + c] = match src {
                     Some(channel) => {
                         next += 1;
@@ -394,7 +436,11 @@ impl PluginProcessor for Vst3Processor {
         let mut next = 0;
         for (bus, slot) in self.out_buses.iter_mut().zip(&self.out_slots) {
             for c in 0..slot.channels {
-                let dst = if slot.active { context.outputs.get_mut(next) } else { None };
+                let dst = if slot.active {
+                    context.outputs.get_mut(next)
+                } else {
+                    None
+                };
                 self.out_ptrs[slot.first + c] = match dst {
                     Some(channel) => {
                         next += 1;
@@ -447,8 +493,7 @@ impl PluginProcessor for Vst3Processor {
         // What the plugin does inside its own process call is outside our real-time guarantee.
         // SAFETY: every pointer in `data` refers to memory that outlives the call, and each
         // channel pointer addresses at least `frames` samples.
-        let result =
-            riddim_rt::guard::permit(|| unsafe { self.processor.process(&mut data) });
+        let result = riddim_rt::guard::permit(|| unsafe { self.processor.process(&mut data) });
 
         if result != kResultOk {
             for channel in context.outputs.iter_mut() {
