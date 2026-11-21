@@ -215,6 +215,13 @@ enum SessionAction {
         /// that plugin.
         #[arg(long)]
         bridged: bool,
+        /// Make this many instrument tracks, each with the instrument, its material and its
+        /// inserts: `--copies 4` with five `--insert`s is four instruments and twenty effects.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        copies: u8,
+        /// Loop the instrument's material, so the project plays for as long as it is left to.
+        #[arg(long)]
+        looped: bool,
     },
     /// Describe a project file.
     Info { project: PathBuf },
@@ -414,6 +421,8 @@ fn main() -> ExitCode {
                 send_effect,
                 fade_in,
                 bridged,
+                copies,
+                looped,
             } => match audio_input.as_deref().map(parse_inputs).transpose() {
                 Ok(audio_input) => session::session_new(
                     &context,
@@ -429,6 +438,8 @@ fn main() -> ExitCode {
                         send_effect,
                         fade_in,
                         bridged,
+                        copies,
+                        looped,
                     },
                 ),
                 Err(message) => Err(message),
