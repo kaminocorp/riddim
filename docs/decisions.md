@@ -60,3 +60,5 @@ These questions have **no recommended default in the vision, so they are not dec
 **D21. The toolchain is pinned** to Rust 1.100.0 in `rust-toolchain.toml`, so CI and every machine build with the same compiler and lints.
 
 **D22. The phase 1 player is a throwaway.** `riddim play` drives one plugin straight to the device from code in `riddim-cli`. It is the vision's "tool, not an engine yet" (§4.5) and is replaced by the engine in phase 2.
+
+**D23. CI is in place but cannot run; checks are run locally and recorded.** As of 2026-11-21 GitHub refuses to start any Actions job on this repository ("recent account payments have failed or your spending limit needs to be increased"). That is an account matter only Phil can resolve. Until then every push is checked with `scripts/ci.sh`, which runs what the workflow runs, and each phase's notes record the result. When billing is fixed, re-run the failed workflow runs on the open pull requests; the macOS run is started by adding the `mac-ci` label (D12).
