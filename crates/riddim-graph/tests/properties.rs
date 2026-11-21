@@ -83,9 +83,10 @@ proptest! {
         for step in &plan.steps {
             for (port, output) in step.outputs.iter().enumerate() {
                 prop_assert_eq!(output.channels, spec.nodes[step.node].outputs[port]);
-                for buffer in output.first_buffer..output.first_buffer + output.channels as usize {
-                    prop_assert!(!owned[buffer], "buffer {} has two owners", buffer);
-                    owned[buffer] = true;
+                let range = output.first_buffer..output.first_buffer + output.channels as usize;
+                for taken in &mut owned[range] {
+                    prop_assert!(!*taken, "a buffer has two owners");
+                    *taken = true;
                 }
             }
         }

@@ -6,6 +6,7 @@ members = [
     "crates/riddim-model",
     "crates/riddim-graph",
     "crates/riddim-disk",
+    "crates/riddim-engine",
     "crates/riddim-plugin",
     "crates/riddim-io",
     "crates/riddim-cli",
@@ -28,6 +29,7 @@ riddim-time = { path = "crates/riddim-time" }
 riddim-model = { path = "crates/riddim-model" }
 riddim-graph = { path = "crates/riddim-graph" }
 riddim-disk = { path = "crates/riddim-disk" }
+riddim-engine = { path = "crates/riddim-engine" }
 riddim-plugin = { path = "crates/riddim-plugin" }
 riddim-io = { path = "crates/riddim-io" }
 riddim-test-support = { path = "fixtures/support" }
@@ -61,6 +63,8 @@ missing_debug_implementations = "allow"
 [workspace.lints.clippy]
 missing_safety_doc = "allow"
 too_many_arguments = "allow"
+# `n % k == 0` reads fine and is what audio code is full of.
+manual_is_multiple_of = "allow"
 
 [profile.dev]
 opt-level = 1

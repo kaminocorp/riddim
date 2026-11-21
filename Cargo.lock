@@ -730,6 +730,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "riddim-engine"
+version = "0.1.0"
+dependencies = [
+ "riddim-disk",
+ "riddim-graph",
+ "riddim-io",
+ "riddim-model",
+ "riddim-plugin",
+ "riddim-rt",
+ "riddim-test-support",
+ "riddim-time",
+]
+
+[[package]]
 name = "riddim-graph"
 version = "0.1.0"
 dependencies = [

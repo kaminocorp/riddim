@@ -291,7 +291,7 @@ impl Drop for Butler {
     }
 }
 
-fn finish(mut capture: Box<ActiveCapture>) -> Result<CaptureResult, String> {
+fn finish(mut capture: ActiveCapture) -> Result<CaptureResult, String> {
     capture.drain();
     if let Some(error) = capture.error {
         return Err(format!("{}: {error}", capture.path.display()));
@@ -320,7 +320,7 @@ fn butler_loop(inbox: Receiver<Command>, config: ButlerConfig, stall_ms: Arc<Ato
             }
             Ok(Command::Finish(id, reply)) => {
                 let result = match captures.remove(&id) {
-                    Some(capture) => finish(capture),
+                    Some(capture) => finish(*capture),
                     None => Err(format!("no capture {} is running", id.0)),
                 };
                 let _ = reply.send(result);
@@ -328,7 +328,7 @@ fn butler_loop(inbox: Receiver<Command>, config: ButlerConfig, stall_ms: Arc<Ato
             Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 // Leave every file valid on the way out.
                 for (_, capture) in captures.drain() {
-                    let _ = finish(capture);
+                    let _ = finish(*capture);
                 }
                 return;
             }

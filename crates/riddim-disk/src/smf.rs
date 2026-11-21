@@ -160,10 +160,8 @@ pub fn read(bytes: &[u8]) -> Result<SmfData, DiskError> {
                     denominator_power,
                     _,
                     _,
-                )) => {
-                    if numerator > 0 && denominator_power <= 6 {
-                        data.meters.push((at, numerator, 1 << denominator_power));
-                    }
+                )) if numerator > 0 && denominator_power <= 6 => {
+                    data.meters.push((at, numerator, 1 << denominator_power));
                 }
                 _ => {}
             }

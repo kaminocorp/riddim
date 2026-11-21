@@ -1,0 +1,1498 @@
+//! The control side of the engine.
+//!
+//! One thread owns the model. It applies ops, compiles a plan for every change, hands plans to
+//! the audio thread, takes retired ones back to free them, asks the main thread to load and
+//! unload plugins, runs recordings, and turns what the audio thread reports into events.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use riddim_disk::capture::{Butler, CaptureId};
+use riddim_disk::wav::{SampleFormat, WavSpec};
+use riddim_graph::compile;
+use riddim_graph::model_graph::{self, NodeKind, PluginPorts};
+use riddim_io::StreamInfo;
+use riddim_model::{
+    Clip, ClipContent, ClipId, Media, MediaId, Model, Note, Op, OpError, SlotId, Track, TrackId,
+    TrackInput, TrackKind, TrackOutput,
+};
+use riddim_plugin::{ActivateConfig, EventBody, PluginEvent, ProcessMode};
+use riddim_rt::garbage::GarbageCollector;
+use riddim_rt::planar::PlanarScratch;
+use riddim_rt::spsc::{Consumer, Producer, PushError};
+use riddim_time::{samples_to_superclock, Position, TempoMap, Ticks};
+
+use crate::audio::{CaptureRt, FromAudio, ToAudio};
+use crate::dsp::{Click, StereoGain};
+use crate::events::{Event, TransportState};
+use crate::host::{HostReply, HostRequest};
+use crate::media::MediaCache;
+use crate::plan::{
+    Buffers, DelayCell, MidiSourceRt, NodeCell, NodeRt, PluginRt, RtAudioClip, RtInput, RtPlan,
+    RtSource, RtStep, StepParams, StripRt, TimedEvent, EVENT_CAPACITY,
+};
+use crate::shared::{MeterCell, Shared};
+
+/// A transport request from the client.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransportCommand {
+    Play,
+    Stop,
+    /// Move the playhead.
+    Locate(Position),
+    /// Start recording on every armed track, with a count-in if the metronome asks for one.
+    Record,
+}
+
+/// The result of a successfully applied batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Applied {
+    pub revision: u64,
+    /// Undo the batch by applying these first to last.
+    pub inverses: Vec<Op>,
+}
+
+/// Why a batch was refused.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rejected {
+    /// The op in the batch that failed.
+    pub index: usize,
+    pub error: OpError,
+}
+
+pub(crate) enum ControlMsg {
+    Apply {
+        ticket: u64,
+        ops: Vec<Op>,
+        reply: Option<Sender<Result<Applied, Rejected>>>,
+    },
+    Transport(TransportCommand),
+    SetParam {
+        slot: SlotId,
+        id: u32,
+        value: f64,
+    },
+    PlayNote {
+        track: TrackId,
+        body: EventBody,
+    },
+    Subscribe(Sender<Event>),
+    /// Answered once everything sent before it has been dealt with.
+    Sync(Sender<()>),
+    /// Replace the whole model (opening a project).
+    Load {
+        model: Box<Model>,
+        reply: Sender<Result<u64, String>>,
+    },
+    /// Ask every loaded plugin for its state and store it in the model.
+    CapturePluginStates(Sender<Result<Applied, String>>),
+    Shutdown,
+}
+
+enum PluginStatus {
+    Loading,
+    Loaded(PluginPorts),
+    Failed,
+}
+
+struct PluginEntry {
+    track: TrackId,
+    status: PluginStatus,
+}
+
+struct AudioTake {
+    track: TrackId,
+    capture: CaptureId,
+    path: PathBuf,
+    channels: u16,
+}
+
+struct RecordingSession {
+    /// Timeline sample where the takes begin. Known once the audio thread has started.
+    start: i64,
+    tracks: Vec<TrackId>,
+    /// Output-side latency (device plus plan) in force when recording started.
+    output_latency: i64,
+    audio: Vec<AudioTake>,
+    midi_tracks: Vec<TrackId>,
+    midi_events: Vec<(TrackId, i64, EventBody)>,
+}
+
+struct PendingSave {
+    waiting: HashSet<SlotId>,
+    states: Vec<(TrackId, SlotId, Vec<u8>)>,
+    reply: Sender<Result<Applied, String>>,
+}
+
+type DelayKey = (NodeKind, usize, NodeKind, usize);
+
+/// What a source node plays, cached per track so an unrelated edit does not rebuild it.
+struct SourceCache {
+    track: Arc<Track>,
+    map: Arc<TempoMap>,
+    audio: Option<Arc<Vec<RtAudioClip>>>,
+    midi: Option<Arc<Vec<TimedEvent>>>,
+}
+
+pub(crate) struct ControlSetup {
+    pub inbox: Receiver<ControlMsg>,
+    pub to_audio: Producer<ToAudio>,
+    pub from_audio: Consumer<FromAudio>,
+    pub collector: GarbageCollector,
+    pub host_requests: Sender<HostRequest>,
+    pub host_replies: Receiver<HostReply>,
+    pub shared: Arc<Shared>,
+    pub snapshot: Arc<Mutex<Arc<Model>>>,
+    pub stream: StreamInfo,
+    pub max_block: usize,
+    pub capture_dir: PathBuf,
+    pub media_dir: PathBuf,
+    pub butler: Butler,
+}
+
+pub(crate) struct Control {
+    inbox: Receiver<ControlMsg>,
+    to_audio: Producer<ToAudio>,
+    from_audio: Consumer<FromAudio>,
+    collector: GarbageCollector,
+    host_requests: Sender<HostRequest>,
+    host_replies: Receiver<HostReply>,
+    shared: Arc<Shared>,
+    snapshot: Arc<Mutex<Arc<Model>>>,
+    stream: StreamInfo,
+    rate: u32,
+    max_block: usize,
+    capture_dir: PathBuf,
+    butler: Butler,
+
+    model: Model,
+    revision: u64,
+    map: Arc<TempoMap>,
+    subscribers: Vec<Sender<Event>>,
+
+    cells: HashMap<NodeKind, Arc<NodeCell>>,
+    delays: HashMap<DelayKey, Arc<DelayCell>>,
+    /// Plugin cells that have left the graph and wait for the audio thread to let go of them.
+    retired: Vec<(SlotId, Arc<NodeCell>)>,
+    plugins: HashMap<SlotId, PluginEntry>,
+    meters: HashMap<TrackId, Arc<MeterCell>>,
+    media: MediaCache,
+    sources: HashMap<TrackId, SourceCache>,
+
+    plan_serial: u64,
+    /// (audio, scratch, event) buffer counts the audio thread currently has.
+    installed: (usize, usize, usize),
+    /// A plan that did not fit in the queue yet. Newer plans replace it.
+    unsent: Option<ToAudio>,
+    /// Other messages that did not fit in the queue yet, in order.
+    backlog: Vec<ToAudio>,
+
+    recording: Option<RecordingSession>,
+    take_counter: u32,
+    pending_save: Option<PendingSave>,
+    pending_syncs: Vec<Sender<()>>,
+    last_state: TransportState,
+    last_report: Instant,
+}
+
+/// Which tracks are heard, given mutes and solos.
+///
+/// With no solo anywhere, everything unmuted is heard. With a solo, a track is heard if it is
+/// soloed, if it feeds a soloed bus, or if it is a bus that a soloed track plays through.
+fn audible_tracks(model: &Model) -> HashSet<TrackId> {
+    let any_solo = model.tracks.iter().any(|t| t.solo);
+    let downstream = |track: &Track| -> Vec<TrackId> {
+        let mut chain = Vec::new();
+        let mut output = track.output;
+        while let TrackOutput::Bus(bus) = output {
+            if chain.contains(&bus) {
+                break;
+            }
+            chain.push(bus);
+            match model.track(bus) {
+                Some(next) => output = next.output,
+                None => break,
+            }
+        }
+        chain
+    };
+    let mut solo_path: HashSet<TrackId> = HashSet::new();
+    if any_solo {
+        for track in model.tracks.iter().filter(|t| t.solo) {
+            solo_path.insert(track.id);
+            solo_path.extend(downstream(track));
+        }
+        // Tracks that feed a soloed bus are part of what "solo that bus" means.
+        for track in &model.tracks {
+            let chain = downstream(track);
+            if chain
+                .iter()
+                .any(|bus| model.track(*bus).is_some_and(|b| b.solo))
+            {
+                solo_path.insert(track.id);
+                solo_path.extend(chain);
+            }
+        }
+    }
+    let mut audible = HashSet::new();
+    for track in &model.tracks {
+        if !track.mute && (!any_solo || solo_path.contains(&track.id)) {
+            audible.insert(track.id);
+        }
+    }
+    if !model.master.mute {
+        audible.insert(TrackId::MASTER);
+    }
+    audible
+}
+
+impl Control {
+    pub fn new(setup: ControlSetup) -> Control {
+        let rate = setup.stream.sample_rate as u32;
+        let model = Model::new();
+        Control {
+            inbox: setup.inbox,
+            to_audio: setup.to_audio,
+            from_audio: setup.from_audio,
+            collector: setup.collector,
+            host_requests: setup.host_requests,
+            host_replies: setup.host_replies,
+            shared: setup.shared,
+            snapshot: setup.snapshot,
+            rate,
+            max_block: setup.max_block,
+            capture_dir: setup.capture_dir,
+            butler: setup.butler,
+            map: Arc::new(model.tempo_map.clone()),
+            model,
+            revision: 0,
+            subscribers: Vec::new(),
+            cells: HashMap::new(),
+            delays: HashMap::new(),
+            retired: Vec::new(),
+            plugins: HashMap::new(),
+            meters: HashMap::new(),
+            media: MediaCache::new(setup.media_dir, rate),
+            sources: HashMap::new(),
+            plan_serial: 0,
+            installed: (0, 0, 0),
+            unsent: None,
+            backlog: Vec::new(),
+            recording: None,
+            take_counter: 0,
+            pending_save: None,
+            pending_syncs: Vec::new(),
+            last_state: TransportState::Stopped,
+            last_report: Instant::now(),
+            stream: setup.stream,
+        }
+    }
+
+    /// The control thread's main loop. Returns when the engine shuts down.
+    pub fn run(mut self) {
+        self.rebuild_plan();
+        loop {
+            match self.inbox.recv_timeout(Duration::from_millis(2)) {
+                Ok(message) => {
+                    if !self.handle(message) {
+                        break;
+                    }
+                    // Deal with whatever else is already waiting before publishing.
+                    let mut alive = true;
+                    while let Ok(message) = self.inbox.try_recv() {
+                        alive = self.handle(message);
+                        if !alive {
+                            break;
+                        }
+                    }
+                    if !alive {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            self.flush_to_audio();
+            self.poll_audio();
+            self.poll_host();
+            self.collect();
+            self.report();
+            self.answer_syncs();
+        }
+        let _ = self.host_requests.send(HostRequest::Shutdown);
+    }
+
+    fn emit(&mut self, event: Event) {
+        self.subscribers
+            .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+    }
+
+    fn send(&mut self, message: ToAudio) {
+        if !self.backlog.is_empty() {
+            self.backlog.push(message);
+            return;
+        }
+        if let Err(PushError::Full(message)) = self.to_audio.push(message) {
+            self.backlog.push(message);
+        }
+    }
+
+    /// Retries whatever did not fit in the audio thread's queue.
+    fn flush_to_audio(&mut self) {
+        if let Some(plan) = self.unsent.take() {
+            if let Err(PushError::Full(plan)) = self.to_audio.push(plan) {
+                self.unsent = Some(plan);
+                return;
+            }
+        }
+        let pending = std::mem::take(&mut self.backlog);
+        let mut pending = pending.into_iter();
+        while let Some(message) = pending.next() {
+            if let Err(PushError::Full(message)) = self.to_audio.push(message) {
+                self.backlog.push(message);
+                self.backlog.extend(pending);
+                break;
+            }
+        }
+    }
+
+    fn handle(&mut self, message: ControlMsg) -> bool {
+        match message {
+            ControlMsg::Apply { ticket, ops, reply } => {
+                let outcome = self.apply(&ops);
+                match &outcome {
+                    Ok(applied) => self.emit(Event::Applied {
+                        ticket,
+                        revision: applied.revision,
+                        inverses: applied.inverses.clone(),
+                    }),
+                    Err(rejected) => self.emit(Event::Rejected {
+                        ticket,
+                        index: rejected.index,
+                        error: rejected.error.to_string(),
+                    }),
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome);
+                }
+            }
+            ControlMsg::Transport(command) => self.transport(command),
+            ControlMsg::SetParam { slot, id, value } => {
+                self.send(ToAudio::Param { slot, id, value });
+                let _ = self
+                    .host_requests
+                    .send(HostRequest::NotifyParam { slot, id, value });
+            }
+            ControlMsg::PlayNote { track, body } => self.send(ToAudio::Midi { track, body }),
+            ControlMsg::Subscribe(subscriber) => self.subscribers.push(subscriber),
+            ControlMsg::Sync(reply) => self.pending_syncs.push(reply),
+            ControlMsg::Load { model, reply } => {
+                let _ = reply.send(self.load(*model));
+            }
+            ControlMsg::CapturePluginStates(reply) => self.capture_plugin_states(reply),
+            ControlMsg::Shutdown => return false,
+        }
+        true
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Model
+    // -----------------------------------------------------------------------------------------
+
+    fn apply(&mut self, ops: &[Op]) -> Result<Applied, Rejected> {
+        let inverses = self
+            .model
+            .apply_all(ops)
+            .map_err(|(index, error)| Rejected { index, error })?;
+        self.revision += 1;
+        self.shared
+            .model_revision
+            .store(self.revision, Ordering::Release);
+        *self.snapshot.lock().unwrap() = Arc::new(self.model.clone());
+        if *self.map != self.model.tempo_map {
+            self.map = Arc::new(self.model.tempo_map.clone());
+        }
+        self.sync_plugins();
+        self.rebuild_plan();
+        Ok(Applied {
+            revision: self.revision,
+            inverses,
+        })
+    }
+
+    /// Replaces the model wholesale. Not an op: there is nothing to undo back to.
+    fn load(&mut self, model: Model) -> Result<u64, String> {
+        if self.recording.is_some() {
+            return Err("cannot open a project while recording".into());
+        }
+        model.validate()?;
+        self.model = model;
+        self.revision += 1;
+        self.shared
+            .model_revision
+            .store(self.revision, Ordering::Release);
+        *self.snapshot.lock().unwrap() = Arc::new(self.model.clone());
+        self.map = Arc::new(self.model.tempo_map.clone());
+        // Every plugin of the old project goes, even one whose slot id the new project reuses:
+        // the new slot may hold a different plugin or different state.
+        let stale: Vec<SlotId> = self.plugins.keys().copied().collect();
+        for slot in stale {
+            let entry = self.plugins.remove(&slot).expect("just listed");
+            match self.cells.remove(&NodeKind::Plugin(entry.track, slot)) {
+                Some(cell) => self.retired.push((slot, cell)),
+                None => {
+                    let _ = self.host_requests.send(HostRequest::Unload {
+                        slot,
+                        processor: None,
+                    });
+                }
+            }
+        }
+        self.sync_plugins();
+        self.rebuild_plan();
+        Ok(self.revision)
+    }
+
+    /// Applies ops the engine itself decided on, and tells the client as if it had made them.
+    fn apply_internal(&mut self, ops: Vec<Op>) -> bool {
+        match self.apply(&ops) {
+            Ok(applied) => {
+                self.emit(Event::ModelChanged {
+                    revision: applied.revision,
+                    ops,
+                    inverses: applied.inverses,
+                });
+                true
+            }
+            Err(rejected) => {
+                self.emit(Event::Error {
+                    message: format!("the engine could not update the model: {}", rejected.error),
+                });
+                false
+            }
+        }
+    }
+
+    /// Starts loading plugins that appeared in the model and retires ones that left it.
+    fn sync_plugins(&mut self) {
+        let mut wanted: HashMap<SlotId, TrackId> = HashMap::new();
+        for track in self.model.all_tracks() {
+            for slot in &track.plugins {
+                wanted.insert(slot.id, track.id);
+            }
+        }
+        let gone: Vec<SlotId> = self
+            .plugins
+            .keys()
+            .filter(|slot| !wanted.contains_key(slot))
+            .copied()
+            .collect();
+        for slot in gone {
+            let entry = self.plugins.remove(&slot).expect("just listed");
+            match self.cells.remove(&NodeKind::Plugin(entry.track, slot)) {
+                // The audio thread may still be running a plan that uses the processor; it is
+                // unloaded once the cell is ours alone.
+                Some(cell) => self.retired.push((slot, cell)),
+                None => {
+                    let _ = self.host_requests.send(HostRequest::Unload {
+                        slot,
+                        processor: None,
+                    });
+                }
+            }
+        }
+        let config = ActivateConfig {
+            sample_rate: self.rate as f64,
+            max_block: self.max_block as u32,
+            mode: ProcessMode::Realtime,
+        };
+        for track in self.model.all_tracks() {
+            for slot in &track.plugins {
+                if self.plugins.contains_key(&slot.id) {
+                    continue;
+                }
+                self.plugins.insert(
+                    slot.id,
+                    PluginEntry {
+                        track: track.id,
+                        status: PluginStatus::Loading,
+                    },
+                );
+                let _ = self.host_requests.send(HostRequest::Load {
+                    slot: slot.id,
+                    plugin: slot.plugin.clone(),
+                    state: slot.state.clone(),
+                    config,
+                });
+            }
+        }
+    }
+
+    fn capture_plugin_states(&mut self, reply: Sender<Result<Applied, String>>) {
+        if self.pending_save.is_some() {
+            let _ = reply.send(Err("a state capture is already in progress".into()));
+            return;
+        }
+        let waiting: HashSet<SlotId> = self
+            .plugins
+            .iter()
+            .filter(|(_, entry)| matches!(entry.status, PluginStatus::Loaded(_)))
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in &waiting {
+            let _ = self
+                .host_requests
+                .send(HostRequest::SaveState { slot: *slot });
+        }
+        self.pending_save = Some(PendingSave {
+            waiting,
+            states: Vec::new(),
+            reply,
+        });
+        self.finish_save_if_ready();
+    }
+
+    fn finish_save_if_ready(&mut self) {
+        if !self
+            .pending_save
+            .as_ref()
+            .is_some_and(|save| save.waiting.is_empty())
+        {
+            return;
+        }
+        let save = self.pending_save.take().expect("checked above");
+        let ops: Vec<Op> = save
+            .states
+            .into_iter()
+            .map(|(track, slot, bytes)| Op::SetPluginState {
+                track,
+                slot,
+                state: Some(Arc::new(bytes)),
+            })
+            .collect();
+        let outcome = match self.apply(&ops) {
+            Ok(applied) => {
+                self.emit(Event::ModelChanged {
+                    revision: applied.revision,
+                    ops,
+                    inverses: applied.inverses.clone(),
+                });
+                Ok(applied)
+            }
+            Err(rejected) => Err(rejected.error.to_string()),
+        };
+        let _ = save.reply.send(outcome);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Plan building
+    // -----------------------------------------------------------------------------------------
+
+    fn audio_clips(&mut self, track: &Track) -> Arc<Vec<RtAudioClip>> {
+        let mut clips = Vec::new();
+        let mut missing = Vec::new();
+        for clip in track.clips.iter().filter(|c| !c.muted) {
+            let ClipContent::Audio {
+                media,
+                offset,
+                length,
+                gain,
+                fade_in,
+                fade_out,
+            } = &clip.content
+            else {
+                continue;
+            };
+            let Some(media) = self.model.media(*media).cloned() else {
+                continue;
+            };
+            let (loaded, first_time) = self.media.get(&media);
+            let audio = match loaded {
+                Ok(audio) => audio,
+                Err(error) => {
+                    if first_time {
+                        missing.push(Event::MediaMissing {
+                            media: media.id,
+                            error,
+                        });
+                    }
+                    continue;
+                }
+            };
+            let to_session = |frames: u64| self.media.to_session_frames(frames, media.sample_rate);
+            let offset = to_session(*offset);
+            let length = to_session(*length)
+                .min(audio.frames() as i64 - offset)
+                .max(0);
+            clips.push(RtAudioClip {
+                start: self.map.position_to_samples(clip.start, self.rate),
+                length,
+                offset,
+                gain: *gain,
+                fade_in: to_session(*fade_in).min(length),
+                fade_out: to_session(*fade_out).min(length),
+                media: audio,
+            });
+        }
+        for event in missing {
+            self.emit(event);
+        }
+        Arc::new(clips)
+    }
+
+    fn midi_events(&self, track: &Track) -> Arc<Vec<TimedEvent>> {
+        let mut events: Vec<(i64, u8, EventBody)> = Vec::new();
+        for clip in track.clips.iter().filter(|c| !c.muted) {
+            let ClipContent::Midi {
+                length,
+                notes,
+                events: others,
+            } = &clip.content
+            else {
+                continue;
+            };
+            let clip_start = self.map.position_to_ticks(clip.start);
+            let clip_end = clip_start + *length;
+            let sample = |tick: Ticks| self.map.ticks_to_samples(tick, self.rate);
+            for note in notes.iter() {
+                let start = clip_start + note.start;
+                if start >= clip_end {
+                    continue;
+                }
+                // Notes are cut at the end of their clip.
+                let end = (start + note.length).min(clip_end);
+                let on = sample(start);
+                let off = sample(end).max(on + 1);
+                let velocity = note.velocity as f32 / 127.0;
+                events.push((
+                    on,
+                    1,
+                    EventBody::NoteOn {
+                        channel: note.channel,
+                        key: note.key,
+                        velocity,
+                        note_id: -1,
+                    },
+                ));
+                events.push((
+                    off,
+                    0,
+                    EventBody::NoteOff {
+                        channel: note.channel,
+                        key: note.key,
+                        velocity: 0.0,
+                        note_id: -1,
+                    },
+                ));
+            }
+            for other in others.iter() {
+                let at = clip_start + other.at;
+                if at < clip_end {
+                    events.push((
+                        sample(at),
+                        1,
+                        EventBody::Midi {
+                            data: other.data,
+                            len: other.len,
+                        },
+                    ));
+                }
+            }
+        }
+        // Releases before attacks at the same sample, so a repeated note retriggers cleanly.
+        events.sort_by_key(|(sample, rank, _)| (*sample, *rank));
+        Arc::new(
+            events
+                .into_iter()
+                .map(|(sample, _, body)| TimedEvent { sample, body })
+                .collect(),
+        )
+    }
+
+    fn source_params(&mut self, track: &Arc<Track>) -> StepParams {
+        let fresh = self.sources.get(&track.id).is_some_and(|cache| {
+            Arc::ptr_eq(&cache.track, track) && Arc::ptr_eq(&cache.map, &self.map)
+        });
+        if !fresh {
+            let (audio, midi) = match track.kind {
+                TrackKind::Audio => (Some(self.audio_clips(track)), None),
+                _ => (None, Some(self.midi_events(track))),
+            };
+            self.sources.insert(
+                track.id,
+                SourceCache {
+                    track: track.clone(),
+                    map: self.map.clone(),
+                    audio,
+                    midi,
+                },
+            );
+        }
+        let cache = &self.sources[&track.id];
+        match track.kind {
+            TrackKind::Audio => StepParams::AudioSource {
+                clips: cache.audio.clone().expect("audio tracks cache audio clips"),
+                monitor_input: match (track.monitor, track.input) {
+                    (
+                        true,
+                        TrackInput::Audio {
+                            first_channel,
+                            channels,
+                        },
+                    ) => Some((first_channel as usize, channels as usize)),
+                    _ => None,
+                },
+            },
+            _ => StepParams::MidiSource {
+                track: track.id,
+                events: cache
+                    .midi
+                    .clone()
+                    .expect("instrument tracks cache MIDI events"),
+                live_input: track.input == TrackInput::Midi
+                    && (track.monitor || track.record_armed),
+                record: track.record_armed,
+            },
+        }
+    }
+
+    fn new_cell(&mut self, kind: NodeKind) -> Option<Arc<NodeCell>> {
+        let rt = match kind {
+            NodeKind::Source(track) => match self.model.track(track).map(|t| t.kind) {
+                Some(TrackKind::Instrument) => NodeRt::MidiSource(MidiSourceRt::new()),
+                _ => NodeRt::Stateless,
+            },
+            NodeKind::BusInput(_) | NodeKind::Output => NodeRt::Stateless,
+            NodeKind::Strip(track) => NodeRt::Strip(StripRt {
+                // A 5 ms ramp: long enough not to click, short enough to feel immediate.
+                gain: StereoGain::new(self.rate / 200),
+                primed: false,
+                meter: self.meters.entry(track).or_default().clone(),
+            }),
+            NodeKind::Metronome => NodeRt::Metronome(Click::new()),
+            // Plugin cells are created when the plugin finishes loading, never here.
+            NodeKind::Plugin(..) => return None,
+        };
+        Some(NodeCell::new(rt))
+    }
+
+    /// Compiles the current model into a plan and sends it to the audio thread.
+    fn rebuild_plan(&mut self) {
+        let ports: HashMap<SlotId, PluginPorts> = self
+            .plugins
+            .iter()
+            .filter_map(|(slot, entry)| match &entry.status {
+                PluginStatus::Loaded(ports) => Some((*slot, ports.clone())),
+                _ => None,
+            })
+            .collect();
+        let graph = model_graph::build(&self.model, &ports);
+        let plan = match compile(&graph.spec) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.emit(Event::Error {
+                    message: format!("the routing could not be compiled: {error}"),
+                });
+                return;
+            }
+        };
+        let audible = audible_tracks(&self.model);
+        let model = self.model.clone();
+
+        let mut steps = Vec::with_capacity(plan.steps.len());
+        let mut scratch_count = 0;
+        let mut event_buffer_of: Vec<Option<usize>> = Vec::with_capacity(plan.steps.len());
+        let mut event_buffer_count = 0;
+        let mut live_kinds: HashSet<NodeKind> = HashSet::new();
+        let mut live_delays: HashSet<DelayKey> = HashSet::new();
+        let mut output_step = 0;
+        let mut plugin_steps = Vec::new();
+
+        for (position, step) in plan.steps.iter().enumerate() {
+            let kind = graph.kinds[step.node];
+            live_kinds.insert(kind);
+            let cell = match self.cells.get(&kind) {
+                Some(cell) => cell.clone(),
+                None => {
+                    let Some(cell) = self.new_cell(kind) else {
+                        // A plugin node without a processor cannot be in the graph: the ports
+                        // table above only lists loaded plugins.
+                        self.emit(Event::Error {
+                            message: format!("no processor for {kind:?}"),
+                        });
+                        return;
+                    };
+                    self.cells.insert(kind, cell.clone());
+                    cell
+                }
+            };
+
+            let params = match kind {
+                NodeKind::Source(track) => match model.track(track) {
+                    Some(track) => self.source_params(track),
+                    None => StepParams::BusInput,
+                },
+                NodeKind::BusInput(_) => StepParams::BusInput,
+                NodeKind::Plugin(track, slot) => {
+                    plugin_steps.push((slot, position));
+                    let bypass = model
+                        .track(track)
+                        .and_then(|t| t.plugin(slot))
+                        .is_some_and(|s| s.bypass);
+                    StepParams::Plugin { bypass }
+                }
+                NodeKind::Strip(track) => {
+                    let strip = model.track(track);
+                    StepParams::Strip {
+                        gain: strip.map_or(1.0, |t| t.gain),
+                        pan: strip.map_or(0.0, |t| t.pan),
+                        mute: !audible.contains(&track),
+                    }
+                }
+                NodeKind::Metronome => StepParams::Metronome {
+                    enabled: model.metronome.enabled,
+                    gain: model.metronome.gain,
+                },
+                NodeKind::Output => {
+                    output_step = position;
+                    StepParams::Output
+                }
+            };
+
+            let first_scratch = scratch_count;
+            let mut inputs = Vec::with_capacity(step.inputs.len());
+            for input in &step.inputs {
+                let mut sources = Vec::with_capacity(input.sources.len());
+                for source in &input.sources {
+                    let delay = (source.delay > 0).then(|| {
+                        let key = (
+                            graph.kinds[source.edge.from],
+                            source.edge.from_port,
+                            kind,
+                            source.edge.to_port,
+                        );
+                        live_delays.insert(key);
+                        let channels = input.channels as usize;
+                        let reusable = self
+                            .delays
+                            .get(&key)
+                            .filter(|cell| {
+                                cell.samples == source.delay && cell.channels == channels
+                            })
+                            .cloned();
+                        reusable.unwrap_or_else(|| {
+                            let cell = DelayCell::new(channels, source.delay);
+                            self.delays.insert(key, cell.clone());
+                            cell
+                        })
+                    });
+                    sources.push(RtSource {
+                        first_buffer: source.first_buffer,
+                        channels: source.channels as usize,
+                        delay,
+                    });
+                }
+                inputs.push(RtInput {
+                    first_scratch: scratch_count,
+                    channels: input.channels as usize,
+                    sources,
+                });
+                scratch_count += input.channels as usize;
+            }
+
+            let event_output = graph.spec.nodes[step.node].event_output.then(|| {
+                event_buffer_count += 1;
+                event_buffer_count - 1
+            });
+            event_buffer_of.push(event_output);
+            let event_sources = step
+                .event_sources
+                .iter()
+                .filter_map(|&source| event_buffer_of[source])
+                .collect();
+
+            steps.push(RtStep {
+                cell,
+                params,
+                inputs,
+                first_scratch,
+                in_channels: scratch_count - first_scratch,
+                first_buffer: step.outputs.first().map_or(0, |o| o.first_buffer),
+                out_channels: step.outputs.iter().map(|o| o.channels as usize).sum(),
+                event_sources,
+                event_output,
+            });
+        }
+
+        // Forget state for nodes and delays that are no longer part of the graph. (Plugin
+        // cells are retired separately, in `sync_plugins`, because they need unloading.)
+        self.cells
+            .retain(|kind, _| live_kinds.contains(kind) || matches!(kind, NodeKind::Plugin(..)));
+        self.delays.retain(|key, _| live_delays.contains(key));
+        self.meters.retain(|track, _| model.track(*track).is_some());
+        self.sources
+            .retain(|track, _| model.track(*track).is_some());
+        self.media.retain(|id| model.media(id).is_some());
+
+        plugin_steps.sort_by_key(|(slot, _)| *slot);
+        let loop_range = match (model.loop_enabled, model.loop_range) {
+            (true, Some(range)) => {
+                let start = self.map.position_to_samples(range.start, self.rate);
+                let end = self.map.position_to_samples(range.end, self.rate);
+                (end > start).then_some((start, end))
+            }
+            _ => None,
+        };
+        self.plan_serial += 1;
+        let rt_plan = Box::new(RtPlan {
+            steps,
+            output_step,
+            plugins: plugin_steps,
+            buffer_count: plan.buffer_count,
+            scratch_count,
+            event_buffer_count,
+            tempo_map: self.map.clone(),
+            loop_range,
+            latency: plan.max_latency,
+            serial: self.plan_serial,
+        });
+
+        let needed = (
+            rt_plan.buffer_count,
+            rt_plan.scratch_count,
+            rt_plan.event_buffer_count,
+        );
+        let mut buffers = None;
+        if needed.0 > self.installed.0 || needed.1 > self.installed.1 || needed.2 > self.installed.2
+        {
+            // Grow with headroom so adding one track does not reallocate every time.
+            let grow = |need: usize, have: usize| {
+                if need > have {
+                    need + need / 2 + 8
+                } else {
+                    have
+                }
+            };
+            self.installed = (
+                grow(needed.0, self.installed.0),
+                grow(needed.1, self.installed.1),
+                grow(needed.2, self.installed.2),
+            );
+            buffers = Some(Box::new(Buffers::new(
+                self.installed.0,
+                self.installed.1,
+                self.installed.2,
+                self.max_block,
+            )));
+        }
+
+        // If an earlier plan is still waiting for room in the queue, this one supersedes it. Its
+        // buffers must not be lost, though: keep whichever set is larger (the newer).
+        let message = match (self.unsent.take(), buffers) {
+            (Some(ToAudio::SwapPlan { buffers: old, .. }), None) => ToAudio::SwapPlan {
+                plan: rt_plan,
+                buffers: old,
+            },
+            (_, buffers) => ToAudio::SwapPlan {
+                plan: rt_plan,
+                buffers,
+            },
+        };
+        if let Err(PushError::Full(message)) = self.to_audio.push(message) {
+            self.unsent = Some(message);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Transport and recording
+    // -----------------------------------------------------------------------------------------
+
+    fn transport(&mut self, command: TransportCommand) {
+        match command {
+            TransportCommand::Play => self.send(ToAudio::Play),
+            TransportCommand::Stop => self.send(ToAudio::Stop),
+            TransportCommand::Locate(position) => {
+                let sample = self.map.position_to_samples(position, self.rate);
+                self.send(ToAudio::Locate(sample));
+            }
+            TransportCommand::Record => self.start_recording(),
+        }
+    }
+
+    fn start_recording(&mut self) {
+        if self.recording.is_some() {
+            return;
+        }
+        let armed: Vec<Arc<Track>> = self
+            .model
+            .tracks
+            .iter()
+            .filter(|t| t.record_armed)
+            .cloned()
+            .collect();
+        if armed.is_empty() {
+            self.emit(Event::Error {
+                message: "no track is armed for recording".into(),
+            });
+            return;
+        }
+        let playing = self.shared.playing.load(Ordering::Acquire);
+        let output_latency = self.stream.output_latency_frames as i64
+            + self.shared.plan_latency.load(Ordering::Acquire) as i64;
+        let round_trip = output_latency + self.stream.input_latency_frames as i64;
+
+        let mut captures = Vec::new();
+        let mut audio = Vec::new();
+        let mut midi_tracks = Vec::new();
+        for track in &armed {
+            match (track.kind, track.input) {
+                (
+                    TrackKind::Audio,
+                    TrackInput::Audio {
+                        first_channel,
+                        channels,
+                    },
+                ) => {
+                    self.take_counter += 1;
+                    let path = self.capture_dir.join(format!(
+                        "take-{:04}-track-{}.wav",
+                        self.take_counter, track.id.0
+                    ));
+                    let spec = WavSpec {
+                        sample_rate: self.rate,
+                        channels: channels as u16,
+                        format: SampleFormat::Float32,
+                    };
+                    match self.butler.start_capture(&path, spec) {
+                        Ok((capture, sink)) => {
+                            captures.push(CaptureRt {
+                                sink,
+                                first_channel: first_channel as usize,
+                                channels: channels as usize,
+                            });
+                            audio.push(AudioTake {
+                                track: track.id,
+                                capture,
+                                path,
+                                channels: channels as u16,
+                            });
+                        }
+                        Err(error) => self.emit(Event::Error {
+                            message: format!(
+                                "could not start recording to {}: {error}",
+                                path.display()
+                            ),
+                        }),
+                    }
+                }
+                (TrackKind::Instrument, TrackInput::Midi) => midi_tracks.push(track.id),
+                _ => {}
+            }
+        }
+        if audio.is_empty() && midi_tracks.is_empty() {
+            self.emit(Event::Error {
+                message: "no armed track has an input to record from".into(),
+            });
+            return;
+        }
+
+        let tracks: Vec<TrackId> = armed.iter().map(|t| t.id).collect();
+        self.recording = Some(RecordingSession {
+            start: 0,
+            tracks,
+            output_latency,
+            audio,
+            midi_tracks,
+            midi_events: Vec::new(),
+        });
+        // The audio thread fixes the exact start (it alone knows the position to the sample)
+        // and reports it back; a little ahead of now if the transport is already rolling.
+        self.send(ToAudio::Record {
+            captures,
+            round_trip,
+            count_in_bars: self.model.metronome.count_in_bars as u32,
+            punch_ahead: 2 * self.max_block as i64,
+        });
+        if !playing {
+            self.send(ToAudio::Play);
+        }
+    }
+
+    fn finish_recording(&mut self, captures: Vec<CaptureRt>, stopped_at: i64) {
+        // Dropping the sinks tells nobody anything; the butler is told explicitly below.
+        drop(captures);
+        let Some(session) = self.recording.take() else {
+            return;
+        };
+        let mut ops = Vec::new();
+        let mut finished = Vec::new();
+        let mut next_id = self.model.fresh_id();
+
+        for take in &session.audio {
+            let result = self
+                .butler
+                .finish_capture(take.capture)
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| Err("the disk thread did not answer".into()));
+            match result {
+                Err(error) => self.emit(Event::Error {
+                    message: format!("recording failed: {error}"),
+                }),
+                Ok(result) => {
+                    if result.frames_dropped > 0 {
+                        self.emit(Event::RecordingOverflow {
+                            track: take.track,
+                            frames_dropped: result.frames_dropped,
+                        });
+                    }
+                    if result.frames == 0 {
+                        let _ = std::fs::remove_file(&take.path);
+                        continue;
+                    }
+                    let media = MediaId(next_id);
+                    let clip = ClipId(next_id + 1);
+                    next_id += 2;
+                    ops.push(Op::AddMedia {
+                        media: Media {
+                            id: media,
+                            path: take.path.to_string_lossy().into_owned(),
+                            sample_rate: self.rate,
+                            channels: take.channels,
+                            frames: result.frames,
+                        },
+                    });
+                    ops.push(Op::AddClip {
+                        track: take.track,
+                        clip: Clip {
+                            id: clip,
+                            name: take
+                                .path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            // Recorded audio is anchored to audio time: it does not move if the
+                            // tempo is changed later.
+                            start: Position::Time(samples_to_superclock(session.start, self.rate)),
+                            muted: false,
+                            content: ClipContent::Audio {
+                                media,
+                                offset: 0,
+                                length: result.frames,
+                                gain: 1.0,
+                                fade_in: 0,
+                                fade_out: 0,
+                            },
+                        },
+                    });
+                    finished.push((take.track, clip, Some(media), result.frames));
+                }
+            }
+        }
+
+        let take_end = stopped_at - session.output_latency;
+        for track in &session.midi_tracks {
+            let Some(clip) = self.midi_take(*track, &session, take_end, ClipId(next_id)) else {
+                continue;
+            };
+            next_id += 1;
+            let notes = match &clip.content {
+                ClipContent::Midi { notes, .. } => notes.len() as u64,
+                _ => 0,
+            };
+            finished.push((*track, clip.id, None, notes));
+            ops.push(Op::AddClip {
+                track: *track,
+                clip,
+            });
+        }
+
+        if !ops.is_empty() && self.apply_internal(ops) {
+            for (track, clip, media, frames) in finished {
+                self.emit(Event::RecordingFinished {
+                    track,
+                    clip,
+                    media,
+                    frames,
+                });
+            }
+        }
+    }
+
+    /// Builds a MIDI clip from what was played on `track` during the session.
+    fn midi_take(
+        &self,
+        track: TrackId,
+        session: &RecordingSession,
+        take_end: i64,
+        id: ClipId,
+    ) -> Option<Clip> {
+        let start_tick = self.map.samples_to_ticks(session.start, self.rate);
+        let end_tick = self
+            .map
+            .samples_to_ticks(take_end.max(session.start + 1), self.rate);
+        // The player heard the timeline `output_latency` late, so what they played belongs that
+        // much earlier than the block it arrived in.
+        let tick_of = |sample: i64| {
+            let heard =
+                (sample - session.output_latency).clamp(session.start, take_end.max(session.start));
+            Ticks(self.map.samples_to_ticks(heard, self.rate).0 - start_tick.0)
+        };
+        let mut held: HashMap<(u8, u8), (Ticks, u8)> = HashMap::new();
+        let mut notes = Vec::new();
+        let mut close =
+            |held: &mut HashMap<(u8, u8), (Ticks, u8)>, channel: u8, key: u8, at: Ticks| {
+                if let Some((start, velocity)) = held.remove(&(channel, key)) {
+                    notes.push(Note {
+                        start,
+                        length: Ticks((at.0 - start.0).max(1)),
+                        key,
+                        velocity,
+                        channel,
+                    });
+                }
+            };
+        let mut others = Vec::new();
+        for (_, sample, body) in session.midi_events.iter().filter(|(t, _, _)| *t == track) {
+            let at = tick_of(*sample);
+            match *body {
+                EventBody::NoteOn {
+                    channel,
+                    key,
+                    velocity,
+                    ..
+                } => {
+                    close(&mut held, channel, key, at);
+                    let velocity = ((velocity * 127.0).round() as u8).clamp(1, 127);
+                    held.insert((channel, key), (at, velocity));
+                }
+                EventBody::NoteOff { channel, key, .. } => close(&mut held, channel, key, at),
+                EventBody::Midi { data, len } => {
+                    others.push(riddim_model::MidiEvent { at, data, len });
+                }
+                EventBody::Param { .. } => {}
+            }
+        }
+        let length = Ticks((end_tick.0 - start_tick.0).max(1));
+        let dangling: Vec<(u8, u8)> = held.keys().copied().collect();
+        for (channel, key) in dangling {
+            close(&mut held, channel, key, length);
+        }
+        if notes.is_empty() && others.is_empty() {
+            return None;
+        }
+        notes.sort_by_key(|n| (n.start, n.channel, n.key));
+        Some(Clip {
+            id,
+            name: "MIDI take".into(),
+            start: Position::Beats(start_tick),
+            muted: false,
+            content: ClipContent::Midi {
+                length,
+                notes: Arc::new(notes),
+                events: Arc::new(others),
+            },
+        })
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Polling
+    // -----------------------------------------------------------------------------------------
+
+    fn poll_audio(&mut self) {
+        while let Ok(message) = self.from_audio.pop() {
+            match message {
+                FromAudio::RecordingStarted { start } => {
+                    if let Some(session) = self.recording.as_mut() {
+                        session.start = start;
+                        let tracks = session.tracks.clone();
+                        self.emit(Event::RecordingStarted {
+                            tracks,
+                            position_samples: start,
+                        });
+                    }
+                }
+                FromAudio::RecordingEnded {
+                    captures,
+                    stopped_at,
+                } => {
+                    self.finish_recording(captures, stopped_at);
+                }
+                FromAudio::RecordedMidi {
+                    track,
+                    sample,
+                    body,
+                } => {
+                    if let Some(session) = self.recording.as_mut() {
+                        session.midi_events.push((track, sample, body));
+                    }
+                }
+                FromAudio::PluginParam { slot, id, value } => {
+                    let _ = self
+                        .host_requests
+                        .send(HostRequest::NotifyParam { slot, id, value });
+                    self.emit(Event::PluginParam { slot, id, value });
+                }
+            }
+        }
+    }
+
+    fn poll_host(&mut self) {
+        while let Ok(reply) = self.host_replies.try_recv() {
+            match reply {
+                HostReply::Loaded { slot, result } => {
+                    let Some(track) = self.plugins.get(&slot).map(|entry| entry.track) else {
+                        // Removed from the model while it was loading.
+                        let processor = result.ok().map(|loaded| loaded.processor);
+                        let _ = self
+                            .host_requests
+                            .send(HostRequest::Unload { slot, processor });
+                        continue;
+                    };
+                    match result {
+                        Ok(loaded) => {
+                            let inputs: usize =
+                                loaded.ports.inputs.iter().map(|c| *c as usize).sum();
+                            let outputs: usize =
+                                loaded.ports.outputs.iter().map(|c| *c as usize).sum();
+                            let cell = NodeCell::new(NodeRt::Plugin(Box::new(PluginRt {
+                                slot,
+                                processor: loaded.processor,
+                                scratch: PlanarScratch::new(inputs, outputs),
+                                events_in: riddim_plugin::EventBuffer::with_capacity(
+                                    EVENT_CAPACITY,
+                                ),
+                                events_out: riddim_plugin::EventBuffer::with_capacity(
+                                    EVENT_CAPACITY,
+                                ),
+                                pending_params: riddim_plugin::EventBuffer::with_capacity(
+                                    EVENT_CAPACITY,
+                                ),
+                            })));
+                            self.cells.insert(NodeKind::Plugin(track, slot), cell);
+                            let latency = loaded.ports.latency;
+                            self.plugins.get_mut(&slot).expect("checked above").status =
+                                PluginStatus::Loaded(loaded.ports);
+                            self.rebuild_plan();
+                            self.emit(Event::PluginLoaded {
+                                track,
+                                slot,
+                                latency,
+                                parameters: loaded.parameters,
+                            });
+                        }
+                        Err(error) => {
+                            self.plugins.get_mut(&slot).expect("checked above").status =
+                                PluginStatus::Failed;
+                            self.emit(Event::PluginFailed { track, slot, error });
+                        }
+                    }
+                }
+                HostReply::State { slot, result } => {
+                    let track = self.plugins.get(&slot).map(|entry| entry.track);
+                    if let Some(save) = self.pending_save.as_mut() {
+                        save.waiting.remove(&slot);
+                        if let (Ok(bytes), Some(track)) = (result, track) {
+                            save.states.push((track, slot, bytes));
+                        }
+                    }
+                    self.finish_save_if_ready();
+                }
+                HostReply::Event { slot, event } => {
+                    if let PluginEvent::ParamChanged { id, value } = event {
+                        // An edit in the plugin's own editor: its processor has to be told.
+                        self.send(ToAudio::Param { slot, id, value });
+                        self.emit(Event::PluginParam { slot, id, value });
+                    }
+                }
+                HostReply::Latency { slot, latency } => {
+                    if let Some(PluginEntry {
+                        status: PluginStatus::Loaded(ports),
+                        ..
+                    }) = self.plugins.get_mut(&slot)
+                    {
+                        if ports.latency != latency {
+                            ports.latency = latency;
+                            self.rebuild_plan();
+                            self.emit(Event::PluginLatencyChanged { slot, latency });
+                        }
+                    }
+                }
+                HostReply::Unloaded => {}
+            }
+        }
+    }
+
+    /// Frees what the audio thread has retired, and unloads plugins nothing references any more.
+    fn collect(&mut self) {
+        self.collector.collect();
+        let mut waiting = Vec::new();
+        for (slot, cell) in std::mem::take(&mut self.retired) {
+            match Arc::try_unwrap(cell) {
+                Ok(cell) => {
+                    let processor = match cell.into_inner() {
+                        NodeRt::Plugin(plugin) => Some(plugin.processor),
+                        _ => None,
+                    };
+                    let _ = self
+                        .host_requests
+                        .send(HostRequest::Unload { slot, processor });
+                }
+                Err(cell) => waiting.push((slot, cell)),
+            }
+        }
+        self.retired = waiting;
+    }
+
+    /// Transport changes at once; position and meters about thirty times a second.
+    fn report(&mut self) {
+        let playing = self.shared.playing.load(Ordering::Acquire);
+        let recording = self.shared.recording.load(Ordering::Acquire);
+        let state = match (playing, recording) {
+            (true, true) => TransportState::Recording,
+            (true, false) => TransportState::Playing,
+            _ => TransportState::Stopped,
+        };
+        let position = self.shared.position.load(Ordering::Acquire);
+        if state != self.last_state {
+            self.last_state = state;
+            self.emit(Event::Transport {
+                state,
+                position_samples: position,
+            });
+        }
+        if self.subscribers.is_empty() || self.last_report.elapsed() < Duration::from_millis(33) {
+            return;
+        }
+        self.last_report = Instant::now();
+        if playing {
+            self.emit(Event::Position { samples: position });
+        }
+        let mut tracks: Vec<(TrackId, [f32; 2])> = self
+            .meters
+            .iter()
+            .map(|(track, meter)| (*track, meter.take()))
+            .collect();
+        tracks.sort_by_key(|(track, _)| *track);
+        self.emit(Event::Meters { tracks });
+    }
+
+    fn answer_syncs(&mut self) {
+        if self.pending_syncs.is_empty() {
+            return;
+        }
+        let loading = self
+            .plugins
+            .values()
+            .any(|entry| matches!(entry.status, PluginStatus::Loading));
+        if loading || self.pending_save.is_some() {
+            return;
+        }
+        for reply in self.pending_syncs.drain(..) {
+            let _ = reply.send(());
+        }
+    }
+}

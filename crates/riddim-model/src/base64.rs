@@ -31,7 +31,7 @@ pub fn encode(bytes: &[u8]) -> String {
 
 pub fn decode(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     let value = |c: u8| -> Option<u32> {

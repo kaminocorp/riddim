@@ -1,0 +1,24 @@
+[package]
+name = "riddim-engine"
+description = "The Riddim engine: control side, audio side, transport, mixing, recording"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+riddim-rt.workspace = true
+riddim-time.workspace = true
+riddim-model.workspace = true
+riddim-graph.workspace = true
+riddim-plugin.workspace = true
+riddim-io.workspace = true
+riddim-disk.workspace = true
+
+[dev-dependencies]
+riddim-test-support.workspace = true
+
+[lints]
+workspace = true
