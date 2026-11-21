@@ -14,12 +14,13 @@ use std::time::{Duration, Instant};
 
 use objc2_core_audio::{
     AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart,
-    AudioDeviceStop, AudioObjectAddPropertyListener, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectRemovePropertyListener, AudioObjectSetPropertyData,
+    AudioDeviceStop, AudioHardwareCreateAggregateDevice, AudioHardwareDestroyAggregateDevice,
+    AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectRemovePropertyListener,
+    AudioObjectSetPropertyData,
 };
 use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
-use objc2_core_foundation::{CFRetained, CFString};
+use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use riddim_rt::planar::PlanarScratch;
 
 use crate::{
@@ -513,6 +514,94 @@ impl Workgroup {
     }
 }
 
+/// A private aggregate device: an output device and a separate input device presented to us
+/// as one, clocked by the output with the input drift-corrected to it. This is what lets the
+/// built-in microphone be recorded while playing through the built-in speakers, which are two
+/// devices. Destroyed with the stream. **Unverified on macOS.**
+struct Aggregate(AudioObjectID);
+
+impl Drop for Aggregate {
+    fn drop(&mut self) {
+        // SAFETY: an aggregate device this process created.
+        unsafe { AudioHardwareDestroyAggregateDevice(self.0) };
+    }
+}
+
+/// Builds the aggregate of `output` and `input` and waits for the system to bring it up.
+fn create_aggregate(output: AudioObjectID, input: AudioObjectID) -> Result<Aggregate, IoError> {
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let uid_of = |device: AudioObjectID, what: &str| {
+        string_property(device, PROP_DEVICE_UID)
+            .ok_or_else(|| IoError::NoDevice(format!("the {what} device has no UID")))
+    };
+    let (output_uid, input_uid) = (uid_of(output, "output")?, uid_of(input, "input")?);
+    let key = CFString::from_static_str;
+    let number = CFNumber::new_i32;
+
+    // One entry per sub-device; the input follows the output's clock, with drift correction.
+    let sub_device = |uid: &str, drift: i32| {
+        let uid = CFString::from_str(uid);
+        let drift = number(drift);
+        let values: [&CFType; 2] = [uid.as_ref(), drift.as_ref()];
+        CFDictionary::<CFString, CFType>::from_slices(&[&*key("uid"), &*key("drift")], &values)
+    };
+    let sub_devices =
+        CFArray::from_retained_objects(&[sub_device(&output_uid, 0), sub_device(&input_uid, 1)]);
+    let name = CFString::from_static_str("Riddim input and output");
+    let uid = CFString::from_str(&format!(
+        "com.kaminocorp.riddim.aggregate.{}.{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    let main = CFString::from_str(&output_uid);
+    let (private, stacked) = (number(1), number(0));
+    let values: [&CFType; 6] = [
+        name.as_ref(),
+        uid.as_ref(),
+        private.as_ref(),
+        stacked.as_ref(),
+        main.as_ref(),
+        sub_devices.as_ref(),
+    ];
+    let description = CFDictionary::<CFString, CFType>::from_slices(
+        &[
+            &*key("name"),
+            &*key("uid"),
+            // Private: visible to this process only, and gone when it exits.
+            &*key("private"),
+            &*key("stacked"),
+            &*key("master"),
+            &*key("subdevices"),
+        ],
+        &values,
+    );
+
+    let mut device: AudioObjectID = 0;
+    // SAFETY: a dictionary of the documented keys, and a valid out-pointer.
+    let status = unsafe {
+        AudioHardwareCreateAggregateDevice(description.as_opaque(), NonNull::from(&mut device))
+    };
+    if status != 0 || device == 0 {
+        return Err(IoError::Device(
+            "could not combine the input and output devices into one".into(),
+            status,
+        ));
+    }
+    let aggregate = Aggregate(device);
+    // The device appears at once but its streams are published a moment later.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while channel_count(device, SCOPE_OUTPUT) == 0 || channel_count(device, SCOPE_INPUT) == 0 {
+        if Instant::now() > deadline {
+            return Err(IoError::Device(
+                "the combined input and output device did not come up".into(),
+                0,
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(aggregate)
+}
+
 /// The largest buffer size this backend will ask a device for.
 const MAX_BUFFER_FRAMES: u32 = 4096;
 
@@ -524,6 +613,8 @@ pub struct CoreAudioStream {
     xruns: Arc<AtomicU64>,
     info: StreamInfo,
     started: bool,
+    /// Held so that the aggregate device, if one was made, outlives the IOProc on it.
+    _aggregate: Option<Aggregate>,
 }
 
 // SAFETY: the raw context pointer is owned by the stream and only dereferenced by the HAL's
@@ -542,7 +633,25 @@ impl CoreAudioStream {
             None => default_device(PROP_DEFAULT_OUTPUT)
                 .ok_or_else(|| IoError::NoDevice("there is no default output device".into()))?,
         };
-        let name = string_property(device, PROP_NAME).unwrap_or_else(|| "Audio device".to_string());
+        let mut name =
+            string_property(device, PROP_NAME).unwrap_or_else(|| "Audio device".to_string());
+
+        // Recording needs inputs on the device we run. An audio interface has them; the
+        // built-in speakers do not, and the built-in microphone is another device. In that
+        // case make one device of the two.
+        let mut aggregate = None;
+        let mut device = device;
+        if config.capture && channel_count(device, SCOPE_INPUT) == 0 {
+            if let Some(input) = default_device(PROP_DEFAULT_INPUT).filter(|&input| input != device)
+            {
+                let input_name =
+                    string_property(input, PROP_NAME).unwrap_or_else(|| "input".to_string());
+                let combined = create_aggregate(device, input)?;
+                device = combined.0;
+                name = format!("{name} + {input_name}");
+                aggregate = Some(combined);
+            }
+        }
 
         // Sample rate changes are asynchronous: request, then wait for the device to report it.
         // SAFETY: the property is a Float64.
@@ -683,6 +792,7 @@ impl CoreAudioStream {
             xruns,
             info,
             started: false,
+            _aggregate: aggregate,
         })
     }
 }
