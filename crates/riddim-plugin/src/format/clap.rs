@@ -1024,7 +1024,9 @@ impl PluginProcessor for ClapProcessor {
             );
             let input_events = self.events_in.as_input();
             let mut output_events = self.events_out.as_output();
-            match processor.ensure_processing_started() {
+            // What the plugin does inside these calls is the plugin's business; our own
+            // work on either side of them stays under the real-time checks.
+            riddim_rt::guard::permit(|| match processor.ensure_processing_started() {
                 Ok(started) => started
                     .process(
                         &input_audio,
@@ -1036,7 +1038,7 @@ impl PluginProcessor for ClapProcessor {
                     )
                     .is_ok(),
                 Err(_) => false,
-            }
+            })
         };
         if !status {
             for output in context.outputs.iter_mut() {
@@ -1111,7 +1113,7 @@ impl PluginProcessor for ClapProcessor {
 
     fn reset(&mut self) {
         if let Some(processor) = self.processor.as_mut() {
-            processor.reset();
+            riddim_rt::guard::permit(|| processor.reset());
         }
     }
 

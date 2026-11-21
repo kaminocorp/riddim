@@ -266,6 +266,12 @@ impl Running {
                 Event::PluginFailed { slot, error, .. } => {
                     eprintln!("error: the plugin in slot {} did not load: {error}", slot.0);
                 }
+                Event::PluginCrashed { slot, .. } => {
+                    eprintln!(
+                        "error: the plugin in slot {} crashed in its own process; everything else carries on",
+                        slot.0
+                    );
+                }
                 Event::MediaMissing { media, error } => {
                     eprintln!("warning: media {} is missing: {error}", media.0)
                 }
