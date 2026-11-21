@@ -16,7 +16,8 @@ use riddim_rt::garbage::GarbageChute;
 use riddim_rt::spsc::{Consumer, Producer};
 use riddim_time::{samples_to_superclock, TempoMap};
 
-use crate::nodes::{self, BlockCtx, NodeIo, NodeMessage};
+use crate::exec::Executor;
+use crate::nodes::{BlockCtx, NodeMessage};
 use crate::plan::{Buffers, NodeRt, RtPlan};
 use crate::shared::Shared;
 
@@ -127,6 +128,7 @@ pub(crate) struct AudioEngine {
     shared: Arc<Shared>,
     sample_rate: u32,
     max_block: usize,
+    executor: Executor,
 }
 
 impl AudioEngine {
@@ -139,6 +141,7 @@ impl AudioEngine {
         shared: Arc<Shared>,
         sample_rate: u32,
         max_block: usize,
+        executor: Executor,
     ) -> Self {
         Self {
             plan: None,
@@ -157,6 +160,7 @@ impl AudioEngine {
             shared,
             sample_rate,
             max_block,
+            executor,
         }
     }
 
@@ -355,85 +359,27 @@ impl AudioEngine {
         let buffers = &mut *self.buffers;
         let replies = &mut self.replies;
         let shared = &self.shared;
-
-        for step in &plan.steps {
-            // 1. Sum this step's inputs, always in the same order.
-            for input in &step.inputs {
-                for c in 0..input.channels {
-                    buffers.scratch[input.first_scratch + c][..frames].fill(0.0);
+        let dropped = self.executor.run(plan, buffers, &ctx, |message| {
+            let message = match message {
+                NodeMessage::PluginParam { slot, id, value } => {
+                    FromAudio::PluginParam { slot, id, value }
                 }
-                for source in &input.sources {
-                    for c in 0..input.channels {
-                        // Mono sources feed every channel; otherwise channels map one to one.
-                        let from = if source.channels == 1 {
-                            0
-                        } else if c < source.channels {
-                            c
-                        } else {
-                            continue;
-                        };
-                        let signal = &buffers.audio[source.first_buffer + from][..frames];
-                        let sum = &mut buffers.scratch[input.first_scratch + c][..frames];
-                        match &source.delay {
-                            None => {
-                                for (s, x) in sum.iter_mut().zip(signal) {
-                                    *s += *x;
-                                }
-                            }
-                            // SAFETY: this step is the only user of its sources' delay lines,
-                            // and we are the thread running it.
-                            Some(delay) => unsafe { delay.get() }.process_add(c, signal, sum),
-                        }
-                    }
-                    if let Some(delay) = &source.delay {
-                        // SAFETY: as above.
-                        unsafe { delay.get() }.advance(frames);
-                    }
-                }
-            }
-
-            // 2. Gather its events.
-            buffers.merged_events.clear();
-            for &source in &step.event_sources {
-                for event in buffers.events[source].as_slice() {
-                    buffers.merged_events.push(*event);
-                }
-            }
-            if step.event_sources.len() > 1 {
-                buffers.merged_events.sort();
-            }
-
-            // 3. Run the node.
-            let (scratch, audio, events) =
-                (&buffers.scratch, &mut buffers.audio, &mut buffers.events);
-            let io = NodeIo {
-                inputs: &scratch[step.first_scratch..step.first_scratch + step.in_channels],
-                outputs: &mut audio[step.first_buffer..step.first_buffer + step.out_channels],
-                events_in: buffers.merged_events.as_slice(),
-                events_out: step.event_output.map(|index| &mut events[index]),
-                latency: step.input_latency,
+                NodeMessage::RecordedMidi {
+                    track,
+                    sample,
+                    body,
+                } => FromAudio::RecordedMidi {
+                    track,
+                    sample,
+                    body,
+                },
             };
-            // SAFETY: we are the audio thread executing this step; the reference ends with it.
-            let rt = unsafe { step.cell.get() };
-            nodes::process(rt, &step.params, io, &ctx, |message| {
-                let message = match message {
-                    NodeMessage::PluginParam { slot, id, value } => {
-                        FromAudio::PluginParam { slot, id, value }
-                    }
-                    NodeMessage::RecordedMidi {
-                        track,
-                        sample,
-                        body,
-                    } => FromAudio::RecordedMidi {
-                        track,
-                        sample,
-                        body,
-                    },
-                };
-                if replies.push(message).is_err() {
-                    shared.events_lost.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+            if replies.push(message).is_err() {
+                shared.events_lost.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        if dropped > 0 {
+            shared.events_lost.fetch_add(dropped, Ordering::Relaxed);
         }
 
         // The output step's input sum is what goes to the device.
@@ -543,8 +489,9 @@ impl AudioCallback for AudioEngine {
         self.shared
             .leaked
             .store(self.chute.leaked(), Ordering::Relaxed);
-        self.shared
-            .rt_violations
-            .store(riddim_rt::guard::thread_violations(), Ordering::Relaxed);
+        self.shared.rt_violations.store(
+            riddim_rt::guard::thread_violations() + self.executor.worker_violations(),
+            Ordering::Relaxed,
+        );
     }
 }

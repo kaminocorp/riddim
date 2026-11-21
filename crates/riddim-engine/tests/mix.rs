@@ -760,6 +760,7 @@ fn bounce_request(dir: &std::path::Path, name: &str, seconds: i64) -> BounceRequ
         format: SampleFormat::Float32,
         media_dir: dir.to_path_buf(),
         tracks: None,
+        render_threads: 0,
     }
 }
 

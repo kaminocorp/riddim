@@ -195,6 +195,7 @@ fn a_demo_song_through_third_party_plugins_bounces() {
         format: SampleFormat::Float32,
         media_dir: dir.clone(),
         tracks,
+        render_threads: 0,
     };
     let first = bounce(&model, &request("mix.wav", None)).unwrap();
     let second = bounce(&model, &request("mix-again.wav", None)).unwrap();

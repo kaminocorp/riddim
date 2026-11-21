@@ -21,17 +21,19 @@ mod control;
 mod dsp;
 mod engine;
 mod events;
+mod exec;
 mod host;
 mod media;
 mod nodes;
 mod plan;
 mod shared;
+mod workgroup;
 
 pub use bounce::{bounce, BounceRequest, BounceResult};
 pub use control::{Applied, Rejected, TransportCommand};
 pub use engine::{
     DeviceConfig, Engine, EngineConfig, EngineError, MainThreadMode, Status, MAX_BUFFER_FRAMES,
-    MIN_BUFFER_FRAMES,
+    MAX_RENDER_THREADS, MIN_BUFFER_FRAMES, PARALLEL_FROM_STEPS,
 };
 pub use events::{Event, TransportState};
 pub use host::MainThread;

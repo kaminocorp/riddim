@@ -201,6 +201,8 @@ impl Running {
             butler: Default::default(),
             midi_input,
             process_mode,
+            render_threads: None,
+            parallel_from: riddim::PARALLEL_FROM_STEPS,
         };
         let mut engine = Engine::start(config).map_err(|e| e.to_string())?;
         let main = engine
@@ -374,6 +376,7 @@ pub fn bounce_model(
         format: SampleFormat::Float32,
         media_dir: media.to_path_buf(),
         tracks,
+        render_threads: 0,
     };
     let result = riddim::bounce(model, &request)?;
     for missing in &result.missing_plugins {

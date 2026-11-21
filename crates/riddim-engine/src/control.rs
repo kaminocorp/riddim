@@ -1176,6 +1176,8 @@ impl Control {
                 out_channels: step.outputs.iter().map(|o| o.channels as usize).sum(),
                 event_sources,
                 event_output,
+                dependencies: step.dependencies,
+                dependents: step.dependents.clone(),
             });
         }
 
@@ -1199,7 +1201,9 @@ impl Control {
             _ => None,
         };
         self.plan_serial += 1;
+        let schedule = crate::exec::Schedule::new(steps.len());
         let rt_plan = Box::new(RtPlan {
+            schedule,
             steps,
             output_step,
             plugins: plugin_steps,

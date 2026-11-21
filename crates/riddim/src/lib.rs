@@ -37,7 +37,8 @@ pub mod import;
 pub use riddim_engine::{bounce, BounceRequest, BounceResult};
 pub use riddim_engine::{
     Applied, DeviceConfig, Engine, EngineConfig, EngineError, Event, MainThread, MainThreadMode,
-    NullConfig, Rejected, Status, TransportCommand, TransportState,
+    NullConfig, Rejected, Status, TransportCommand, TransportState, MAX_BUFFER_FRAMES,
+    MAX_RENDER_THREADS, MIN_BUFFER_FRAMES, PARALLEL_FROM_STEPS,
 };
 
 /// The engine model: tracks, clips, routing, plugin slots, and the ops that edit them.

@@ -50,6 +50,7 @@ const PROP_LATENCY: u32 = fourcc(b"ltnc");
 const PROP_SAFETY_OFFSET: u32 = fourcc(b"saft");
 const PROP_STREAMS: u32 = fourcc(b"stm#");
 const PROP_PROCESSOR_OVERLOAD: u32 = fourcc(b"over");
+const PROP_IO_THREAD_WORKGROUP: u32 = fourcc(b"oswg");
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -409,6 +410,109 @@ unsafe extern "C-unwind" fn overload_listener(
     0
 }
 
+// The workgroup and thread-policy calls, from libSystem. Declared here because the bindings
+// we use do not cover them.
+extern "C" {
+    fn os_workgroup_join(workgroup: *mut c_void, token: *mut JoinToken) -> i32;
+    fn os_workgroup_leave(workgroup: *mut c_void, token: *mut JoinToken);
+    fn os_retain(object: *mut c_void) -> *mut c_void;
+    fn os_release(object: *mut c_void);
+    fn mach_thread_self() -> u32;
+    fn thread_policy_set(thread: u32, flavor: u32, policy: *const u32, count: u32) -> i32;
+}
+
+/// `os_workgroup_join_token_s` is 40 bytes (a 32-bit signature and 36 opaque bytes) in the
+/// macOS 11 to 15 SDKs. This leaves generous room, in case it ever grows.
+#[repr(C, align(16))]
+struct JoinToken([u8; 128]);
+
+/// A device's audio workgroup (`os_workgroup_t`), retained.
+///
+/// **Unverified on macOS.**
+pub struct Workgroup(NonNull<c_void>);
+
+// SAFETY: an os_workgroup is a reference-counted, thread-safe OS object.
+unsafe impl Send for Workgroup {}
+unsafe impl Sync for Workgroup {}
+
+impl Clone for Workgroup {
+    fn clone(&self) -> Self {
+        // SAFETY: retaining a live OS object.
+        unsafe { os_retain(self.0.as_ptr()) };
+        Workgroup(self.0)
+    }
+}
+
+impl Drop for Workgroup {
+    fn drop(&mut self) {
+        // SAFETY: balances the retain this value stands for.
+        unsafe { os_release(self.0.as_ptr()) };
+    }
+}
+
+struct Joined {
+    workgroup: Workgroup,
+    token: Box<JoinToken>,
+}
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        // SAFETY: the token is the one this thread joined with; a thread must leave its
+        // workgroups before it exits, which is when this runs.
+        unsafe { os_workgroup_leave(self.workgroup.0.as_ptr(), &mut *self.token) };
+    }
+}
+
+thread_local! {
+    static JOINED: std::cell::RefCell<Option<Joined>> = const { std::cell::RefCell::new(None) };
+}
+
+impl Workgroup {
+    /// Makes the calling thread a real-time thread whose deadline is one device block of
+    /// `period_seconds`, and joins it to the workgroup. The thread leaves the workgroup by
+    /// itself when it exits. On failure returns the status of the call that failed; the
+    /// thread carries on as an ordinary one.
+    pub fn join_current_thread(&self, period_seconds: f64) -> Result<(), i32> {
+        const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+        let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+        // SAFETY: valid out-pointer.
+        unsafe { mach_timebase_info(&mut timebase) };
+        let ticks = |seconds: f64| {
+            let nanos = seconds * 1e9;
+            (nanos * timebase.denom.max(1) as f64 / timebase.numer.max(1) as f64) as u32
+        };
+        // period, computation, constraint, preemptible: the shape Apple's own audio threads
+        // use, with the block as the deadline and most of it as the budget.
+        let period = period_seconds.clamp(0.000_1, 0.1);
+        let policy = [ticks(period), ticks(period * 0.75), ticks(period), 1u32];
+        // SAFETY: the policy is four 32-bit words, as THREAD_TIME_CONSTRAINT_POLICY expects.
+        let status = unsafe {
+            thread_policy_set(
+                mach_thread_self(),
+                THREAD_TIME_CONSTRAINT_POLICY,
+                policy.as_ptr(),
+                policy.len() as u32,
+            )
+        };
+        if status != 0 {
+            return Err(status);
+        }
+        let mut token = Box::new(JoinToken([0; 128]));
+        // SAFETY: a live workgroup and a token buffer at least as large as the system's.
+        let status = unsafe { os_workgroup_join(self.0.as_ptr(), &mut *token) };
+        if status != 0 {
+            return Err(status);
+        }
+        JOINED.with(|joined| {
+            *joined.borrow_mut() = Some(Joined {
+                workgroup: self.clone(),
+                token,
+            });
+        });
+        Ok(())
+    }
+}
+
 /// The largest buffer size this backend will ask a device for.
 const MAX_BUFFER_FRAMES: u32 = 4096;
 
@@ -580,6 +684,16 @@ impl CoreAudioStream {
             info,
             started: false,
         })
+    }
+}
+
+impl CoreAudioStream {
+    /// The workgroup of the device's I/O thread, for render threads to join.
+    pub fn workgroup(&self) -> Option<Workgroup> {
+        // SAFETY: the property is one os_workgroup_t, handed over retained.
+        let raw =
+            unsafe { get::<*mut c_void>(self.device, PROP_IO_THREAD_WORKGROUP, SCOPE_GLOBAL) }?;
+        NonNull::new(raw).map(Workgroup)
     }
 }
 

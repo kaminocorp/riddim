@@ -58,7 +58,21 @@ pub struct EngineConfig {
     /// What plugins are told about how they are being driven. `Offline` lets samplers wait for
     /// their own disk streaming instead of dropping voices; use it for bounces.
     pub process_mode: riddim_plugin::ProcessMode,
+    /// Threads that help the audio thread render. `None` picks for the device: one fewer than
+    /// the machine has cores (at most 7) on audio hardware, where they join the device's audio
+    /// workgroup; none on the deviceless backends. The result is the same, bit for bit,
+    /// whatever the number.
+    pub render_threads: Option<usize>,
+    /// Plans with fewer steps than this are rendered by the audio thread alone even when
+    /// there are render threads: sharing out a handful of steps costs more than it saves.
+    pub parallel_from: usize,
 }
+
+/// The default for [`EngineConfig::parallel_from`].
+pub const PARALLEL_FROM_STEPS: usize = 24;
+
+/// The most render threads the engine will start.
+pub const MAX_RENDER_THREADS: usize = 31;
 
 impl EngineConfig {
     /// A deterministic, deviceless configuration at 48 kHz with 128-frame blocks, writing
@@ -73,6 +87,8 @@ impl EngineConfig {
             butler: ButlerConfig::default(),
             midi_input: false,
             process_mode: riddim_plugin::ProcessMode::Realtime,
+            render_threads: None,
+            parallel_from: PARALLEL_FROM_STEPS,
         }
     }
 }
@@ -166,6 +182,26 @@ impl Engine {
         };
         // The plan never runs a block larger than this; bigger device blocks are split.
         let max_block = block.max(MIN_BUFFER_FRAMES) as usize;
+
+        let render_threads = config.render_threads.unwrap_or(match &config.device {
+            DeviceConfig::System(_) => std::thread::available_parallelism()
+                .map_or(0, |cores| cores.get().saturating_sub(1))
+                .min(7),
+            DeviceConfig::Manual(_) | DeviceConfig::Null(_) => 0,
+        });
+        let workgroup = crate::workgroup::Slot::default();
+        let pool = if render_threads > 0 {
+            let workgroup = workgroup.clone();
+            Some(
+                crate::exec::Pool::new(render_threads.min(MAX_RENDER_THREADS), move || {
+                    workgroup.join_when_known()
+                })
+                .map_err(EngineError::Io)?,
+            )
+        } else {
+            None
+        };
+        let executor = crate::exec::Executor::new(pool, config.parallel_from);
         let audio = AudioEngine::new(
             from_control,
             to_control,
@@ -174,24 +210,29 @@ impl Engine {
             shared.clone(),
             rate as u32,
             max_block,
+            executor,
         );
 
-        let (stream, info) = match config.device.clone() {
+        let opened = match config.device.clone() {
             DeviceConfig::Manual(c) => {
                 let stream = ManualStream::new(c, audio);
                 let info = stream.info().clone();
-                (Stream::Manual(Box::new(stream)), info)
+                Ok((Stream::Manual(Box::new(stream)), info))
             }
             DeviceConfig::Null(c) => {
                 let mut stream = NullStream::new(c, audio);
                 let info = stream.info().clone();
                 stream
                     .start()
-                    .map_err(|e| EngineError::Device(e.to_string()))?;
-                (Stream::Running(Box::new(stream)), info)
+                    .map(|()| (Stream::Running(Box::new(stream) as Box<_>), info))
+                    .map_err(|e| EngineError::Device(e.to_string()))
             }
-            DeviceConfig::System(c) => open_system_stream(&c, audio)?,
+            DeviceConfig::System(c) => open_system_stream(&c, audio, &workgroup),
         };
+        // Whatever happened, the render threads must not be left waiting to hear about a
+        // workgroup.
+        workgroup.close();
+        let (stream, info) = opened?;
 
         let (midi_feed, midi) = if config.midi_input {
             let input = MidiInput::open_all("Riddim", midi_tx).map_err(EngineError::Device)?;
@@ -506,9 +547,17 @@ impl Drop for Engine {
 fn open_system_stream(
     config: &riddim_io::StreamConfig,
     audio: AudioEngine,
+    workgroup: &crate::workgroup::Slot,
 ) -> Result<(Stream, StreamInfo), EngineError> {
     let mut stream = riddim_io::coreaudio::CoreAudioStream::open(config, audio)
         .map_err(|e| EngineError::Device(e.to_string()))?;
+    // The render threads join the device's audio workgroup, so the system schedules them
+    // together with the device's own I/O thread.
+    workgroup.set(
+        stream.workgroup(),
+        stream.info().max_frames,
+        stream.info().sample_rate,
+    );
     let info = stream.info().clone();
     stream
         .start()
@@ -520,6 +569,7 @@ fn open_system_stream(
 fn open_system_stream(
     _config: &riddim_io::StreamConfig,
     _audio: AudioEngine,
+    _workgroup: &crate::workgroup::Slot,
 ) -> Result<(Stream, StreamInfo), EngineError> {
     Err(EngineError::Device(
         "there is no audio hardware backend for this platform yet".into(),

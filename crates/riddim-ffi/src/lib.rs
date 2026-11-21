@@ -110,7 +110,8 @@ pub struct RiddimStatus {
 ///   "media_dir": "/path/to/project/media",
 ///   "main_thread": "external",    // "external" (pump it yourself) | "internal"
 ///   "midi_input": true,
-///   "offline": false              // tell plugins this is an offline render
+///   "offline": false,             // tell plugins this is an offline render
+///   "render_threads": null        // extra render threads; null picks for the device
 /// }
 /// ```
 #[derive(Deserialize)]
@@ -139,6 +140,10 @@ struct Config {
     input_channels: u32,
     #[serde(default = "default_channels")]
     output_channels: u32,
+    /// Threads that help the audio thread render. Absent or null: one fewer than the machine
+    /// has cores (at most 7) on audio hardware, none on "null" and "manual".
+    #[serde(default)]
+    render_threads: Option<usize>,
 }
 
 fn default_device() -> String {
@@ -196,6 +201,8 @@ fn engine_config(json: &str) -> Result<EngineConfig, String> {
         } else {
             riddim::plugins::ProcessMode::Realtime
         },
+        render_threads: config.render_threads,
+        parallel_from: riddim::PARALLEL_FROM_STEPS,
     })
 }
 
@@ -495,6 +502,9 @@ struct BounceSpec {
     /// Track ids to render as a stem. Absent or null: the whole mix.
     #[serde(default)]
     tracks: Option<Vec<TrackId>>,
+    /// Threads to render with besides the calling one. The file is the same whatever it is.
+    #[serde(default)]
+    render_threads: usize,
 }
 
 fn start_position() -> Position {
@@ -529,6 +539,7 @@ fn run_bounce(model_json: &str, request_json: &str) -> Result<String, String> {
             format,
             media_dir: spec.media_dir,
             tracks: spec.tracks,
+            render_threads: spec.render_threads,
         },
     )?;
     Ok(serde_json::json!({

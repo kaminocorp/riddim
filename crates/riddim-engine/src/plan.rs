@@ -332,6 +332,9 @@ pub(crate) struct RtStep {
     pub event_sources: Vec<usize>,
     /// The event buffer this step writes, if it produces events.
     pub event_output: Option<usize>,
+    /// How many steps must finish before this one can start, and which steps wait for it.
+    pub dependencies: u32,
+    pub dependents: Vec<usize>,
 }
 
 /// A compiled plan, ready to run.
@@ -350,6 +353,8 @@ pub(crate) struct RtPlan {
     /// Samples by which the output lags the timeline.
     pub latency: u32,
     pub serial: u64,
+    /// Bookkeeping for running the steps on several threads.
+    pub schedule: crate::exec::Schedule,
 }
 
 impl RtPlan {
@@ -367,7 +372,6 @@ pub(crate) struct Buffers {
     pub audio: Vec<Vec<f32>>,
     pub scratch: Vec<Vec<f32>>,
     pub events: Vec<EventBuffer>,
-    pub merged_events: EventBuffer,
     /// The most frames these buffers can carry: the largest block the engine may run with
     /// them.
     pub max_block: usize,
@@ -384,7 +388,6 @@ impl Buffers {
             events: (0..events)
                 .map(|_| EventBuffer::with_capacity(EVENT_CAPACITY))
                 .collect(),
-            merged_events: EventBuffer::with_capacity(EVENT_CAPACITY),
             max_block,
         }
     }
