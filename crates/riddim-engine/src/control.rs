@@ -29,7 +29,7 @@ use riddim_time::{samples_to_superclock, Position, TempoMap, Ticks};
 use crate::audio::{CaptureRt, FromAudio, ToAudio};
 use crate::dsp::{Click, DelayLine, StereoGain};
 use crate::events::{Event, TransportState};
-use crate::host::{HostReply, HostRequest};
+use crate::host::{BusRequest, HostReply, HostRequest};
 use crate::media::MediaCache;
 use crate::plan::{
     Buffers, DelayCell, GainRt, MidiSourceRt, NodeCell, NodeRt, PluginRt, RtAudioClip, RtCurve,
@@ -109,6 +109,20 @@ enum PluginStatus {
 struct PluginEntry {
     track: TrackId,
     status: PluginStatus,
+    /// Names the instance to the plugin host (a slot can be emptied and filled again before
+    /// the host has let go of what was in it).
+    serial: u64,
+    /// The buses and block size the plugin was last asked to run with.
+    buses: BusRequest,
+    max_block: u32,
+}
+
+/// The optional buses a slot's routing calls for.
+fn wanted_buses(slot: &riddim_model::PluginSlot) -> BusRequest {
+    BusRequest {
+        extra_outputs: slot.outputs.iter().map(|o| o.bus).max().unwrap_or(0),
+        sidechain: slot.sidechain.is_some(),
+    }
 }
 
 struct AudioTake {
@@ -197,7 +211,11 @@ pub(crate) struct Control {
     cells: HashMap<NodeKind, Arc<NodeCell>>,
     delays: HashMap<DelayKey, Arc<DelayCell>>,
     /// Plugin cells that have left the graph and wait for the audio thread to let go of them.
-    retired: Vec<(SlotId, Arc<NodeCell>)>,
+    retired: Vec<(u64, Arc<NodeCell>)>,
+    next_serial: u64,
+    /// Plugins taken out of the plan to be activated again with other buses or another block
+    /// size, waiting for the audio thread to let go of them.
+    restarting: Vec<(SlotId, u64, Arc<NodeCell>)>,
     plugins: HashMap<SlotId, PluginEntry>,
     meters: HashMap<TrackId, Arc<MeterCell>>,
     media: MediaCache,
@@ -355,6 +373,8 @@ impl Control {
             cells: HashMap::new(),
             delays: HashMap::new(),
             retired: Vec::new(),
+            next_serial: 1,
+            restarting: Vec::new(),
             plugins: HashMap::new(),
             meters: HashMap::new(),
             media: MediaCache::new(setup.media_dir, rate),
@@ -559,14 +579,10 @@ impl Control {
         let stale: Vec<SlotId> = self.plugins.keys().copied().collect();
         for slot in stale {
             let entry = self.plugins.remove(&slot).expect("just listed");
-            match self.cells.remove(&NodeKind::Plugin(entry.track, slot)) {
-                Some(cell) => self.retired.push((slot, cell)),
-                None => {
-                    let _ = self.host_requests.send(HostRequest::Unload {
-                        slot,
-                        processor: None,
-                    });
-                }
+            // (One with no cell is still loading or being restarted: it is let go of when it
+            // reports back and turns out not to be wanted.)
+            if let Some(cell) = self.cells.remove(&NodeKind::Plugin(entry.track, slot)) {
+                self.retired.push((entry.serial, cell));
             }
         }
         self.sync_plugins();
@@ -610,16 +626,11 @@ impl Control {
             .collect();
         for slot in gone {
             let entry = self.plugins.remove(&slot).expect("just listed");
-            match self.cells.remove(&NodeKind::Plugin(entry.track, slot)) {
-                // The audio thread may still be running a plan that uses the processor; it is
-                // unloaded once the cell is ours alone.
-                Some(cell) => self.retired.push((slot, cell)),
-                None => {
-                    let _ = self.host_requests.send(HostRequest::Unload {
-                        slot,
-                        processor: None,
-                    });
-                }
+            // The audio thread may still be running a plan that uses the processor; it is
+            // unloaded once the cell is ours alone. (One with no cell is still loading or
+            // being restarted: it is let go of when it reports back and is not wanted.)
+            if let Some(cell) = self.cells.remove(&NodeKind::Plugin(entry.track, slot)) {
+                self.retired.push((entry.serial, cell));
             }
         }
         let config = ActivateConfig {
@@ -629,24 +640,58 @@ impl Control {
         };
         for track in self.model.all_tracks() {
             for slot in &track.plugins {
-                if self.plugins.contains_key(&slot.id) {
+                let buses = wanted_buses(slot);
+                if let Some(entry) = self.plugins.get_mut(&slot.id) {
+                    // Loaded, but for other buses or another block size than are wanted now:
+                    // take it out of the plan and have it activated again. (One that is still
+                    // loading is looked at again when it arrives.)
+                    let stale = entry.buses != buses || entry.max_block != config.max_block;
+                    if stale && matches!(entry.status, PluginStatus::Loaded(_)) {
+                        entry.status = PluginStatus::Loading;
+                        if let Some(cell) =
+                            self.cells.remove(&NodeKind::Plugin(entry.track, slot.id))
+                        {
+                            self.restarting.push((slot.id, entry.serial, cell));
+                        }
+                    }
                     continue;
                 }
+                let serial = self.next_serial;
+                self.next_serial += 1;
                 self.plugins.insert(
                     slot.id,
                     PluginEntry {
                         track: track.id,
                         status: PluginStatus::Loading,
+                        serial,
+                        buses,
+                        max_block: config.max_block,
                     },
                 );
                 let _ = self.host_requests.send(HostRequest::Load {
                     slot: slot.id,
+                    serial,
                     plugin: slot.plugin.clone(),
                     state: slot.state.clone(),
                     config,
+                    buses,
                 });
             }
         }
+    }
+
+    /// What a slot should be running with right now, if it is still in the model.
+    fn wanted_config(&self, slot: SlotId) -> Option<(ActivateConfig, BusRequest)> {
+        let config = ActivateConfig {
+            sample_rate: self.rate as f64,
+            max_block: self.max_block as u32,
+            mode: self.process_mode,
+        };
+        self.model
+            .all_tracks()
+            .flat_map(|t| t.plugins.iter())
+            .find(|s| s.id == slot)
+            .map(|s| (config, wanted_buses(s)))
     }
 
     fn capture_plugin_states(&mut self, reply: Sender<Result<Applied, String>>) {
@@ -1846,13 +1891,24 @@ impl Control {
     fn poll_host(&mut self) {
         while let Ok(reply) = self.host_replies.try_recv() {
             match reply {
-                HostReply::Loaded { slot, result } => {
-                    let Some(track) = self.plugins.get(&slot).map(|entry| entry.track) else {
-                        // Removed from the model while it was loading.
+                HostReply::Loaded {
+                    slot,
+                    serial,
+                    result,
+                    restarted,
+                } => {
+                    let current = self
+                        .plugins
+                        .get(&slot)
+                        .filter(|entry| entry.serial == serial)
+                        .map(|entry| entry.track);
+                    let Some(track) = current else {
+                        // Removed from the model while it was loading (even if the slot has
+                        // been filled again since: that is another instance).
                         let processor = result.ok().map(|loaded| loaded.processor);
                         let _ = self
                             .host_requests
-                            .send(HostRequest::Unload { slot, processor });
+                            .send(HostRequest::Unload { serial, processor });
                         continue;
                     };
                     match result {
@@ -1879,17 +1935,30 @@ impl Control {
                                     Box::new(DelayLine::new(outputs, loaded.ports.latency as usize))
                                 }),
                                 was_bypassed: false,
+                                main_in: loaded.ports.inputs.first().copied().unwrap_or(0) as usize,
+                                main_out: loaded.ports.outputs.first().copied().unwrap_or(0)
+                                    as usize,
                             })));
                             self.cells.insert(NodeKind::Plugin(track, slot), cell);
                             let latency = loaded.ports.latency;
                             self.plugins.get_mut(&slot).expect("checked above").status =
                                 PluginStatus::Loaded(loaded.ports);
+                            // The routing or the block size may have moved on while it loaded.
+                            self.sync_plugins();
                             self.rebuild_plan();
-                            self.emit(Event::PluginLoaded {
-                                track,
-                                slot,
-                                latency,
-                                parameters: loaded.parameters,
+                            self.emit(if restarted {
+                                Event::PluginRestarted {
+                                    track,
+                                    slot,
+                                    latency,
+                                }
+                            } else {
+                                Event::PluginLoaded {
+                                    track,
+                                    slot,
+                                    latency,
+                                    parameters: loaded.parameters,
+                                }
                             });
                         }
                         Err(error) => {
@@ -1957,7 +2026,7 @@ impl Control {
     fn collect(&mut self) {
         self.collector.collect();
         let mut waiting = Vec::new();
-        for (slot, cell) in std::mem::take(&mut self.retired) {
+        for (serial, cell) in std::mem::take(&mut self.retired) {
             match Arc::try_unwrap(cell) {
                 Ok(cell) => {
                     let processor = match cell.into_inner() {
@@ -1966,12 +2035,47 @@ impl Control {
                     };
                     let _ = self
                         .host_requests
-                        .send(HostRequest::Unload { slot, processor });
+                        .send(HostRequest::Unload { serial, processor });
                 }
-                Err(cell) => waiting.push((slot, cell)),
+                Err(cell) => waiting.push((serial, cell)),
             }
         }
         self.retired = waiting;
+
+        let mut waiting = Vec::new();
+        for (slot, serial, cell) in std::mem::take(&mut self.restarting) {
+            match Arc::try_unwrap(cell) {
+                Ok(cell) => {
+                    let processor = match cell.into_inner() {
+                        NodeRt::Plugin(plugin) => Some(plugin.processor),
+                        _ => None,
+                    };
+                    let still_wanted = self.plugins.get(&slot).is_some_and(|e| e.serial == serial);
+                    match self.wanted_config(slot) {
+                        Some((config, buses)) if still_wanted => {
+                            let entry = self.plugins.get_mut(&slot).expect("just checked");
+                            entry.buses = buses;
+                            entry.max_block = config.max_block;
+                            let _ = self.host_requests.send(HostRequest::Restart {
+                                slot,
+                                serial,
+                                processor,
+                                config,
+                                buses,
+                            });
+                        }
+                        // Removed from the model in the meantime.
+                        _ => {
+                            let _ = self
+                                .host_requests
+                                .send(HostRequest::Unload { serial, processor });
+                        }
+                    }
+                }
+                Err(cell) => waiting.push((slot, serial, cell)),
+            }
+        }
+        self.restarting = waiting;
     }
 
     /// Transport changes at once; position and meters about thirty times a second.

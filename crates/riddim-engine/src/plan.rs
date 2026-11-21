@@ -216,6 +216,10 @@ pub(crate) struct PluginRt {
     /// not shift the track in time. `None` for a plugin with no latency.
     pub bypass_delay: Option<Box<DelayLine>>,
     pub was_bypassed: bool,
+    /// Channels of the main input and main output buses: the first of the channels the
+    /// plugin is given. What follows them is the sidechain and the extra outputs.
+    pub main_in: usize,
+    pub main_out: usize,
 }
 
 /// How many automated parameters per plugin are tracked for change detection. Lanes beyond

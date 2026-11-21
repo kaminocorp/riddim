@@ -265,6 +265,9 @@ impl Kernel for SynthKernel {
                                 voice.active = false;
                             }
                         }
+                        if let Some(out) = &out_events {
+                            unsafe { out.addEvent(&mut event) };
+                        }
                     }
                     _ => {}
                 }

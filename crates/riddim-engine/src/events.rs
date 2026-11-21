@@ -60,6 +60,13 @@ pub enum Event {
         slot: SlotId,
         error: String,
     },
+    /// A loaded plugin was taken out of the mix for a moment and activated again: its extra
+    /// outputs or sidechain were routed, or the buffer size changed. Its settings are intact.
+    PluginRestarted {
+        track: TrackId,
+        slot: SlotId,
+        latency: u32,
+    },
     /// A plugin's parameter changed from its editor or from the plugin itself.
     PluginParam {
         slot: SlotId,

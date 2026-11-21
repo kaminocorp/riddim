@@ -392,10 +392,14 @@ fn plugin_node(
                 delay.clear();
             }
         }
-        // Pass the main input through (an instrument has none, and is silent), delayed by the
-        // plugin's latency so the rest of the mix stays aligned with it.
+        // Pass the main input through to the main output (an instrument has none, and is
+        // silent), delayed by the plugin's latency so the rest of the mix stays aligned with
+        // it. The sidechain goes nowhere and the extra outputs are silent.
         for (c, output) in io.outputs.iter_mut().enumerate() {
             output[..frames].fill(0.0);
+            if c >= plugin.main_out || c >= plugin.main_in {
+                continue;
+            }
             let Some(input) = io.inputs.get(c) else {
                 continue;
             };
