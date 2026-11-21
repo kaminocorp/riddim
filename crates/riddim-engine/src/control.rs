@@ -246,6 +246,7 @@ pub(crate) struct ControlSetup {
     pub process_mode: ProcessMode,
     /// The device's count of missed deadlines, if it keeps one.
     pub xruns: Option<Arc<std::sync::atomic::AtomicU64>>,
+    pub streaming: crate::stream::StreamingConfig,
 }
 
 pub(crate) struct Control {
@@ -306,6 +307,9 @@ pub(crate) struct Control {
     last_load_report: Instant,
     xruns: Option<Arc<std::sync::atomic::AtomicU64>>,
     xruns_seen: u64,
+    /// Reads long files ahead of the playhead.
+    streamer: crate::stream::Streamer,
+    starved_seen: u64,
 }
 
 /// What mutes and solos leave to be heard.
@@ -426,7 +430,7 @@ impl Control {
             collector: setup.collector,
             host_requests: setup.host_requests,
             host_replies: setup.host_replies,
-            shared: setup.shared,
+            shared: setup.shared.clone(),
             snapshot: setup.snapshot,
             rate,
             max_block: setup.max_block,
@@ -445,7 +449,15 @@ impl Control {
             carried_params: HashMap::new(),
             plugins: HashMap::new(),
             meters: HashMap::new(),
-            media: MediaCache::new(setup.media_dir, rate),
+            media: MediaCache::new(
+                setup.media_dir,
+                rate,
+                setup.streaming,
+                setup.shared.stream.clone(),
+            ),
+            streamer: crate::stream::Streamer::start(setup.streaming, rate, setup.shared.clone())
+                .expect("the reader thread could not be started"),
+            starved_seen: 0,
             sources: HashMap::new(),
             plan_serial: 0,
             installed: (0, 0, 0),
@@ -1271,6 +1283,24 @@ impl Control {
             _ => None,
         };
         self.plan_serial += 1;
+        // Tell the reader where every streamed file now sits on the timeline.
+        let streamed: Vec<crate::stream::StreamClip> = self
+            .sources
+            .values()
+            .filter_map(|source| source.audio.as_ref())
+            .flat_map(|clips| clips.iter())
+            .filter(|clip| matches!(*clip.media, crate::plan::MediaAudio::Paged(_)))
+            .map(|clip| crate::stream::StreamClip {
+                media: clip.media.clone(),
+                start: clip.start,
+                offset: clip.offset,
+                length: clip.length,
+            })
+            .collect();
+        self.streamer.send(crate::stream::StreamMsg::Clips {
+            clips: streamed,
+            loop_range,
+        });
         let schedule = crate::exec::Schedule::new(steps.len());
         let rt_plan = Box::new(RtPlan {
             schedule,
@@ -1610,6 +1640,8 @@ impl Control {
                     return;
                 }
                 let sample = self.map.position_to_samples(position, self.rate);
+                // Give the reader a head start on wherever the playhead is going.
+                self.streamer.send(crate::stream::StreamMsg::Seek(sample));
                 self.send(ToAudio::Locate(sample));
             }
             TransportCommand::Record => self.start_recording(),
@@ -2499,6 +2531,11 @@ impl Control {
                 state,
                 position_samples: position,
             });
+        }
+        let starved = self.shared.stream.starved.load(Ordering::Relaxed);
+        if starved != self.starved_seen {
+            self.starved_seen = starved;
+            self.emit(Event::PlaybackStarved { total: starved });
         }
         if let Some(xruns) = &self.xruns {
             let total = xruns.load(Ordering::Relaxed);

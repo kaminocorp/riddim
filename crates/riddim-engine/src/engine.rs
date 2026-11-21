@@ -66,6 +66,8 @@ pub struct EngineConfig {
     /// Plans with fewer steps than this are rendered by the audio thread alone even when
     /// there are render threads: sharing out a handful of steps costs more than it saves.
     pub parallel_from: usize,
+    /// How long files are played from disk.
+    pub streaming: crate::stream::StreamingConfig,
 }
 
 /// The default for [`EngineConfig::parallel_from`].
@@ -89,6 +91,7 @@ impl EngineConfig {
             process_mode: riddim_plugin::ProcessMode::Realtime,
             render_threads: None,
             parallel_from: PARALLEL_FROM_STEPS,
+            streaming: Default::default(),
         }
     }
 }
@@ -146,6 +149,10 @@ pub struct Status {
     /// Messages from the audio thread that were lost because nobody was taking them fast
     /// enough. Should stay at zero.
     pub events_lost: u64,
+    /// Frames of files played from disk that were not read in time and played as silence.
+    pub playback_starved: u64,
+    /// Pages of files played from disk that are in memory right now.
+    pub stream_pages: u64,
 }
 
 enum Stream {
@@ -217,6 +224,7 @@ impl Engine {
             rate as u32,
             max_block,
             executor,
+            matches!(config.device, DeviceConfig::Manual(_)),
         );
 
         let opened = match config.device.clone() {
@@ -270,6 +278,7 @@ impl Engine {
                 Stream::Running(stream) => Some(stream.xrun_counter()),
                 Stream::Manual(_) => None,
             },
+            streaming: config.streaming,
         };
         let control_thread = std::thread::Builder::new()
             .name("riddim-control".into())
@@ -495,6 +504,8 @@ impl Engine {
                 .load(Ordering::Relaxed)
                 .max(self.shared.dsp_load.load(Ordering::Relaxed)),
             events_lost: self.shared.events_lost.load(Ordering::Relaxed),
+            playback_starved: self.shared.stream.starved.load(Ordering::Relaxed),
+            stream_pages: self.shared.stream.pages.load(Ordering::Relaxed),
         }
     }
 

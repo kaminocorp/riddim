@@ -10,6 +10,7 @@ use crate::plan::{
     MidiSourceRt, NodeRt, PluginRt, RtAudioClip, RtCurve, StepParams, TimedEvent,
     AUTOMATED_CAPACITY,
 };
+use crate::stream::Chunk;
 
 /// Everything about the block that is the same for every node.
 pub(crate) struct BlockCtx<'a> {
@@ -32,6 +33,9 @@ pub(crate) struct BlockCtx<'a> {
     pub tempo_map: &'a TempoMap,
     /// Click regardless of the metronome setting (count-in).
     pub force_click: bool,
+    /// There is no clock to keep up with (the manual device): a streamed file's page that is
+    /// not in memory is waited for instead of being played as silence.
+    pub blocking_disk: bool,
 }
 
 /// A node's audio and event connections for one block.
@@ -235,27 +239,45 @@ fn audio_source(
             }
             let from = clip.start.max(block_start);
             let to = clip_end.min(block_end);
-            let media_channels = clip.media.channels.len();
+            let media_channels = clip.media.channels();
             if media_channels == 0 {
                 continue;
             }
             for (c, output) in io.outputs.iter_mut().enumerate() {
                 // Mono media plays on both sides; extra media channels are ignored.
-                let source = &clip.media.channels[c.min(media_channels - 1)];
-                for timeline in from..to {
+                let channel = c.min(media_channels - 1);
+                let mut timeline = from;
+                while timeline < to {
                     let into_clip = timeline - clip.start;
-                    let Some(&sample) = source.get((clip.offset + into_clip) as usize) else {
-                        break;
+                    let frame = (clip.offset + into_clip) as usize;
+                    // The file is handed over a stretch at a time (a streamed one, a page at a
+                    // time); a stretch that is not in memory is left silent.
+                    let source = match clip.media.chunk(
+                        channel,
+                        frame,
+                        (to - timeline) as usize,
+                        ctx.blocking_disk,
+                    ) {
+                        Chunk::Data(source) => source,
+                        Chunk::Missing(frames) => {
+                            timeline += frames as i64;
+                            continue;
+                        }
+                        Chunk::End => break,
                     };
-                    let mut gain = clip.gain;
-                    if into_clip < clip.fade_in {
-                        gain *= into_clip as f32 / clip.fade_in as f32;
+                    for (i, &sample) in source.iter().enumerate() {
+                        let into_clip = into_clip + i as i64;
+                        let mut gain = clip.gain;
+                        if into_clip < clip.fade_in {
+                            gain *= into_clip as f32 / clip.fade_in as f32;
+                        }
+                        let from_end = clip.length - into_clip;
+                        if from_end <= clip.fade_out {
+                            gain *= from_end as f32 / clip.fade_out as f32;
+                        }
+                        output[(timeline - block_start) as usize + i] += sample * gain;
                     }
-                    let from_end = clip.length - into_clip;
-                    if from_end <= clip.fade_out {
-                        gain *= from_end as f32 / clip.fade_out as f32;
-                    }
-                    output[(timeline - block_start) as usize] += sample * gain;
+                    timeline += source.len() as i64;
                 }
             }
         }

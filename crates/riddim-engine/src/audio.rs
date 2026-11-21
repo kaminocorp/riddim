@@ -157,6 +157,8 @@ pub(crate) struct AudioEngine {
     sample_rate: u32,
     max_block: usize,
     executor: Executor,
+    /// The device has no clock (see `BlockCtx::blocking_disk`).
+    blocking_disk: bool,
 }
 
 impl AudioEngine {
@@ -170,6 +172,7 @@ impl AudioEngine {
         sample_rate: u32,
         max_block: usize,
         executor: Executor,
+        blocking_disk: bool,
     ) -> Self {
         Self {
             plan: None,
@@ -189,6 +192,7 @@ impl AudioEngine {
             sample_rate,
             max_block,
             executor,
+            blocking_disk,
         }
     }
 
@@ -406,6 +410,7 @@ impl AudioEngine {
             transport: &transport,
             tempo_map: &plan.tempo_map,
             force_click,
+            blocking_disk: self.blocking_disk,
         };
         let buffers = &mut *self.buffers;
         let replies = &mut self.replies;

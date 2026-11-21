@@ -17,14 +17,50 @@ use riddim_time::TempoMap;
 use crate::dsp::{Click, DelayLine, StereoGain};
 use crate::shared::MeterCell;
 
-/// Decoded media at the session's sample rate.
-pub struct MediaAudio {
-    pub channels: Vec<Vec<f32>>,
+/// A media file's audio at the session's sample rate: decoded into memory whole, or, for a
+/// long file, read from disk a page at a time as the playhead approaches.
+pub(crate) enum MediaAudio {
+    Memory { channels: Vec<Vec<f32>> },
+    Paged(crate::stream::PagedMedia),
 }
 
 impl MediaAudio {
     pub fn frames(&self) -> usize {
-        self.channels.first().map_or(0, Vec::len)
+        match self {
+            MediaAudio::Memory { channels } => channels.first().map_or(0, Vec::len),
+            MediaAudio::Paged(paged) => paged.frames(),
+        }
+    }
+
+    pub fn channels(&self) -> usize {
+        match self {
+            MediaAudio::Memory { channels } => channels.len(),
+            MediaAudio::Paged(paged) => paged.channels(),
+        }
+    }
+
+    /// The samples of `channel` from `frame` on: as many as can be handed over in one piece,
+    /// and at most `max`. `blocking` says a page that is not in memory may be waited for.
+    #[inline]
+    pub fn chunk(
+        &self,
+        channel: usize,
+        frame: usize,
+        max: usize,
+        blocking: bool,
+    ) -> crate::stream::Chunk<'_> {
+        match self {
+            MediaAudio::Memory { channels } => {
+                let source = &channels[channel];
+                if frame >= source.len() || max == 0 {
+                    crate::stream::Chunk::End
+                } else {
+                    let count = max.min(source.len() - frame);
+                    crate::stream::Chunk::Data(&source[frame..frame + count])
+                }
+            }
+            MediaAudio::Paged(paged) => paged.chunk(channel, frame, max, blocking),
+        }
     }
 }
 

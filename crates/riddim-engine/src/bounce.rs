@@ -122,6 +122,7 @@ pub fn bounce(model: &Model, request: &BounceRequest) -> Result<BounceResult, St
         butler: Default::default(),
         midi_input: false,
         process_mode: ProcessMode::Offline,
+        streaming: Default::default(),
         render_threads: Some(request.render_threads),
         // Nothing is waiting for a bounce to make its deadline, so even a small plan is
         // shared out when threads were asked for.

@@ -27,6 +27,7 @@ mod media;
 mod nodes;
 mod plan;
 mod shared;
+mod stream;
 mod workgroup;
 
 pub use bounce::{bounce, BounceRequest, BounceResult};
@@ -38,3 +39,4 @@ pub use engine::{
 pub use events::{Event, TransportState};
 pub use host::MainThread;
 pub use riddim_io::null::NullConfig;
+pub use stream::StreamingConfig;

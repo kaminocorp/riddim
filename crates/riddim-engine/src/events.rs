@@ -136,6 +136,11 @@ pub enum Event {
         input_latency_frames: u32,
         output_latency_frames: u32,
     },
+    /// A file being played from disk was not read in time, and a stretch of it played as
+    /// silence. `total` counts the frames lost that way since the engine started.
+    PlaybackStarved {
+        total: u64,
+    },
     /// The device missed a deadline. `total` counts them since the engine started.
     Xrun {
         total: u64,

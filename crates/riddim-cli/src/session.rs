@@ -203,6 +203,7 @@ impl Running {
             process_mode,
             render_threads: None,
             parallel_from: riddim::PARALLEL_FROM_STEPS,
+            streaming: Default::default(),
         };
         let mut engine = Engine::start(config).map_err(|e| e.to_string())?;
         let main = engine

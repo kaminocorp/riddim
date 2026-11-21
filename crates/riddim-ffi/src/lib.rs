@@ -101,6 +101,8 @@ pub struct RiddimStatus {
     pub dsp_load: f32,
     /// Messages from the audio thread that were lost. Should stay at zero.
     pub events_lost: u64,
+    /// Frames of files played from disk that were not read in time and played as silence.
+    pub playback_starved: u64,
 }
 
 /// Engine configuration as JSON.
@@ -208,6 +210,7 @@ fn engine_config(json: &str) -> Result<EngineConfig, String> {
         },
         render_threads: config.render_threads,
         parallel_from: riddim::PARALLEL_FROM_STEPS,
+        streaming: Default::default(),
     })
 }
 
@@ -664,6 +667,7 @@ pub unsafe extern "C" fn riddim_status(
             output_latency: s.output_latency,
             dsp_load: s.dsp_load,
             events_lost: s.events_lost,
+            playback_starved: s.playback_starved,
         };
     }
     1

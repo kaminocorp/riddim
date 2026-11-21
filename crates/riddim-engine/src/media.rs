@@ -12,19 +12,29 @@ use riddim_disk::{resample, wav};
 use riddim_model::{Media, MediaId};
 
 use crate::plan::MediaAudio;
+use crate::stream::{PagedMedia, StreamStats, StreamingConfig};
 
 pub(crate) struct MediaCache {
     media_dir: PathBuf,
     session_rate: u32,
     loaded: HashMap<MediaId, Result<Arc<MediaAudio>, String>>,
+    streaming: StreamingConfig,
+    stats: Arc<StreamStats>,
 }
 
 impl MediaCache {
-    pub fn new(media_dir: PathBuf, session_rate: u32) -> Self {
+    pub fn new(
+        media_dir: PathBuf,
+        session_rate: u32,
+        streaming: StreamingConfig,
+        stats: Arc<StreamStats>,
+    ) -> Self {
         Self {
             media_dir,
             session_rate,
             loaded: HashMap::new(),
+            streaming,
+            stats,
         }
     }
 
@@ -44,14 +54,30 @@ impl MediaCache {
             return (existing.clone(), false);
         }
         let path = self.resolve(&media.path);
-        let result = wav::read(&path)
-            .map(|data| {
-                let data = resample::resample(data, self.session_rate);
-                Arc::new(MediaAudio {
-                    channels: data.channels,
+        // A long file that needs no conversion is played from disk; anything else is decoded
+        // (and, if need be, resampled) into memory.
+        let streamed = wav::probe(&path).ok().filter(|info| {
+            info.sample_rate == self.session_rate
+                && info.channels > 0
+                && info.frames >= self.streaming.threshold_frames
+        });
+        let result = match streamed {
+            Some(info) => Ok(Arc::new(MediaAudio::Paged(PagedMedia::new(
+                path.clone(),
+                info.channels as usize,
+                info.frames as usize,
+                self.streaming.page_frames,
+                self.stats.clone(),
+            )))),
+            None => wav::read(&path)
+                .map(|data| {
+                    let data = resample::resample(data, self.session_rate);
+                    Arc::new(MediaAudio::Memory {
+                        channels: data.channels,
+                    })
                 })
-            })
-            .map_err(|e| format!("{}: {e}", path.display()));
+                .map_err(|e| format!("{}: {e}", path.display())),
+        };
         self.loaded.insert(media.id, result.clone());
         (result, true)
     }

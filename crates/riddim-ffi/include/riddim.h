@@ -73,6 +73,8 @@ typedef struct RiddimStatus {
     float dsp_load;
     // Messages from the audio thread that were lost. Should stay at zero.
     uint64_t events_lost;
+    // Frames of files played from disk that were not read in time and played as silence.
+    uint64_t playback_starved;
 } RiddimStatus;
 
 #ifdef __cplusplus

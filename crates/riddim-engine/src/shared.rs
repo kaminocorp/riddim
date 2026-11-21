@@ -35,6 +35,8 @@ pub struct Shared {
     pub dsp_load: AtomicF32,
     /// The last value of `dsp_load` that was reported: the load over the second before.
     pub dsp_load_reported: AtomicF32,
+    /// What the files played from disk are doing.
+    pub stream: std::sync::Arc<crate::stream::StreamStats>,
 }
 
 /// Peak meter for one strip. The audio thread raises the peaks; whoever reads them takes the
