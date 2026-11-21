@@ -1,0 +1,20 @@
+[package]
+name = "riddim-model"
+description = "The Riddim engine model: tracks, clips, routing, plugin slots, and the edit operations that change them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+riddim-time = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

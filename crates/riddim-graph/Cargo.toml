@@ -1,0 +1,18 @@
+[package]
+name = "riddim-graph"
+description = "Render-plan compilation for Riddim: topological order, latency compensation, buffer assignment and the parallel schedule"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+riddim-model.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

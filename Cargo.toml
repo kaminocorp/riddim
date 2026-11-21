@@ -2,6 +2,9 @@
 resolver = "2"
 members = [
     "crates/riddim-rt",
+    "crates/riddim-time",
+    "crates/riddim-model",
+    "crates/riddim-graph",
     "crates/riddim-plugin",
     "crates/riddim-io",
     "crates/riddim-cli",
@@ -20,17 +23,21 @@ publish = false
 
 [workspace.dependencies]
 riddim-rt = { path = "crates/riddim-rt" }
+riddim-time = { path = "crates/riddim-time" }
+riddim-model = { path = "crates/riddim-model" }
+riddim-graph = { path = "crates/riddim-graph" }
 riddim-plugin = { path = "crates/riddim-plugin" }
 riddim-io = { path = "crates/riddim-io" }
 riddim-test-support = { path = "fixtures/support" }
 
 rtrb = "0.4.1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 vst3 = "0.3.0"
 libloading = "0.9"
 crossbeam-queue = "0.3"
 clap = { version = "4", features = ["derive"] }
+proptest = "1"
 
 # macOS system frameworks (only built on macOS).
 objc2 = "0.6"
