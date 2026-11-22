@@ -34,8 +34,11 @@ pub const RESTART_PARAM_TITLES_CHANGED: i32 = 1 << 4;
 /// Setting this "parameter" on the controller makes the plugin act on its own behalf. The
 /// value, times eight, picks what: 1 drags its first parameter to 0.75 (begin, perform, end);
 /// 2 says its state is dirty; 3 says its parameter values changed; 4 that its parameter list
-/// did; 5 asks to be restarted.
+/// did; 5 asks to be restarted; 6 aborts the process; 7 makes `process` hang from then on.
 pub const COMMAND_PARAM: u32 = 0x7E57_0001;
+
+/// Set by command 7: `process` never returns again, in any instance in this process.
+pub static HANG: AtomicBool = AtomicBool::new(false);
 
 pub struct BusSpec {
     pub name: &'static str,
@@ -430,6 +433,9 @@ impl<K: Kernel> IAudioProcessorTrait for Processor<K> {
     }
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        while HANG.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
         let data = unsafe { &*data };
         if let Some(changes) = unsafe { ComRef::from_raw(data.inputParameterChanges) } {
             for index in 0..unsafe { changes.getParameterCount() } {
@@ -501,6 +507,10 @@ impl<K: Kernel> Controller<K> {
                 5 => {
                     handler.restartComponent(RESTART_RELOAD_COMPONENT);
                 }
+                // Take the whole process down, as a plugin bug would.
+                6 => std::process::abort(),
+                // Stop answering: every `process` call from now on never returns.
+                7 => HANG.store(true, Ordering::SeqCst),
                 _ => {}
             }
         }

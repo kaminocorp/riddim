@@ -163,6 +163,10 @@ struct DeviceArgs {
     /// Change to this buffer size a few seconds in, while running.
     #[arg(long, value_name = "FRAMES")]
     switch_buffer: Option<u32>,
+    /// Let each plugin's first block run on the audio thread, instead of giving it one block
+    /// of silence where it was loaded. For finding out whether a plugin minds the latter.
+    #[arg(long)]
+    no_warm_up: bool,
 }
 
 impl DeviceArgs {
@@ -175,6 +179,7 @@ impl DeviceArgs {
             capture: false,
             render_threads: self.render_threads,
             switch_buffer: self.switch_buffer,
+            warm_up: !self.no_warm_up,
         }
     }
 }
@@ -211,6 +216,17 @@ enum SessionAction {
         /// Automate the instrument's fader from silence to full over this many beats.
         #[arg(long, value_name = "BEATS")]
         fade_in: Option<u32>,
+        /// Run each plugin in a process of its own (riddim-bridge): a crash then costs only
+        /// that plugin.
+        #[arg(long)]
+        bridged: bool,
+        /// Make this many instrument tracks, each with the instrument, its material and its
+        /// inserts: `--copies 4` with five `--insert`s is four instruments and twenty effects.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        copies: u8,
+        /// Loop the instrument's material, so the project plays for as long as it is left to.
+        #[arg(long)]
+        looped: bool,
     },
     /// Describe a project file.
     Info { project: PathBuf },
@@ -409,6 +425,9 @@ fn main() -> ExitCode {
                 insert,
                 send_effect,
                 fade_in,
+                bridged,
+                copies,
+                looped,
             } => match audio_input.as_deref().map(parse_inputs).transpose() {
                 Ok(audio_input) => session::session_new(
                     &context,
@@ -423,6 +442,9 @@ fn main() -> ExitCode {
                         inserts: insert,
                         send_effect,
                         fade_in,
+                        bridged,
+                        copies,
+                        looped,
                     },
                 ),
                 Err(message) => Err(message),

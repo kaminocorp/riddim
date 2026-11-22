@@ -342,11 +342,20 @@ Riddim phases map onto the Whiplash phases (its §8). Estimates are **[estimates
 
 1. **Rust-first vs Tracktion + JUCE.** Is Riddim the path for Whiplash, given that it pushes Whiplash v0 back by months? Or is Riddim a parallel track, with Whiplash starting on Tracktion and swapping later (the Whiplash doc's "keep an exit")? This is the decision both docs hang on.
 2. **Whiplash's UI stack.** Swift/AppKit, Rust (which toolkit?) or something else? It decides how the C ABI and the `MainThread` handle look.
+   - **Answered (Phil, 21 Nov 2026): Tauri 2.** A Rust core that links Riddim, a TypeScript web UI, WebGPU for waveforms and meters. Decision D83; [`docs/api/embedding.md`](../api/embedding.md).
 3. **Is the P1 exit bar right?** Specifically: both formats, and an identical state blob after save, restore and save again.
 4. **Out-of-process:** is in-process with crash survival acceptable for v1, with the bridge in v1.x?
 5. **Phil's Mac:** the exact model, macOS version and interface (2i2 4th gen?). These set the performance targets in P4.
+   - **Answered (Phil, 21 Nov 2026): a Mac Mini with an M4 Pro, and a Focusrite Scarlett 2i2 of the 2nd or 3rd generation** (which of the two is not known; the macOS version was not given). Decision D77.
 6. **Helix:** Helix Native or Helix Stadium Native?
+   - **Answered (Phil, 21 Nov 2026): neither is owned yet.** Helix is a future test plugin, not a requirement. Decision D78.
 7. **Licence:** AGPL-3.0-only (recommended) or GPL-3.0-only? Is a server-side renderer plausible?
+   - **Answered in part (Phil, 21 Nov 2026): no change.** AGPL-3.0-only stays (D2). Whether a server-side renderer is plausible is **still open**. Decision D80.
 8. **Copyright owner:** Kamino (the company) or Phil personally, for Riddim and for Whiplash? This decides whether an internal licence is needed and who signs the CLA.
+   - **Answered (Phil, 21 Nov 2026): the company, for both.** Kamino Research Corporation (legal entity: Bradgate Capital Management Pte Ltd, Singapore). One owner for Riddim and Whiplash, so no internal licence is needed. Decision D79.
 9. **When does the repo go public?** Before or after P1, and who takes outside contributions (CLA tooling)?
+   - **Answered (Phil, 21 Nov 2026): now.** Contributions are welcome and Phil reviews every one. Decision D81; `CONTRIBUTING.md`, `CLA.md`.
 10. **Windows:** is it "later" in the v1.x sense, or "if ever"? It affects how much we abstract `riddim-io` now.
+    - **Answered (Phil, 21 Nov 2026): wanted, later.** The core stays portable now; WASAPI and ASIO are future backends. Decision D82.
+
+Question 1 was settled by Phil's go-ahead (decision D1). Questions 3 and 4 have not been answered and stand at their recommended defaults (decisions D4 and D3).

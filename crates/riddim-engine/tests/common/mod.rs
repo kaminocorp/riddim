@@ -135,6 +135,7 @@ pub fn fixture_slot(id: u64, uid: &str) -> PluginSlot {
         bypass: false,
         outputs: Vec::new(),
         sidechain: None,
+        bridged: false,
     }
 }
 

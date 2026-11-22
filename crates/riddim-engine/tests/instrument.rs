@@ -242,6 +242,7 @@ fn a_missing_plugin_is_reported_and_the_rest_of_the_project_plays() {
         bypass: false,
         outputs: Vec::new(),
         sidechain: None,
+        bridged: false,
     };
     engine
         .apply_wait(vec![

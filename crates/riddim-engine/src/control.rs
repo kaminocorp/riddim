@@ -39,7 +39,11 @@ use crate::plan::{
 use crate::shared::{MeterCell, Shared};
 
 /// A transport request from the client.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// As JSON: `{"command":"play"}`, `{"command":"stop"}`, `{"command":"record"}`,
+/// `{"command":"locate","position":{"beats":0}}`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "command", content = "position")]
 pub enum TransportCommand {
     Play,
     Stop,
@@ -50,7 +54,7 @@ pub enum TransportCommand {
 }
 
 /// The result of a successfully applied batch.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Applied {
     pub revision: u64,
     /// Undo the batch by applying these first to last.
@@ -63,6 +67,17 @@ pub struct Rejected {
     /// The op in the batch that failed.
     pub index: usize,
     pub error: OpError,
+}
+
+/// As JSON: `{"index": 2, "error": "..."}`, the error in words, as events carry it.
+impl serde::Serialize for Rejected {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("Rejected", 2)?;
+        out.serialize_field("index", &self.index)?;
+        out.serialize_field("error", &self.error.to_string())?;
+        out.end()
+    }
 }
 
 pub(crate) enum ControlMsg {
@@ -783,6 +798,7 @@ impl Control {
                     state: slot.state.clone(),
                     config,
                     buses,
+                    bridged: slot.bridged,
                 });
             }
         }
@@ -1450,6 +1466,12 @@ impl Control {
     fn automation_value(&mut self, track: TrackId, target: AutomationTarget, value: f32) {
         // Hear about any jump of the playhead first, so this value lands in the right pass.
         self.poll_audio();
+        self.record_automation_value(track, target, value);
+    }
+
+    /// As [`automation_value`](Self::automation_value), for a value that came from the audio
+    /// thread itself (and so is already in order with any jump it reported).
+    fn record_automation_value(&mut self, track: TrackId, target: AutomationTarget, value: f32) {
         if !self.shared.playing.load(Ordering::Acquire) {
             return;
         }
@@ -2261,6 +2283,13 @@ impl Control {
                         .host_requests
                         .send(HostRequest::NotifyParam { slot, id, value });
                     self.emit(Event::PluginParam { slot, id, value });
+                    // A change the plugin made on its audio side (for a CLAP plugin, that is
+                    // how a knob turned in its editor arrives) is automation to be written
+                    // like any other, if its lane is being written.
+                    if let Some(track) = self.plugins.get(&slot).map(|entry| entry.track) {
+                        let target = AutomationTarget::PluginParam { slot, param: id };
+                        self.record_automation_value(track, target, value as f32);
+                    }
                 }
                 FromAudio::Jumped { from, to } => {
                     // While recording, the only jumps are loop wraps: each starts a new pass.
@@ -2411,6 +2440,21 @@ impl Control {
                         }
                         (PluginEvent::StateDirty, _) => {
                             self.emit(Event::PluginStateDirty { slot });
+                        }
+                        // A bridged plugin's process died or hung. Take what is left of it
+                        // out of the mix; everything else carries on.
+                        (PluginEvent::Crashed, Some(track)) => {
+                            if let Some(entry) = self.plugins.get_mut(&slot) {
+                                entry.status = PluginStatus::Failed;
+                                let serial = entry.serial;
+                                if let Some(cell) =
+                                    self.cells.remove(&NodeKind::Plugin(track, slot))
+                                {
+                                    self.retired.push((serial, cell));
+                                }
+                            }
+                            self.rebuild_plan();
+                            self.emit(Event::PluginCrashed { track, slot });
                         }
                         (PluginEvent::EditorResizeRequest { width, height }, _) => {
                             self.emit(Event::PluginEditorResize {

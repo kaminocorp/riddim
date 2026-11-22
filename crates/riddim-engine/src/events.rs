@@ -15,8 +15,12 @@ pub enum TransportState {
 /// An event from the engine. Subscribe with [`Engine::subscribe`](crate::Engine::subscribe).
 ///
 /// Events serialise as JSON objects tagged with `"event"`, which is how they cross the C ABI.
+///
+/// More kinds of event will be added over time, and existing ones may gain fields: match with
+/// a wildcard arm, and ignore what you do not know.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "event")]
+#[non_exhaustive]
 pub enum Event {
     /// A batch of ops was applied. `inverses` undo it, applied first to last.
     Applied {
@@ -65,6 +69,13 @@ pub enum Event {
         track: TrackId,
         slot: SlotId,
         error: String,
+    },
+    /// A plugin running in a process of its own (a bridged slot) crashed or stopped
+    /// answering. It is out of the mix; the session carries on. Removing the slot and
+    /// inserting it again starts a fresh one.
+    PluginCrashed {
+        track: TrackId,
+        slot: SlotId,
     },
     /// A loaded plugin was taken out of the mix for a moment and activated again: its extra
     /// outputs or sidechain were routed, or the buffer size changed. Its settings are intact.

@@ -21,28 +21,31 @@ use riddim_model::{
     Op, PluginRef, PluginSlot, Send, SendId, SlotId, TrackId, TrackKind,
 };
 use riddim_plugin::scan::{ScanOutcome, ScanTarget, Scanner};
-use riddim_plugin::{PluginDescriptor, PluginFormat, PluginKind};
+use riddim_plugin::{PluginDescriptor, PluginKind};
 use riddim_rt::guard::RtCheckAllocator;
 
 #[global_allocator]
 static ALLOC: RtCheckAllocator = RtCheckAllocator::system();
 
-fn descriptors() -> Vec<PluginDescriptor> {
-    let bundles: Vec<std::path::PathBuf> = std::env::var("RIDDIM_TEST_VST3")
-        .map(|v| {
-            v.split(';')
-                .filter(|s| !s.is_empty())
-                .map(Into::into)
-                .collect()
-        })
-        .unwrap_or_default();
+fn descriptors(format: &str) -> Vec<PluginDescriptor> {
+    // CLAP plugins are preferred when both kinds are named: the VST3 builds of the same
+    // plugins are exercised by the conformance run in any case.
+    let named = |variable: &str| -> Vec<std::path::PathBuf> {
+        std::env::var(variable)
+            .map(|v| {
+                v.split(';')
+                    .filter(|s| !s.is_empty())
+                    .map(Into::into)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut bundles = named(&format!("RIDDIM_TEST_{}", format.to_uppercase()));
+    bundles.retain(|path: &std::path::PathBuf| path.exists());
     let scanner = Scanner::new(riddim_test_support::scanner_exe());
     let mut found = Vec::new();
     for bundle in bundles {
-        let target = ScanTarget {
-            format: PluginFormat::Vst3,
-            path: Some(bundle.clone()),
-        };
+        let target = ScanTarget::for_path(bundle.clone());
         match scanner.scan(&target) {
             ScanOutcome::Ok(plugins) => found.extend(plugins),
             other => panic!("{} did not scan: {other:?}", bundle.display()),
@@ -67,6 +70,7 @@ fn slot(id: u64, descriptor: &PluginDescriptor) -> PluginSlot {
         bypass: false,
         outputs: Vec::new(),
         sidechain: None,
+        bridged: false,
     }
 }
 
@@ -80,19 +84,32 @@ fn point(beat: i64, value: f32) -> AutomationPoint {
 
 #[test]
 fn a_demo_song_through_third_party_plugins_bounces() {
-    let found = descriptors();
+    demo_song("vst3");
+}
+
+#[test]
+fn a_demo_song_through_third_party_clap_plugins_bounces() {
+    demo_song("clap");
+}
+
+fn demo_song(format: &str) {
+    let found = descriptors(format);
     let instrument = found.iter().find(|d| d.kind == PluginKind::Instrument);
     let effect = found.iter().find(|d| d.kind == PluginKind::Effect);
     let (Some(instrument), Some(effect)) = (instrument, effect) else {
         eprintln!(
-            "RIDDIM_TEST_VST3 does not name an instrument and an effect: no demo song was bounced"
+            "RIDDIM_TEST_{} does not name an instrument and an effect: no demo song was bounced",
+            format.to_uppercase()
         );
         return;
     };
-    eprintln!("demo song: {} into {}", instrument.name, effect.name);
+    eprintln!(
+        "demo song ({format}): {} into {}",
+        instrument.name, effect.name
+    );
 
     // Build the song in a live engine, as an application would.
-    let dir = temp_dir("demo-song");
+    let dir = temp_dir(&format!("demo-song-{format}"));
     let mut engine = engine_with(
         &dir,
         riddim_engine::NullConfig {

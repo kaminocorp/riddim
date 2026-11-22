@@ -197,6 +197,7 @@ fn realise(seed: &Seed, model: &Model) -> Option<Op> {
                     bypass: seed.b % 5 == 0,
                     outputs: Vec::new(),
                     sidechain: None,
+                    bridged: false,
                 },
             }
         }

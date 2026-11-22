@@ -1054,12 +1054,14 @@ fn a_slow_loading_plugin_does_not_stall_the_audio() {
     engine.sync();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Ask for the slow plugin and watch the block counter while it loads.
+    // Ask for the slow plugin and watch the block counter while it loads. (The slot is made
+    // first: making it builds the fixture if it is stale, which is not what is being timed.)
+    let slot = fixture_slot(12, ids::SLOW_UID);
     let started = std::time::Instant::now();
     engine.apply(vec![Op::InsertPlugin {
         track: TrackId(10),
         index: 0,
-        slot: fixture_slot(12, ids::SLOW_UID),
+        slot,
     }]);
     // The engine keeps taking edits while the plugin loads: a fader move goes through at once.
     engine
@@ -1084,6 +1086,14 @@ fn a_slow_loading_plugin_does_not_stall_the_audio() {
         }
     }
     let loaded_after = loaded_after.expect("the slow plugin never loaded");
+    // Keep watching after it has loaded: that is when it joins the plan and gets its first
+    // block from the audio thread. The fixture takes 150 ms over the first block it is ever
+    // given, so that block had better have been given to it somewhere else.
+    let watch_until = started.elapsed() + std::time::Duration::from_millis(400);
+    while started.elapsed() < watch_until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        samples.push((started.elapsed(), engine.status().blocks));
+    }
     assert!(
         edit_took < std::time::Duration::from_millis(ids::SLOW_LOAD_MS / 2),
         "an edit made during the load took {edit_took:?}: it waited for the plugin"
@@ -1093,19 +1103,29 @@ fn a_slow_loading_plugin_does_not_stall_the_audio() {
         "the plugin loaded in {loaded_after:?}; it is supposed to be slow"
     );
 
-    // While it loaded, the audio callback never went quiet: between any two looks at the
-    // counter 10 ms apart (7.5 blocks at 64 frames), it had always moved on.
-    let longest_stall = samples
-        .windows(2)
-        .filter(|w| w[1].1 == w[0].1)
-        .map(|w| w[1].0 - w[0].0)
-        .max();
+    // While it loaded and when it joined, the audio callback never went quiet: the counter
+    // (7.5 blocks every 10 ms at 64 frames) never stood still for long. The longest time it
+    // did is measured across looks, from the last one that saw it move.
+    let mut longest_stall = std::time::Duration::ZERO;
+    let mut moved_at = samples[0];
+    for &(at, blocks) in &samples[1..] {
+        if blocks == moved_at.1 {
+            longest_stall = longest_stall.max(at - moved_at.0);
+        } else {
+            moved_at = (at, blocks);
+        }
+    }
+    let allowed = std::time::Duration::from_millis(ids::SLOW_FIRST_BLOCK_MS * 2 / 3);
     assert!(
-        longest_stall.is_none_or(|gap| gap < std::time::Duration::from_millis(40)),
-        "the audio callback stalled for {longest_stall:?} while a plugin was loading"
+        longest_stall < allowed,
+        "the audio callback stalled for {longest_stall:?} while a plugin was loading or joining"
     );
-    let blocks = samples.last().unwrap().1 - samples[0].1;
-    let expected = loaded_after.as_secs_f64() * 48_000.0 / 64.0;
+    let loaded_at = samples
+        .iter()
+        .rposition(|(at, _)| *at <= loaded_after)
+        .unwrap_or(0);
+    let blocks = samples[loaded_at].1 - samples[0].1;
+    let expected = samples[loaded_at].0.as_secs_f64() * 48_000.0 / 64.0;
     assert!(
         blocks as f64 > expected * 0.7,
         "only {blocks} blocks ran in {loaded_after:?} (expected about {expected:.0})"

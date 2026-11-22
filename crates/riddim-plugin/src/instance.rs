@@ -91,6 +91,9 @@ pub enum PluginEvent {
         width: u32,
         height: u32,
     },
+    /// The plugin is gone: it ran in a process of its own and that process died or stopped
+    /// answering. Nothing more will come from this instance; its audio side gives silence.
+    Crashed,
 }
 
 /// Editor size in points.
@@ -198,6 +201,14 @@ pub trait PluginInstance {
 pub trait PluginProcessor: Send {
     /// Renders one block.
     fn process(&mut self, context: &mut ProcessContext<'_>) -> ProcessStatus;
+
+    /// Renders the first block after activation, when the host chooses to give the plugin
+    /// one before the audio thread has the processor: once, on the thread that activated the
+    /// plugin, with nothing waiting for the result. An implementation with a deadline of its
+    /// own for a block has no use for it here.
+    fn first_block(&mut self, context: &mut ProcessContext<'_>) -> ProcessStatus {
+        self.process(context)
+    }
 
     /// Clears voices, delay lines and tails, as after a transport jump.
     fn reset(&mut self) {}

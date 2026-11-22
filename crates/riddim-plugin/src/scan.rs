@@ -66,6 +66,25 @@ pub struct ScanTarget {
     pub path: Option<PathBuf>,
 }
 
+impl ScanTarget {
+    /// The target for one plugin file or bundle, its format told from its extension
+    /// (`.clap` is CLAP; anything else is taken for VST3).
+    pub fn for_path(path: impl Into<PathBuf>) -> ScanTarget {
+        let path = path.into();
+        let clap = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("clap"));
+        ScanTarget {
+            format: if clap {
+                PluginFormat::Clap
+            } else {
+                PluginFormat::Vst3
+            },
+            path: Some(path),
+        }
+    }
+}
+
 /// The result of scanning many targets.
 #[derive(Clone, Debug, Default)]
 pub struct ScanReport {
@@ -92,7 +111,13 @@ pub fn scan_in_process(target: &ScanTarget) -> Result<Vec<PluginDescriptor>> {
         PluginFormat::AudioUnit => format::au::scan(),
         #[cfg(not(target_os = "macos"))]
         PluginFormat::AudioUnit => Err(PluginError::Unsupported("Audio Units need macOS")),
-        PluginFormat::Clap => Err(PluginError::Unsupported("CLAP scanning arrives after v1")),
+        PluginFormat::Clap => {
+            let path = target
+                .path
+                .as_deref()
+                .ok_or_else(|| PluginError::Scan("a CLAP scan needs a file path".into()))?;
+            format::clap::scan_bundle(path)
+        }
         PluginFormat::Internal => Ok(Vec::new()),
     }
 }
@@ -657,10 +682,10 @@ impl Scanner {
     }
 }
 
-/// Everything there is to scan in the default locations (plus `extra_vst3_dirs`).
-pub fn default_targets(extra_vst3_dirs: &[PathBuf]) -> Vec<ScanTarget> {
+/// Everything there is to scan in the default locations (plus `extra_dirs`).
+pub fn default_targets(extra_dirs: &[PathBuf]) -> Vec<ScanTarget> {
     let mut dirs = format::vst3::default_search_paths();
-    dirs.extend(extra_vst3_dirs.iter().cloned());
+    dirs.extend(extra_dirs.iter().cloned());
     let mut targets: Vec<ScanTarget> = format::vst3::find_bundles(&dirs)
         .into_iter()
         .map(|path| ScanTarget {
@@ -668,6 +693,17 @@ pub fn default_targets(extra_vst3_dirs: &[PathBuf]) -> Vec<ScanTarget> {
             path: Some(path),
         })
         .collect();
+    // The extra directories are searched for CLAP plugins as well.
+    let mut dirs = format::clap::default_search_paths();
+    dirs.extend(extra_dirs.iter().cloned());
+    targets.extend(
+        format::clap::find_bundles(&dirs)
+            .into_iter()
+            .map(|path| ScanTarget {
+                format: PluginFormat::Clap,
+                path: Some(path),
+            }),
+    );
     if cfg!(target_os = "macos") {
         targets.push(ScanTarget {
             format: PluginFormat::AudioUnit,

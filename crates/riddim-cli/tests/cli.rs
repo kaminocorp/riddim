@@ -784,3 +784,198 @@ fn loop_takes_punch_routing_threads_and_a_live_buffer_change() {
     assert!(text.contains("messages lost 0"), "{text}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_project_with_bridged_plugins_renders_what_it_renders_in_process() {
+    let dir = temp_dir("bridged");
+    let render = |name: &str, extra: &[&str]| {
+        let project = dir.join(format!("{name}.json"));
+        let mut args = vec!["session", "new", project.to_str().unwrap(), "--instrument"];
+        let synth = plugin("synth");
+        let delay = plugin("delay");
+        args.extend_from_slice(&[&synth, "--sequence", "--insert", &delay]);
+        args.extend_from_slice(extra);
+        let created = riddim(&args);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let out = dir.join(format!("{name}.wav"));
+        let rendered = riddim(&[
+            "session",
+            "render",
+            project.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--seconds",
+            "2",
+        ]);
+        assert!(
+            rendered.status.success(),
+            "{}{}",
+            stdout(&rendered),
+            String::from_utf8_lossy(&rendered.stderr)
+        );
+        (
+            std::fs::read(out).unwrap(),
+            stdout(&riddim(&["session", "info", project.to_str().unwrap()])),
+        )
+    };
+    let (in_process, info) = render("in-process", &[]);
+    assert!(!info.contains("in a process of its own"), "{info}");
+    // The bridge executable is found beside the tool, as it would be when installed.
+    let (bridged, info) = render("bridged", &["--bridged"]);
+    assert_eq!(info.matches("in a process of its own").count(), 2, "{info}");
+    assert!(
+        bridged == in_process,
+        "bridging the plugins changed the bounce"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_reference_session_is_one_command() {
+    let dir = temp_dir("reference");
+    let project = dir.join("reference.json");
+    let project_arg = project.to_str().unwrap();
+    let ok = |output: Output| {
+        assert!(
+            output.status.success(),
+            "{}{}",
+            stdout(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout(&output)
+    };
+    // Four instruments, five effects after each: the shape of the vision's reference session.
+    let (gain, delay) = (plugin("gain"), plugin("delay"));
+    let mut args = vec![
+        "session",
+        "new",
+        project_arg,
+        "--instrument",
+        "synth",
+        "--sequence",
+        "--copies",
+        "4",
+        "--looped",
+    ];
+    let synth = plugin("synth");
+    args[4] = &synth;
+    for effect in [&gain, &delay, &gain, &delay, &gain] {
+        args.extend(["--insert", effect.as_str()]);
+    }
+    let text = ok(riddim(&args));
+    assert!(text.contains("4 track(s)"), "{text}");
+
+    let info = ok(riddim(&["session", "info", project_arg]));
+    assert_eq!(
+        info.matches("  instrument Riddim Test Synth").count(),
+        4,
+        "{info}"
+    );
+    assert_eq!(info.matches("      plugin ").count(), 24, "{info}");
+    assert_eq!(info.matches("Riddim Test Synth").count(), 8, "{info}");
+    assert!(info.contains("loop beats 0.00 to 4.00 (on)"), "{info}");
+    // Every slot and clip has an id of its own, or the project would not have been accepted;
+    // the copies are turned down so that together they are as loud as one.
+    assert_eq!(info.matches("gain 0.25").count(), 4, "{info}");
+
+    // It plays, looping, at 64 frames: longer than the material is, and still sounding. The
+    // summary's load figure covers the whole run.
+    let text = ok(riddim(&[
+        "session",
+        "play",
+        project_arg,
+        "--null-device",
+        "--buffer",
+        "64",
+        "--seconds",
+        "3",
+    ]));
+    assert!(text.contains("audio-thread heap operations 0"), "{text}");
+    assert!(text.contains("seconds had a block over its time"), "{text}");
+    assert_eq!(text.matches("plugin loaded").count(), 24, "{text}");
+
+    // The options need an instrument to copy.
+    let lonely = riddim(&[
+        "session",
+        "new",
+        dir.join("lonely.json").to_str().unwrap(),
+        "--copies",
+        "2",
+    ]);
+    assert_eq!(lonely.status.code(), Some(2));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_clap_plugin_is_checked_played_and_rendered_like_any_other() {
+    let dir = temp_dir("clap");
+    let project = dir.join("clap.json");
+    let project_arg = project.to_str().unwrap();
+    let ok = |output: Output| {
+        assert!(
+            output.status.success(),
+            "{}{}",
+            stdout(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout(&output)
+    };
+    let bundle = riddim_test_support::clapplug_bundle();
+    let synth = format!("{}#Riddim CLAP Synth", bundle.display());
+    let delay = format!("{}#Riddim CLAP Delay", bundle.display());
+
+    // The conformance run, on a `.clap` named by its path.
+    let checked = ok(riddim(&["check", &synth]));
+    assert!(checked.contains("=> passed"), "{checked}");
+
+    ok(riddim(&[
+        "session",
+        "new",
+        project_arg,
+        "--instrument",
+        &synth,
+        "--sequence",
+        "--insert",
+        &delay,
+    ]));
+    let info = ok(riddim(&["session", "info", project_arg]));
+    assert!(info.contains("(clap:dev.riddim.test.clap-synth"), "{info}");
+    assert!(info.contains("(clap:dev.riddim.test.clap-delay"), "{info}");
+
+    // It renders, the same bytes each time, and it plays on a device.
+    let render = |name: &str| {
+        let out = dir.join(name);
+        let text = ok(riddim(&[
+            "session",
+            "render",
+            project_arg,
+            "--out",
+            out.to_str().unwrap(),
+            "--seconds",
+            "2",
+        ]));
+        assert!(text.contains("rendered 2.00 s"), "{text}");
+        std::fs::read(out).unwrap()
+    };
+    let first = render("one.wav");
+    assert!(first == render("two.wav"), "two renders differ");
+    assert!(
+        first[44..].iter().any(|&byte| byte != 0),
+        "the render is silent"
+    );
+    let text = ok(riddim(&[
+        "session",
+        "play",
+        project_arg,
+        "--null-device",
+        "--seconds",
+        "1",
+    ]));
+    assert_eq!(text.matches("plugin loaded").count(), 2, "{text}");
+    assert!(text.contains("audio-thread heap operations 0"), "{text}");
+    std::fs::remove_dir_all(&dir).ok();
+}

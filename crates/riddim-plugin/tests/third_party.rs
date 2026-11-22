@@ -1,8 +1,10 @@
 //! Conformance runs against plugins that are not part of this repository.
 //!
-//! Set `RIDDIM_TEST_VST3` to one or more `.vst3` bundle paths (separated by `;`) to run them.
-//! CI points it at Surge XT; on a developer machine it can point at anything installed. Without
-//! the variable the tests pass vacuously and say so.
+//! Set `RIDDIM_TEST_VST3` to one or more `.vst3` bundle paths (separated by `;`), and
+//! `RIDDIM_TEST_CLAP` to `.clap` files likewise, to run them.
+//! `scripts/ci.sh` passes whatever the variables hold on to these tests (Surge XT on the build
+//! machine); CI itself sets neither. Without them the tests pass vacuously and say so: the
+//! plugins loaded in every run are the fixtures, in `vst3_host.rs` and `clap_host.rs`.
 
 use riddim_plugin::check::{self, Options, Verdict};
 use riddim_plugin::scan::{ScanOutcome, ScanTarget, Scanner};
@@ -12,30 +14,32 @@ use riddim_rt::guard::RtCheckAllocator;
 #[global_allocator]
 static ALLOC: RtCheckAllocator = RtCheckAllocator::system();
 
+/// The bundles named by `RIDDIM_TEST_VST3` and `RIDDIM_TEST_CLAP`.
 fn bundles() -> Vec<std::path::PathBuf> {
-    std::env::var("RIDDIM_TEST_VST3")
-        .map(|v| {
-            v.split(';')
+    ["RIDDIM_TEST_VST3", "RIDDIM_TEST_CLAP"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .flat_map(|list| {
+            list.split(';')
                 .filter(|s| !s.is_empty())
-                .map(Into::into)
-                .collect()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 #[test]
 fn third_party_vst3_plugins_pass_the_conformance_run() {
     let bundles = bundles();
     if bundles.is_empty() {
-        eprintln!("RIDDIM_TEST_VST3 is not set: no third-party plugins were tested");
+        eprintln!(
+            "neither RIDDIM_TEST_VST3 nor RIDDIM_TEST_CLAP is set: no third-party plugins were tested"
+        );
         return;
     }
     let scanner = Scanner::new(env!("CARGO_BIN_EXE_riddim-scan"));
     for bundle in bundles {
-        let target = ScanTarget {
-            format: PluginFormat::Vst3,
-            path: Some(bundle.clone()),
-        };
+        let target = ScanTarget::for_path(bundle.clone());
         let plugins = match scanner.scan(&target) {
             ScanOutcome::Ok(plugins) => plugins,
             other => panic!("{} did not scan: {other:?}", bundle.display()),

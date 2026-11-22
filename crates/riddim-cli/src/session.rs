@@ -35,6 +35,9 @@ pub const EFFECT_SEND: SendId = SendId(1002);
 pub const FADE_LANE: LaneId = LaneId(1003);
 /// Insert effects on the instrument track are numbered from here.
 pub const INSERT_SLOT: SlotId = SlotId(1010);
+/// `session new --copies`: the nth copy of the instrument track has the original's ids plus n
+/// times this.
+pub const COPY_ID_STEP: u64 = 10_000;
 
 /// Where the audio comes from and goes to.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +55,8 @@ pub struct DeviceOptions {
     /// Change to this buffer size a few seconds into playing, to show that it can be done
     /// on the fly.
     pub switch_buffer: Option<u32>,
+    /// Run each plugin's first block off the audio thread.
+    pub warm_up: bool,
 }
 
 impl DeviceOptions {
@@ -148,6 +153,7 @@ pub fn instrument_ops(
                 bypass: false,
                 outputs: Vec::new(),
                 sidechain: None,
+                bridged: false,
             },
         },
     ];
@@ -190,6 +196,25 @@ pub struct Running {
     pub events: Receiver<Event>,
     /// A buffer size to change to while running (see [`DeviceOptions::switch_buffer`]).
     switch_buffer: Option<u32>,
+    /// The engine's load reports so far: the worst, how many there were, and how many said a
+    /// block took longer to render than it lasts.
+    worst_load: f32,
+    load_reports: u32,
+    loads_over_budget: u32,
+    /// When the engine was started, when the worst load was reported, and when the first few
+    /// reports of a block over its time came (in seconds since the start).
+    started: Instant,
+    worst_at: f64,
+    over_budget_at: Vec<f64>,
+}
+
+/// How many of the moments a block ran over its time the summary lists.
+const OVER_BUDGET_LISTED: usize = 6;
+
+/// Seconds as `m:ss`.
+fn clock(seconds: f64) -> String {
+    let whole = seconds.max(0.0) as u64;
+    format!("{}:{:02}", whole / 60, whole % 60)
 }
 
 impl Running {
@@ -206,6 +231,7 @@ impl Running {
             dir,
             midi_input,
             options.render_threads,
+            options.warm_up,
         )?;
         running.switch_buffer = options.switch_buffer;
         Ok(running)
@@ -216,6 +242,7 @@ impl Running {
         dir: &Path,
         midi_input: bool,
         render_threads: Option<usize>,
+        warm_up_plugins: bool,
     ) -> Result<Running, String> {
         // The manual device is only ever used for rendering.
         let process_mode = match device {
@@ -234,6 +261,8 @@ impl Running {
             render_threads,
             parallel_from: riddim::PARALLEL_FROM_STEPS,
             streaming: Default::default(),
+            bridge_executable: None,
+            warm_up_plugins,
         };
         let mut engine = Engine::start(config).map_err(|e| e.to_string())?;
         let main = engine
@@ -245,6 +274,12 @@ impl Running {
             main,
             events,
             switch_buffer: None,
+            worst_load: 0.0,
+            load_reports: 0,
+            loads_over_budget: 0,
+            started: Instant::now(),
+            worst_at: 0.0,
+            over_budget_at: Vec::new(),
         })
     }
 
@@ -264,10 +299,30 @@ impl Running {
                 Event::PluginFailed { slot, error, .. } => {
                     eprintln!("error: the plugin in slot {} did not load: {error}", slot.0);
                 }
+                Event::PluginCrashed { slot, .. } => {
+                    eprintln!(
+                        "error: the plugin in slot {} crashed in its own process; everything else carries on",
+                        slot.0
+                    );
+                }
                 Event::MediaMissing { media, error } => {
                     eprintln!("warning: media {} is missing: {error}", media.0)
                 }
                 Event::Error { message } => eprintln!("error: {message}"),
+                Event::Load { dsp } => {
+                    let at = self.started.elapsed().as_secs_f64();
+                    if *dsp > self.worst_load {
+                        self.worst_load = *dsp;
+                        self.worst_at = at;
+                    }
+                    self.load_reports += 1;
+                    if *dsp > 1.0 {
+                        self.loads_over_budget += 1;
+                        if self.over_budget_at.len() < OVER_BUDGET_LISTED {
+                            self.over_budget_at.push(at);
+                        }
+                    }
+                }
                 Event::RecordingOverflow {
                     track,
                     frames_dropped,
@@ -573,11 +628,27 @@ fn print_summary(running: &Running) -> bool {
         "blocks {}  xruns {}  audio-thread heap operations {}  frames lost while recording {}",
         status.blocks, status.xruns, status.rt_violations, status.capture_dropped
     );
+    // The status has the load of the last second only; the reports, one a second, cover the
+    // whole run.
+    let mut when: Vec<String> = running.over_budget_at.iter().map(|at| clock(*at)).collect();
+    if running.loads_over_budget as usize > when.len() {
+        when.push("...".into());
+    }
+    let when = if when.is_empty() {
+        String::new()
+    } else {
+        format!(", at {}", when.join(", "))
+    };
     println!(
-        "peak dsp load {:.0}%  frames of streamed files not read in time {}  messages lost {}",
-        status.dsp_load * 100.0,
-        status.playback_starved,
-        status.events_lost
+        "peak dsp load {:.0}% at {} ({} of {} seconds had a block over its time{when})",
+        running.worst_load.max(status.dsp_load) * 100.0,
+        clock(running.worst_at),
+        running.loads_over_budget,
+        running.load_reports,
+    );
+    println!(
+        "frames of streamed files not read in time {}  messages lost {}",
+        status.playback_starved, status.events_lost
     );
     status.rt_violations == 0 && status.capture_dropped == 0
 }
@@ -684,6 +755,12 @@ pub struct NewOptions {
     pub send_effect: Option<String>,
     /// Automate the instrument's fader from silence to full over this many beats.
     pub fade_in: Option<u32>,
+    /// Run every plugin of the project in a process of its own.
+    pub bridged: bool,
+    /// How many instrument tracks to make, each with the instrument, its material and inserts.
+    pub copies: u8,
+    /// Loop the instrument's material.
+    pub looped: bool,
 }
 
 /// `riddim session new`: writes a project with an instrument track and an armed audio track.
@@ -702,10 +779,16 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
             (None, true) => Material::Arpeggio,
             (None, false) => Material::Live,
         };
-        apply(
-            &mut model,
-            instrument_ops(&descriptor, None, &material, false)?,
-        )?;
+        let mut ops = instrument_ops(&descriptor, None, &material, options.looped)?;
+        for op in &mut ops {
+            if let Op::InsertPlugin { slot, .. } = op {
+                slot.bridged = options.bridged;
+            }
+        }
+        apply(&mut model, ops)?;
+    }
+    if (options.copies > 1 || options.looped) && options.instrument.is_none() {
+        return Err("--copies and --looped need an --instrument track".into());
     }
     let effect_slot = |id: SlotId, spec: &str| -> Result<PluginSlot, String> {
         Ok(PluginSlot {
@@ -715,6 +798,7 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
             bypass: false,
             outputs: Vec::new(),
             sidechain: None,
+            bridged: options.bridged,
         })
     };
     let wants_mixing =
@@ -731,6 +815,41 @@ pub fn session_new(context: &Context, project: &Path, options: NewOptions) -> Co
                 slot: effect_slot(SlotId(INSERT_SLOT.0 + n as u64), spec)?,
             }],
         )?;
+    }
+    // The instrument track, whole, as many times over as asked: the same instrument, material
+    // and inserts under ids of their own, turned down so that the copies together are as loud
+    // as one.
+    let copies = options.copies.max(1) as u64;
+    if copies > 1 {
+        let original: Track = model
+            .track(INSTRUMENT_TRACK)
+            .map(|track| (**track).clone())
+            .expect("the instrument track was just made");
+        let gain = 1.0 / copies as f32;
+        let mut ops = vec![Op::SetTrack {
+            id: INSTRUMENT_TRACK,
+            change: TrackChange::Gain(gain),
+        }];
+        for n in 1..copies {
+            let base = n * COPY_ID_STEP;
+            let mut track = original.clone();
+            track.id = TrackId(original.id.0 + base);
+            track.name = format!("{} {}", original.name, n + 1);
+            track.gain = gain;
+            for slot in &mut track.plugins {
+                let slot = std::sync::Arc::make_mut(slot);
+                slot.id = SlotId(slot.id.0 + base);
+            }
+            for clip in &mut track.clips {
+                let clip = std::sync::Arc::make_mut(clip);
+                clip.id = ClipId(clip.id.0 + base);
+            }
+            ops.push(Op::AddTrack {
+                index: n as usize,
+                track,
+            });
+        }
+        apply(&mut model, ops)?;
     }
     if let Some(spec) = &options.send_effect {
         let index = model.tracks.len();
@@ -884,11 +1003,16 @@ pub fn session_info(project: &Path) -> CommandResult {
         }
         for slot in &track.plugins {
             println!(
-                "      plugin {} in slot {} ({}:{}){}",
+                "      plugin {} in slot {} ({}:{}{}){}",
                 slot.plugin.name,
                 slot.id.0,
                 slot.plugin.format,
                 slot.plugin.uid,
+                if slot.bridged {
+                    ", in a process of its own"
+                } else {
+                    ""
+                },
                 slot.state
                     .as_ref()
                     .map_or(String::new(), |s| format!(", {} bytes of state", s.len()))

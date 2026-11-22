@@ -1,7 +1,7 @@
 //! A single-component effect: one object is both the processor and the edit controller.
 
 use std::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vst3::Steinberg::Vst::{
     BusDirection, BusInfo, IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentHandler,
@@ -21,23 +21,29 @@ const STEREO: SpeakerArrangement = 3;
 
 pub struct GainSingle {
     gain: AtomicU64,
-    /// Take a long time to initialise, like a sampler loading its library.
+    /// Take a long time to initialise, like a sampler loading its library, and a long time
+    /// over the first block after each activation, like a plugin that sets itself up there.
     slow: bool,
+    /// The next block is the first since activation.
+    first_block: AtomicBool,
 }
 
 impl GainSingle {
     pub const NAME: &'static str = "Riddim Test Gain";
     pub const CID: TUID = uid(0x52444D54, 0x47414E31, 0x53494E47, 0x00000001);
     pub const GAIN: u32 = 7;
-    /// The same plugin under a second class id, with a 400 ms `initialize`.
+    /// The same plugin under a second class id, with a 400 ms `initialize` and a 150 ms first
+    /// block after each activation.
     pub const SLOW_NAME: &'static str = "Riddim Test Slow Loader";
     pub const SLOW_CID: TUID = uid(0x52444D54, 0x534C4F57, 0x53494E47, 0x00000001);
     pub const SLOW_LOAD: std::time::Duration = std::time::Duration::from_millis(400);
+    pub const SLOW_FIRST_BLOCK: std::time::Duration = std::time::Duration::from_millis(150);
 
     pub fn new() -> Self {
         Self {
             gain: AtomicU64::new(0.5f64.to_bits()),
             slow: false,
+            first_block: AtomicBool::new(false),
         }
     }
 
@@ -128,7 +134,8 @@ impl IComponentTrait for GainSingle {
         kResultOk
     }
 
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        self.first_block.store(state != 0, Ordering::Relaxed);
         kResultOk
     }
 
@@ -211,6 +218,9 @@ impl IAudioProcessorTrait for GainSingle {
     }
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        if self.first_block.swap(false, Ordering::Relaxed) && self.slow {
+            std::thread::sleep(Self::SLOW_FIRST_BLOCK);
+        }
         let data = unsafe { &*data };
         if let Some(changes) = unsafe { ComRef::from_raw(data.inputParameterChanges) } {
             for index in 0..unsafe { changes.getParameterCount() } {

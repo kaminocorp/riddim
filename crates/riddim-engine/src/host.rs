@@ -12,8 +12,9 @@ use std::sync::Arc;
 use riddim_graph::model_graph::PluginPorts;
 use riddim_model::{PluginRef, SlotId};
 use riddim_plugin::{
-    ActivateConfig, BusDirection, BusKind, PluginDescriptor, PluginEvent, PluginFormat, PluginId,
-    PluginInstance, PluginKind, PluginProcessor, StateBlob,
+    ActivateConfig, BusDirection, BusKind, EventBuffer, PluginDescriptor, PluginEvent,
+    PluginFormat, PluginId, PluginInstance, PluginKind, PluginProcessor, ProcessContext,
+    ProcessMode, StateBlob, TransportInfo,
 };
 
 /// Which of a plugin's optional buses the project uses.
@@ -37,6 +38,8 @@ pub(crate) enum HostRequest {
         state: Option<Arc<Vec<u8>>>,
         config: ActivateConfig,
         buses: BusRequest,
+        /// Host it in a child process.
+        bridged: bool,
     },
     /// Deactivate a loaded plugin and activate it again with other buses or another block
     /// size. The instance, and with it everything the user set up in it, stays.
@@ -106,6 +109,28 @@ fn descriptor_for(plugin: &PluginRef) -> Result<PluginDescriptor, String> {
     })
 }
 
+/// Starts the plugin in a child process of its own.
+#[cfg(unix)]
+fn instantiate_bridged(
+    descriptor: &PluginDescriptor,
+    executable: Option<&std::path::Path>,
+) -> Result<Box<dyn PluginInstance>, String> {
+    let executable = executable
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(riddim_plugin::bridge::default_executable);
+    riddim_plugin::bridge::instantiate(descriptor, &executable)
+        .map(|instance| Box::new(instance) as Box<dyn PluginInstance>)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn instantiate_bridged(
+    _: &PluginDescriptor,
+    _: Option<&std::path::Path>,
+) -> Result<Box<dyn PluginInstance>, String> {
+    Err("plugins cannot be run in a process of their own on this platform yet".into())
+}
+
 /// Switches the plugin's optional buses to what the project uses. Must be called while the
 /// instance is inactive. A bus the plugin refuses to change is left as it is: the graph is
 /// built from what ends up active, so a missing bus is simply not connected.
@@ -160,6 +185,51 @@ fn ports_of(instance: &dyn PluginInstance) -> PluginPorts {
     }
 }
 
+/// Gives a processor that has just been activated one block of silence, here on the thread
+/// that loaded it, and resets it.
+///
+/// Plugins do things once in the first block they are ever given: touch memory they were
+/// handed at activation, build tables, start threads. On the audio thread that is a dropout
+/// at small buffer sizes each time a plugin joins a playing session. The processor has not
+/// been handed to the audio thread yet, so for this one block this thread is its audio
+/// thread; the engine's render threads already call a processor from one thread and then
+/// another. Whatever the plugin sends out in that block is dropped, and so is the outcome: a
+/// plugin that fails here will fail again where failures are handled.
+///
+/// Not done for an offline render, where nothing is waiting on the first block and the
+/// result should come from a plugin nobody has run.
+fn warm_up(processor: &mut dyn PluginProcessor, ports: &PluginPorts, config: &ActivateConfig) {
+    if config.mode != ProcessMode::Realtime || config.max_block == 0 {
+        return;
+    }
+    let frames = config.max_block as usize;
+    let channels = |buses: &[u32]| buses.iter().map(|c| *c as usize).sum::<usize>();
+    let silence = vec![0.0f32; frames];
+    let inputs: Vec<&[f32]> = (0..channels(&ports.inputs))
+        .map(|_| silence.as_slice())
+        .collect();
+    let mut output_storage = vec![vec![0.0f32; frames]; channels(&ports.outputs)];
+    let mut outputs: Vec<&mut [f32]> = output_storage
+        .iter_mut()
+        .map(|channel| channel.as_mut_slice())
+        .collect();
+    let mut events_out = EventBuffer::with_capacity(WARM_UP_EVENTS);
+    let transport = TransportInfo::stopped(config.sample_rate);
+    let mut context = ProcessContext {
+        frames,
+        inputs: &inputs,
+        outputs: &mut outputs,
+        events_in: &[],
+        events_out: &mut events_out,
+        transport: &transport,
+    };
+    let _ = processor.first_block(&mut context);
+    processor.reset();
+}
+
+/// Room for what a plugin sends out during its warm-up block, all of which is dropped.
+const WARM_UP_EVENTS: usize = 256;
+
 /// The main-thread half of the engine. Call [`pump`](Self::pump) regularly from the thread that
 /// owns it.
 pub struct MainThread {
@@ -171,6 +241,10 @@ pub struct MainThread {
     displaced: Vec<Held>,
     events: Vec<PluginEvent>,
     alive: bool,
+    /// The bridge executable for bridged slots, if the engine was told of one.
+    bridge: Option<std::path::PathBuf>,
+    /// Give each plugin its first block here before the audio thread gets it.
+    warm_up: bool,
 }
 
 struct Held {
@@ -181,7 +255,12 @@ struct Held {
 }
 
 impl MainThread {
-    pub(crate) fn new(requests: Receiver<HostRequest>, replies: Sender<HostReply>) -> Self {
+    pub(crate) fn new(
+        requests: Receiver<HostRequest>,
+        replies: Sender<HostReply>,
+        bridge: Option<std::path::PathBuf>,
+        warm_up: bool,
+    ) -> Self {
         Self {
             requests,
             replies,
@@ -189,6 +268,8 @@ impl MainThread {
             displaced: Vec::new(),
             events: Vec::new(),
             alive: true,
+            bridge,
+            warm_up,
         }
     }
 
@@ -258,13 +339,22 @@ impl MainThread {
                 state,
                 config,
                 buses,
+                bridged,
             } => {
                 // An instance still in this slot belongs to an earlier load whose unload has
                 // not arrived yet. Keep it aside: its processor is still out.
                 if let Some(earlier) = self.instances.remove(&slot) {
                     self.displaced.push(earlier);
                 }
-                let result = self.load(slot, serial, &plugin, state.as_deref(), &config, buses);
+                let result = self.load(
+                    slot,
+                    serial,
+                    &plugin,
+                    state.as_deref(),
+                    &config,
+                    buses,
+                    bridged,
+                );
                 let _ = self.replies.send(HostReply::Loaded {
                     slot,
                     serial,
@@ -286,12 +376,19 @@ impl MainThread {
                             instance.deactivate(processor);
                         }
                         configure_buses(instance.as_mut(), buses);
+                        let warm = self.warm_up;
                         let result = instance
                             .activate(&config)
-                            .map(|processor| Loaded {
-                                processor,
-                                ports: ports_of(instance.as_ref()),
-                                parameters: instance.params().len(),
+                            .map(|mut processor| {
+                                let ports = ports_of(instance.as_ref());
+                                if warm {
+                                    warm_up(processor.as_mut(), &ports, &config);
+                                }
+                                Loaded {
+                                    processor,
+                                    ports,
+                                    parameters: instance.params().len(),
+                                }
                             })
                             .map_err(|e| e.to_string());
                         if let Ok(loaded) = &result {
@@ -376,19 +473,27 @@ impl MainThread {
         state: Option<&Vec<u8>>,
         config: &ActivateConfig,
         buses: BusRequest,
+        bridged: bool,
     ) -> Result<Loaded, String> {
         let descriptor = descriptor_for(plugin)?;
-        let mut instance =
-            riddim_plugin::host::instantiate(&descriptor).map_err(|e| e.to_string())?;
+        let mut instance = if bridged {
+            instantiate_bridged(&descriptor, self.bridge.as_deref())?
+        } else {
+            riddim_plugin::host::instantiate(&descriptor).map_err(|e| e.to_string())?
+        };
         if let Some(bytes) = state {
             let blob = StateBlob::from_bytes(bytes).map_err(|e| e.to_string())?;
             instance.restore_state(&blob).map_err(|e| e.to_string())?;
         }
         configure_buses(instance.as_mut(), buses);
-        let processor = instance.activate(config).map_err(|e| e.to_string())?;
+        let mut processor = instance.activate(config).map_err(|e| e.to_string())?;
+        let ports = ports_of(instance.as_ref());
+        if self.warm_up {
+            warm_up(processor.as_mut(), &ports, config);
+        }
         let loaded = Loaded {
             processor,
-            ports: ports_of(instance.as_ref()),
+            ports,
             parameters: instance.params().len(),
         };
         self.instances.insert(
@@ -413,5 +518,90 @@ impl MainThread {
     /// Slots that currently hold a loaded plugin.
     pub fn loaded_slots(&self) -> Vec<SlotId> {
         self.instances.keys().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use riddim_plugin::ProcessStatus;
+    use std::sync::{Arc, Mutex};
+
+    /// Writes down what it is asked to do.
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl PluginProcessor for Recorder {
+        fn first_block(&mut self, context: &mut ProcessContext<'_>) -> ProcessStatus {
+            self.0.lock().unwrap().push("first block".into());
+            self.process(context)
+        }
+
+        fn process(&mut self, context: &mut ProcessContext<'_>) -> ProcessStatus {
+            let silent = context.inputs.iter().all(|c| c.iter().all(|s| *s == 0.0));
+            self.0.lock().unwrap().push(format!(
+                "process frames={} in={} out={} events={} playing={} silent={} lengths_ok={}",
+                context.frames,
+                context.inputs.len(),
+                context.outputs.len(),
+                context.events_in.len(),
+                context.transport.playing,
+                silent,
+                context.inputs.iter().all(|c| c.len() == context.frames)
+                    && context.outputs.iter().all(|c| c.len() == context.frames),
+            ));
+            ProcessStatus::Failed
+        }
+
+        fn reset(&mut self) {
+            self.0.lock().unwrap().push("reset".into());
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    fn ports() -> PluginPorts {
+        PluginPorts {
+            inputs: vec![2, 1],
+            main_input: true,
+            sidechain: Some(1),
+            outputs: vec![2, 2, 2],
+            latency: 0,
+            takes_events: true,
+            emits_events: false,
+        }
+    }
+
+    fn config(mode: ProcessMode) -> ActivateConfig {
+        ActivateConfig {
+            sample_rate: 48_000.0,
+            max_block: 64,
+            mode,
+        }
+    }
+
+    #[test]
+    fn a_warm_up_is_one_silent_block_of_the_plugins_own_shape_and_then_a_reset() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut processor = Recorder(calls.clone());
+        // (The recorder says the block failed. That is not the warm-up's business.)
+        warm_up(&mut processor, &ports(), &config(ProcessMode::Realtime));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "first block",
+                "process frames=64 in=3 out=6 events=0 playing=false silent=true lengths_ok=true",
+                "reset"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_offline_render_gets_a_plugin_nobody_has_run() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut processor = Recorder(calls.clone());
+        warm_up(&mut processor, &ports(), &config(ProcessMode::Offline));
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

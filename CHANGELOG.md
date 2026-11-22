@@ -6,6 +6,47 @@ Entries say what exists and where it has been run. "Unverified on macOS" means t
 
 ## [Unreleased]
 
+### v1.x
+
+#### Decided (Phil's answers to the vision's open questions, 2026-11-21; decisions D77 to D83)
+- **Owner and licence notices.** The copyright owner is Kamino Research Corporation (legal entity: Bradgate Capital Management Pte Ltd, Singapore): `COPYRIGHT`, the C header, crate manifests and the README say so. The licence stays AGPL-3.0-only.
+- **Public.** The repository is public as of 2026-11-21.
+- **Open to contributions.** `CONTRIBUTING.md` (the maintainer reviews every change) and `CLA.md` (a licence grant that keeps a commercial licence possible; a draft no lawyer has read yet), with a Developer Certificate of Origin sign-off on every commit.
+- **Windows later, portable now.** The whole workspace is type-checked and linted for `x86_64-pc-windows-msvc` in `scripts/ci.sh`. WASAPI and ASIO are the future device backends.
+- **Whiplash is a Tauri 2 application** linking the engine in process: [`docs/api/embedding.md`](docs/api/embedding.md).
+- **Target machine**: a Mac Mini with an M4 Pro and a Scarlett 2i2. **Helix** is a future test plugin, not a requirement.
+
+#### Changed for in-process hosts
+- **`Engine` is `Send`.** It used to hold the plugin-carrying main-thread half until asked for it, so it could not be kept in an application's shared state. It now makes that half when `take_main_thread` is called, on the calling thread.
+- `TransportCommand` can be read from JSON; `Applied`, `Rejected`, `Status` and `StreamInfo` can be written as JSON.
+
+#### Added
+- **CLAP hosting** on `clack-host`: scanning, instantiation, audio and note ports, parameters, sample-offset events both ways, transport, state, latency, and an editor through the `gui` extension (*the editor is unverified*). `.clap` files are scanned and cached with everything else.
+- **The out-of-process bridge**: a plugin slot marked `bridged` runs in a `riddim-bridge` child process. Shared memory for audio and events, a socket hand-off per block, JSON for everything else. A plugin that crashes or hangs is taken out of the mix (`plugin_crashed`) and the session carries on. Unix only; no editor for bridged plugins yet.
+- **`riddim-render`**: a headless renderer. A model as JSON in, a WAV and a line of JSON out.
+- **A stability policy** ([`docs/api/stability.md`](docs/api/stability.md)) and the checks behind it: golden schema-1 project and ops files that must keep loading with nothing lost. `Event`, `EngineError` and `Status` are marked non-exhaustive.
+- `riddim session new --bridged`; `EngineConfig::bridge_executable`; `RIDDIM_TEST_CLAP` for the third-party tests.
+- `riddim session new --copies N --looped`: the instrument track with its material and inserts, N times over, looping. Four copies with five inserts is the shape of the reference session (4 instruments, 20 effects), so the hour at 64 frames can be tried with whatever plugins are installed.
+- `scripts/ci-clean.sh`: the CI job in a clean Ubuntu 24.04 container on two cores, for when Actions cannot run it.
+- **CLAP fixture plugins** (`fixtures/clapplug`: a synth and a delay with latency, written against the CLAP C ABI directly) and the tests that use them, so that every test run loads CLAP plugins: host tests, the conformance run, the engine (latency compensated to the sample, state saved with the project, bounce, bridged) and the CLI.
+
+#### Changed
+- **A plugin's first block no longer runs on the audio thread.** After a plugin is activated, the thread that loaded it gives it one block of silence and resets it before the audio thread gets it, so whatever the plugin does once in its first block is not a dropout. With four Surge XT instruments at 64 frames the worst block at start-up went from about 254% of its time to about 47%. A bridged plugin that is slow over its first block is no longer taken for hung: that block is given thirty seconds. Not done for offline renders. `EngineConfig::warm_up_plugins` (on by default; `"warm_up_plugins"` in the C API's configuration, `--no-warm-up` on the command line) turns it off. *Not tried with any commercial plugin.*
+- A parameter change a plugin makes on its audio side is written into automation when its lane is being written (this is how a CLAP editor's moves arrive).
+- The `peak dsp load` in the CLI's summary after playing or recording is the worst of the whole run (it was the last second's), with the number of seconds that had a block over its time.
+
+#### Fixed
+- *A recording test bet on the scheduler.* The eight-track recording test paced a faster-than-real-time recording with a fixed sleep and failed once on a GitHub runner (5 times in 72 under load here). It is paced by the disk's backlog now. Test only; fixed on the phase 2 branch and merged up.
+- The scan cache could blocklist a healthy plugin when two Riddim processes ran at once: found here, fixed on the phase 3 branch, where it came from (see that section).
+- A bounce did not tell CLAP plugins that it was offline (VST3 and Audio Unit plugins were told). It now does, through CLAP's `render` extension, so a sampler can wait for its disk instead of dropping notes.
+- The CLAP host passed a block larger than the plugin was activated for on to the plugin, and for an effect indexed past its own input buffers (a panic on the audio thread). Such a block is now refused and silenced, as the VST3 host does. The engine never sends one; the CLAP fixture found it.
+
+#### Verified
+- On Linux: Surge XT's CLAP builds pass every step of the conformance run, and the demo song plays, saves, reopens, bounces and reroutes through them; a bridged fixture plugin has the same buses, parameters, state, events and audio (bit for bit) as in process; a project with bridged plugins bounces to the same bytes; a bridged plugin that aborts, and one that hangs, cost only themselves while a timer-driven device keeps running.
+
+#### Not verified
+- Anything on a Mac: CLAP hosting, CLAP editors, and the bridge on macOS have never run. Kontakt bridged at 128 frames (the bridge's first exit criterion) needs Kontakt. See [`docs/phases/v1x.md`](docs/phases/v1x.md).
+
 ### Phase 4: v1
 
 #### Added

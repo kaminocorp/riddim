@@ -324,6 +324,7 @@ mod tests {
             bypass: false,
             outputs: Vec::new(),
             sidechain: None,
+            bridged: false,
         }
     }
 

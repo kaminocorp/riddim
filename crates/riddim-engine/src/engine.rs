@@ -19,7 +19,7 @@ use riddim_rt::spsc::{self, Producer};
 use crate::audio::AudioEngine;
 use crate::control::{Applied, Control, ControlMsg, ControlSetup, Rejected, TransportCommand};
 use crate::events::{Event, TransportState};
-use crate::host::MainThread;
+use crate::host::{HostReply, HostRequest, MainThread};
 use crate::shared::Shared;
 
 /// Which audio device the engine runs on.
@@ -68,6 +68,13 @@ pub struct EngineConfig {
     pub parallel_from: usize,
     /// How long files are played from disk.
     pub streaming: crate::stream::StreamingConfig,
+    /// The `riddim-bridge` executable, for plugin slots marked to run in a process of their
+    /// own. `None` looks in `$RIDDIM_BRIDGE` and then beside the running program.
+    pub bridge_executable: Option<PathBuf>,
+    /// Give every plugin one block of silence on the thread that loads it, before the audio
+    /// thread gets it, so that whatever it does once in its first block is not done there.
+    /// On unless a plugin turns out to mind; never done when `process_mode` is `Offline`.
+    pub warm_up_plugins: bool,
 }
 
 /// The default for [`EngineConfig::parallel_from`].
@@ -92,6 +99,8 @@ impl EngineConfig {
             render_threads: None,
             parallel_from: PARALLEL_FROM_STEPS,
             streaming: Default::default(),
+            bridge_executable: None,
+            warm_up_plugins: true,
         }
     }
 }
@@ -101,6 +110,7 @@ pub const MIN_BUFFER_FRAMES: u32 = 16;
 pub const MAX_BUFFER_FRAMES: u32 = 4096;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EngineError {
     Device(String),
     Io(std::io::Error),
@@ -120,8 +130,17 @@ impl std::fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+/// The channel ends and the bridge path a [`MainThread`] is made from.
+type MainThreadParts = (
+    Receiver<HostRequest>,
+    Sender<HostReply>,
+    Option<PathBuf>,
+    bool,
+);
+
 /// A snapshot of what the engine is doing.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[non_exhaustive]
 pub struct Status {
     pub transport: TransportState,
     pub position_samples: i64,
@@ -168,7 +187,8 @@ pub struct Engine {
     control: Sender<ControlMsg>,
     control_thread: Option<JoinHandle<()>>,
     host_thread: Option<JoinHandle<()>>,
-    main_thread: Option<MainThread>,
+    /// What the main-thread half is made from, until it is taken.
+    main_thread: Option<MainThreadParts>,
     stream: Option<Stream>,
     info: StreamInfo,
     shared: Arc<Shared>,
@@ -286,13 +306,27 @@ impl Engine {
             .map_err(EngineError::Io)?;
 
         let (main_thread, host_thread) = match config.main_thread {
-            MainThreadMode::External => (Some(MainThread::new(host_rx, host_reply_tx)), None),
+            // Only what the main-thread half is made from is kept here, and the half itself is
+            // made where it is taken: it holds plugin instances, which must never change
+            // thread, and an `Engine` holding one could not be handed to another thread or
+            // kept in an application's shared state.
+            MainThreadMode::External => (
+                Some((
+                    host_rx,
+                    host_reply_tx,
+                    config.bridge_executable.clone(),
+                    config.warm_up_plugins,
+                )),
+                None,
+            ),
             MainThreadMode::Internal => {
+                let bridge = config.bridge_executable.clone();
+                let warm_up = config.warm_up_plugins;
                 let thread = std::thread::Builder::new()
                     .name("riddim-plugin-host".into())
                     .spawn(move || {
                         // Plugin instances are created on, and never leave, this thread.
-                        let mut main = MainThread::new(host_rx, host_reply_tx);
+                        let mut main = MainThread::new(host_rx, host_reply_tx, bridge, warm_up);
                         while main.pump() {
                             std::thread::sleep(Duration::from_millis(2));
                         }
@@ -548,8 +582,14 @@ impl Engine {
 
     /// Takes the main-thread half of the engine. Only present with
     /// [`MainThreadMode::External`], and only once.
+    ///
+    /// Call this on the thread that will pump it, which on macOS must be the application's
+    /// main thread: the half that comes back holds the plugin instances and cannot be sent
+    /// to another thread. The `Engine` itself can be (it is `Send`), so an application can
+    /// take this on its main thread and keep the engine wherever its commands are handled.
     pub fn take_main_thread(&mut self) -> Option<MainThread> {
-        self.main_thread.take()
+        let (requests, replies, bridge, warm_up) = self.main_thread.take()?;
+        Some(MainThread::new(requests, replies, bridge, warm_up))
     }
 }
 

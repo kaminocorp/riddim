@@ -4,7 +4,7 @@ Completion notes for phase 2 of the vision (the second row of §5): the engine t
 
 **Where it stands (2026-11-21):** the engine is written and everything that can run without a Mac passes, on a deterministic simulated device. **Nothing here has run on a Mac or on real audio hardware.** The phase's first exit criterion (Phil records a take over an instrument in Whiplash, saves, reopens and hears it identically) cannot be met from here: it needs a Mac, real hardware and Whiplash. A terminal stand-in for that flow exists (`riddim session`) and is what the Mac checklist below asks to be run.
 
-Still true from phase 1: GitHub Actions could not start jobs on this repository (billing), and CI is deliberately one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded here; and the commercial plugins have not been bought, so Surge XT stands in for the instrument.
+Still true from phase 1: GitHub Actions could not start jobs on this repository (an account-level block), and CI is deliberately one small Linux job in any case (decision D12), so the fuller checks are run locally and recorded here; and the commercial plugins have not been bought, so Surge XT stands in for the instrument.
 
 ## What was built
 
@@ -28,7 +28,7 @@ Still true from phase 1: GitHub Actions could not start jobs on this repository 
 | 2 | Recorded audio lands within ±1 sample of a loopback-calibrated position | **Met in simulation, exactly** (0 samples) for round-trip latencies of 128, 300, 777 and 1024 frames, including punch-in while rolling and after a count-in. On real hardware it depends on the device reporting its latency truthfully; `riddim loopback` measures it. Mac checklist step 2 |
 | 3 | Zero allocations on the audio thread under the CI RealtimeSanitizer run | **Met locally.** The engine, host, I/O and disk test suites pass under RealtimeSanitizer, with a self-check proving the sanitizer is live. Every engine test also asserts zero heap operations on the audio path with our own counting allocator. It runs locally as part of `scripts/ci.sh`; it is not a CI job, because Actions minutes are a hard budget (D12) |
 | 4 | Ops round-trip: apply → inverse → apply restores an identical model (property test) | **Met.** 400 random edit histories per run; also checked through the engine |
-| 5 | 60 minutes of continuous recording on 8 tracks with no dropped buffers, and `kill -9` mid-take keeps everything up to the last flush | **Met as far as it can be without a clock.** An hour of timeline on eight tracks, fast-forwarded, loses no frame (172,799,744 frames per track, all accounted for). A recording process killed with `SIGKILL` leaves a readable take holding everything that reached the file. A real-time hour on real disks is Mac checklist step 7 |
+| 5 | 60 minutes of continuous recording on 8 tracks with no dropped buffers, and `kill -9` mid-take keeps everything up to the last flush | **Met on Linux with a timer for a device, not yet with an audio interface.** An hour of timeline on eight tracks, fast-forwarded, loses no frame (172,799,744 frames per track, all accounted for). Run again in real time (added from the v1.x branch, 2026-11-21; see "Local results"): a real hour on eight tracks to a real disk lost no frame, and a recorder killed with `kill -9` a minute in left eight readable takes of 59.26 s. The clock in that run is a timer thread, which was late 26 times in the hour; an audio interface's clock is what Mac checklist step 7 is for |
 
 ## What the tests actually establish
 
@@ -56,6 +56,8 @@ Run on the Linux build machine (x86-64, Rust 1.100.0) at the commit this file wa
 | third-party conformance run, Surge XT and Surge XT Effects | passed |
 | `cargo deny --all-features check` | advisories, bans, licences, sources all ok |
 | `long_recording` (ignored by default: one hour, eight tracks, 5.5 GB) | passed in about 90 s; worst disk backlog 1.2 s of a 4 s ring; 0 frames dropped; 0 audio-thread heap operations |
+| the same hour in real time: `riddim session record long.json --null-device --loopback 256 --seconds 3600` on a project made with `--audio-input 1 --audio-tracks 8` (v1.x branch build, 128 frames, software RAID on the Linux build machine) | ran from 14:35:15 to 15:35:16 UTC. Eight takes of 172,773,504 frames each (3,599.45 s), every file's header agreeing with its length on disk; `frames lost while recording 0`; 0 audio-thread heap operations; worst block 16% of its time, none over. 1,349,916 of the hour's 1,350,000 blocks were served and `xruns 26`: the timer thread that stands in for a device was woken late 26 times (an ordinary thread in a container), which is not something the engine did and not something an interface's clock does |
+| the hard kill, in real time: the same command, `kill -9` sixty seconds after launch | eight takes, each a readable WAV of 2,844,288 frames (59.26 s; one had 128 more), header and file length agreeing: everything up to the last one-second flush |
 | `riddim session` flow with Surge XT (new, record through simulated loopback, save, reopen, render) | completed; take of the expected length; 0 frames lost; 0 audio-thread heap operations |
 
 ## Findings
