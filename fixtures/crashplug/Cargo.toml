@@ -1,0 +1,16 @@
+[package]
+name = "riddim-crashplug"
+description = "Test fixture: a VST3 module that crashes the process as soon as it is asked for its factory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

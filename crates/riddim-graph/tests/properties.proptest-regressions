@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8944995d1e016c6c20eca0715993e5e1166a7c66ac6e376436856c3a9a273141 # shrinks to spec = GraphSpec { nodes: [NodeSpec { inputs: [], outputs: [], latency: 0, event_output: false }, NodeSpec { inputs: [1], outputs: [], latency: 0, event_output: false }, NodeSpec { inputs: [], outputs: [], latency: 0, event_output: false }, NodeSpec { inputs: [], outputs: [2], latency: 0, event_output: false }], edges: [Edge { from: 3, from_port: 0, to: 1, to_port: 0 }], event_edges: [] }

@@ -1,0 +1,45 @@
+name: CI
+
+# GitHub Actions minutes are a hard budget for this organisation, so this is deliberately the
+# only workflow, with one Linux job, and it only runs for pull requests that are ready for
+# review and touch something other than documentation.
+#
+# Everything else is run locally with scripts/ci.sh before pushing: the type-check of the
+# macOS-only code, RealtimeSanitizer, the third-party plugin run and the licence check.
+# Verification on macOS itself is manual (see the checklists in docs/phases/).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+concurrency:
+  group: ci-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # rust-toolchain.toml pins the toolchain and its components.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace

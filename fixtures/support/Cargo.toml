@@ -1,0 +1,16 @@
+[package]
+name = "riddim-test-support"
+description = "Test support: builds the fixture plugins and assembles them into bundles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

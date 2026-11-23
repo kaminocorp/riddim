@@ -1,0 +1,875 @@
+//! Out-of-process plugin scanning.
+//!
+//! Probing a plugin means loading its binary and running its code, and plugins crash. So the
+//! host never does it itself: it spawns the `riddim-scan` binary once per plugin bundle and
+//! reads descriptors back as JSON lines. If the child dies, hangs or prints nonsense, only that
+//! one bundle is marked as failed.
+//!
+//! The wire format is one [`ScanMessage`] per line on the child's stdout.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::descriptor::{PluginDescriptor, PluginFormat};
+use crate::error::{PluginError, Result};
+use crate::format;
+
+/// Name of the scanner executable (without a platform suffix).
+pub const SCANNER_BINARY: &str = "riddim-scan";
+
+/// Environment variable that overrides where the scanner executable is looked for.
+pub const SCANNER_ENV: &str = "RIDDIM_SCAN";
+
+/// One line of scanner output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScanMessage {
+    Plugin {
+        descriptor: PluginDescriptor,
+    },
+    /// The bundle loaded but could not be scanned.
+    Error {
+        message: String,
+    },
+    /// Always the last line of a scan that ran to the end.
+    Done {
+        count: usize,
+    },
+}
+
+/// What scanning one target produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanOutcome {
+    Ok(Vec<PluginDescriptor>),
+    /// The scanner reported a problem and exited normally.
+    Failed(String),
+    /// The scanner process died (signal, abort, non-zero exit without a report).
+    Crashed(String),
+    /// The scanner did not finish in time and was killed.
+    TimedOut,
+}
+
+impl ScanOutcome {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, ScanOutcome::Ok(_))
+    }
+}
+
+/// A scan target: one bundle for file-based formats, or the whole registry for Audio Units.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScanTarget {
+    pub format: PluginFormat,
+    pub path: Option<PathBuf>,
+}
+
+impl ScanTarget {
+    /// The target for one plugin file or bundle, its format told from its extension
+    /// (`.clap` is CLAP; anything else is taken for VST3).
+    pub fn for_path(path: impl Into<PathBuf>) -> ScanTarget {
+        let path = path.into();
+        let clap = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("clap"));
+        ScanTarget {
+            format: if clap {
+                PluginFormat::Clap
+            } else {
+                PluginFormat::Vst3
+            },
+            path: Some(path),
+        }
+    }
+}
+
+/// The result of scanning many targets.
+#[derive(Clone, Debug, Default)]
+pub struct ScanReport {
+    pub plugins: Vec<PluginDescriptor>,
+    /// Targets that did not scan cleanly, with what happened.
+    pub failures: Vec<(ScanTarget, ScanOutcome)>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Child side
+// ---------------------------------------------------------------------------------------------
+
+/// Scans `target` in this process. Only the scanner binary should call this.
+pub fn scan_in_process(target: &ScanTarget) -> Result<Vec<PluginDescriptor>> {
+    match target.format {
+        PluginFormat::Vst3 => {
+            let path = target
+                .path
+                .as_deref()
+                .ok_or_else(|| PluginError::Scan("a VST3 scan needs a bundle path".into()))?;
+            format::vst3::scan_bundle(path)
+        }
+        #[cfg(target_os = "macos")]
+        PluginFormat::AudioUnit => format::au::scan(),
+        #[cfg(not(target_os = "macos"))]
+        PluginFormat::AudioUnit => Err(PluginError::Unsupported("Audio Units need macOS")),
+        PluginFormat::Clap => {
+            let path = target
+                .path
+                .as_deref()
+                .ok_or_else(|| PluginError::Scan("a CLAP scan needs a file path".into()))?;
+            format::clap::scan_bundle(path)
+        }
+        PluginFormat::Internal => Ok(Vec::new()),
+    }
+}
+
+/// The scanner binary's whole job: scan, write messages to `out`, return the exit code.
+pub fn run_scanner(target: &ScanTarget, out: &mut dyn Write) -> i32 {
+    let mut emit = |message: &ScanMessage| {
+        let line = serde_json::to_string(message).expect("scan messages always serialise");
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    };
+    match scan_in_process(target) {
+        Ok(descriptors) => {
+            let count = descriptors.len();
+            for descriptor in descriptors {
+                emit(&ScanMessage::Plugin { descriptor });
+            }
+            emit(&ScanMessage::Done { count });
+            0
+        }
+        Err(error) => {
+            emit(&ScanMessage::Error {
+                message: error.to_string(),
+            });
+            1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Host side
+// ---------------------------------------------------------------------------------------------
+
+/// Drives the scanner child process.
+#[derive(Clone, Debug)]
+pub struct Scanner {
+    executable: PathBuf,
+    timeout: Duration,
+    env: Vec<(String, String)>,
+}
+
+impl Scanner {
+    /// Uses the scanner at `executable`.
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+            timeout: Duration::from_secs(120),
+            env: Vec::new(),
+        }
+    }
+
+    /// Finds the scanner: `$RIDDIM_SCAN`, else next to the running executable.
+    pub fn locate() -> Result<Self> {
+        if let Some(path) = std::env::var_os(SCANNER_ENV) {
+            return Ok(Self::new(path));
+        }
+        let name = format!("{SCANNER_BINARY}{}", std::env::consts::EXE_SUFFIX);
+        let here = std::env::current_exe()?;
+        // Next to the executable, or one level up (cargo puts test binaries in `deps/`).
+        let candidates = here.ancestors().skip(1).take(2).map(|dir| dir.join(&name));
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Ok(Self::new(candidate));
+            }
+        }
+        Err(PluginError::Scan(format!(
+            "could not find the {name} executable; set {SCANNER_ENV} to its path"
+        )))
+    }
+
+    /// How long one target may take before the scanner is killed.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Sets an environment variable for the scanner child only.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    /// Scans one target in a fresh child process.
+    pub fn scan(&self, target: &ScanTarget) -> ScanOutcome {
+        let mut command = Command::new(&self.executable);
+        command.arg(target.format.as_str());
+        if let Some(path) = &target.path {
+            command.arg(path);
+        }
+        command.envs(self.env.iter().map(|(k, v)| (k, v)));
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return ScanOutcome::Failed(format!(
+                    "could not start {}: {e}",
+                    self.executable.display()
+                ))
+            }
+        };
+
+        // Read both pipes on their own threads so a chatty plugin cannot block the child.
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let out_reader = std::thread::spawn(move || {
+            BufReader::new(stdout)
+                .lines()
+                .map_while(|l| l.ok())
+                .collect::<Vec<String>>()
+        });
+        let err_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = BufReader::new(stderr)
+                .take(64 * 1024)
+                .read_to_string(&mut text);
+            text
+        });
+
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => return ScanOutcome::Crashed(format!("lost the scanner process: {e}")),
+            }
+        };
+        let lines = out_reader.join().unwrap_or_default();
+        let stderr_text = err_reader.join().unwrap_or_default();
+        let Some(status) = status else {
+            return ScanOutcome::TimedOut;
+        };
+
+        let mut plugins = Vec::new();
+        let mut reported_error = None;
+        let mut done = false;
+        for line in &lines {
+            // Plugins print to stdout too; anything that is not one of our messages is noise.
+            match serde_json::from_str::<ScanMessage>(line) {
+                Ok(ScanMessage::Plugin { descriptor }) => plugins.push(descriptor),
+                Ok(ScanMessage::Error { message }) => reported_error = Some(message),
+                Ok(ScanMessage::Done { .. }) => done = true,
+                Err(_) => {}
+            }
+        }
+
+        if let Some(message) = reported_error {
+            return ScanOutcome::Failed(message);
+        }
+        if status.success() && done {
+            return ScanOutcome::Ok(plugins);
+        }
+        let mut detail = describe_exit(&status);
+        let tail = stderr_text.trim();
+        if !tail.is_empty() {
+            let last = tail.lines().last().unwrap_or(tail);
+            detail.push_str(&format!(" ({last})"));
+        }
+        ScanOutcome::Crashed(detail)
+    }
+
+    /// Scans every target, one child process each, and gathers the results.
+    pub fn scan_all(
+        &self,
+        targets: &[ScanTarget],
+        mut progress: impl FnMut(&ScanTarget, &ScanOutcome),
+    ) -> ScanReport {
+        let mut report = ScanReport::default();
+        for target in targets {
+            let outcome = self.scan(target);
+            progress(target, &outcome);
+            match outcome {
+                ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
+                other => report.failures.push((target.clone(), other)),
+            }
+        }
+        report
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cache and blocklist
+// ---------------------------------------------------------------------------------------------
+
+/// Version of the cache file. A file with another version is ignored and rebuilt.
+const CACHE_VERSION: u32 = 1;
+
+/// Environment variable that overrides where the scan cache lives.
+pub const CACHE_ENV: &str = "RIDDIM_SCAN_CACHE";
+
+/// What a bundle looked like when it was scanned: if this still matches, the cached result
+/// stands; if the plugin was updated, it does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    /// Newest modification time found in the bundle, in nanoseconds since the Unix epoch.
+    pub modified: u128,
+    /// Total size of the files looked at.
+    pub size: u64,
+}
+
+impl FileStamp {
+    /// Stamps a bundle (or a single file) by walking its first few levels.
+    pub fn of(path: &Path) -> Option<FileStamp> {
+        fn visit(path: &Path, depth: u32, stamp: &mut FileStamp) {
+            let Ok(meta) = std::fs::metadata(path) else {
+                return;
+            };
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            stamp.modified = stamp.modified.max(modified);
+            if meta.is_file() {
+                stamp.size += meta.len();
+            } else if meta.is_dir() && depth < 4 {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        visit(&entry.path(), depth + 1, stamp);
+                    }
+                }
+            }
+        }
+        if !path.exists() {
+            return None;
+        }
+        let mut stamp = FileStamp {
+            modified: 0,
+            size: 0,
+        };
+        visit(path, 0, &mut stamp);
+        Some(stamp)
+    }
+}
+
+/// What the cache remembers about one bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub enum CachedOutcome {
+    Plugins {
+        plugins: Vec<PluginDescriptor>,
+    },
+    /// The bundle crashed, hung or failed to scan and is not probed again until it changes.
+    Blocked {
+        reason: String,
+    },
+    /// A host process started probing the bundle and has not reported back. While that
+    /// process is alive this means nothing (it may be mid-scan); once it is gone, the bundle
+    /// took its host down with it and counts as blocked.
+    Probing {
+        pid: u32,
+    },
+}
+
+/// The reason given for a bundle whose probe never came back.
+const UNFINISHED: &str = "the scan did not finish (the host exited while probing it)";
+
+/// Whether a process with this id exists.
+fn process_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const ESRCH: i32 = 3;
+        // SAFETY: signal 0 delivers nothing; it only asks whether the process can be signalled.
+        let result = unsafe { kill(pid as i32, 0) };
+        // A failure other than "no such process" (not permitted, say) still means it exists.
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CacheEntry {
+    stamp: FileStamp,
+    #[serde(flatten)]
+    outcome: CachedOutcome,
+}
+
+/// Scan results kept between runs, and the list of bundles not to touch again.
+///
+/// Keyed by bundle path. An entry is only trusted while the bundle's [`FileStamp`] is
+/// unchanged, so installing an update gets a plugin rescanned (and a blocked one retried).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanCache {
+    version: u32,
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, CacheEntry>,
+    /// Bundles this process took out of the cache since it last read or wrote the file, so
+    /// that merging with the file does not bring them back.
+    #[serde(skip)]
+    forgotten: std::collections::BTreeSet<String>,
+    /// Bundles whose entry this process wrote since it last read or wrote the file. Only these
+    /// are this process's to say; everything else is whatever the file says now.
+    #[serde(skip)]
+    changed: std::collections::BTreeSet<String>,
+}
+
+impl Default for ScanCache {
+    fn default() -> ScanCache {
+        ScanCache::new()
+    }
+}
+
+impl ScanCache {
+    pub fn new() -> ScanCache {
+        ScanCache {
+            version: CACHE_VERSION,
+            entries: Default::default(),
+            forgotten: Default::default(),
+            changed: Default::default(),
+        }
+    }
+
+    /// Where the cache lives by default: `$RIDDIM_SCAN_CACHE`, else the platform's cache
+    /// directory.
+    pub fn default_path() -> PathBuf {
+        if let Some(path) = std::env::var_os(CACHE_ENV) {
+            return PathBuf::from(path);
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let base = if cfg!(target_os = "macos") {
+            home.join("Library/Caches")
+        } else if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            PathBuf::from(xdg)
+        } else {
+            home.join(".cache")
+        };
+        base.join("riddim").join("plugin-scan.json")
+    }
+
+    fn read(path: &Path) -> Option<ScanCache> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<ScanCache>(&text).ok())
+            .filter(|cache| cache.version == CACHE_VERSION)
+    }
+
+    /// Reads a cache file. A missing, unreadable or outdated file gives an empty cache.
+    pub fn load(path: &Path) -> ScanCache {
+        Self::read(path).unwrap_or_default()
+    }
+
+    /// Brings this cache up to date with the file: what the file says now, with this
+    /// process's own changes since it last read or wrote the file laid over it.
+    ///
+    /// Only entries this process wrote, and bundles it forgot, are its to say. Everything
+    /// else it holds is a copy of what the file said at some earlier moment, and another host
+    /// may have moved on since: finished a probe whose mark we read while it was running,
+    /// taken a bundle off the blocklist, scanned something new. Writing such a copy back
+    /// would undo that. (A probe mark is the case that hurts: the copy says "being probed by
+    /// process N", N has since finished and exited, and the bundle reads as having taken N
+    /// down with it.)
+    pub fn refresh(&mut self, path: &Path) {
+        let Some(on_disk) = Self::read(path) else {
+            return;
+        };
+        let mut entries = on_disk.entries;
+        for key in &self.forgotten {
+            entries.remove(key);
+        }
+        for key in &self.changed {
+            if let Some(entry) = self.entries.get(key) {
+                entries.insert(key.clone(), entry.clone());
+            }
+        }
+        self.entries = entries;
+    }
+
+    /// Writes the cache, replacing the file in one step.
+    ///
+    /// The file is read first and this process's changes are laid over what it says now (see
+    /// [`ScanCache::refresh`]), so two hosts scanning at once do not undo each other's work.
+    /// (There is no lock: two hosts saving in the same instant can still lose one entry,
+    /// which costs a repeated scan. For a bundle both of them probed, the later writer wins.)
+    pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        self.refresh(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(
+            &temporary,
+            serde_json::to_string_pretty(self).expect("the cache serialises"),
+        )?;
+        std::fs::rename(&temporary, path)?;
+        // The file now says what we had to say.
+        self.changed.clear();
+        self.forgotten.clear();
+        Ok(())
+    }
+
+    fn key(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The cached outcome for `path`, if the bundle has not changed since.
+    ///
+    /// A probe that a dead process left unfinished reads as [`CachedOutcome::Blocked`]; one
+    /// that a live process is still running reads as not cached.
+    pub fn lookup(&self, path: &Path) -> Option<CachedOutcome> {
+        let entry = self.entries.get(&Self::key(path))?;
+        if FileStamp::of(path) != Some(entry.stamp) {
+            return None;
+        }
+        match &entry.outcome {
+            CachedOutcome::Probing { pid } if process_alive(*pid) => None,
+            CachedOutcome::Probing { .. } => Some(CachedOutcome::Blocked {
+                reason: UNFINISHED.into(),
+            }),
+            settled => Some(settled.clone()),
+        }
+    }
+
+    fn store(&mut self, path: &Path, outcome: CachedOutcome) {
+        if let Some(stamp) = FileStamp::of(path) {
+            let key = Self::key(path);
+            self.forgotten.remove(&key);
+            self.changed.insert(key.clone());
+            self.entries.insert(key, CacheEntry { stamp, outcome });
+        }
+    }
+
+    /// Bundles on the blocklist, with why.
+    pub fn blocked(&self) -> Vec<(PathBuf, String)> {
+        self.entries
+            .iter()
+            .filter_map(|(path, entry)| match &entry.outcome {
+                CachedOutcome::Blocked { reason } => Some((PathBuf::from(path), reason.clone())),
+                CachedOutcome::Probing { pid } if !process_alive(*pid) => {
+                    Some((PathBuf::from(path), UNFINISHED.to_string()))
+                }
+                CachedOutcome::Probing { .. } | CachedOutcome::Plugins { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Takes a bundle off the blocklist (and out of the cache) so it is scanned again.
+    pub fn forget(&mut self, path: &Path) -> bool {
+        let key = Self::key(path);
+        let known = self.entries.remove(&key).is_some();
+        self.changed.remove(&key);
+        self.forgotten.insert(key);
+        known
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Scanner {
+    /// Scans `targets`, using and updating `cache`.
+    ///
+    /// A bundle that has not changed since it was last scanned is not loaded again: its
+    /// plugins come from the cache, or, if it is blocklisted, it is skipped and reported.
+    /// A bundle whose scan crashes, hangs or fails goes on the blocklist.
+    ///
+    /// If `cache_file` is given, the cache is saved before each bundle is probed, with that
+    /// bundle marked as being probed by this process, and again after. So if this process dies
+    /// while a plugin has the scanner stuck, the next start finds the mark, sees that its
+    /// owner is gone, and does not probe that plugin again.
+    ///
+    /// `progress` is told, for each target, the outcome and whether it came from the cache.
+    pub fn scan_cached(
+        &self,
+        targets: &[ScanTarget],
+        cache: &mut ScanCache,
+        cache_file: Option<&Path>,
+        mut progress: impl FnMut(&ScanTarget, &ScanOutcome, bool),
+    ) -> ScanReport {
+        // Start from what the file says now: a host that has been running for a while may
+        // hold marks of probes that other hosts have long since finished.
+        if let Some(file) = cache_file {
+            cache.refresh(file);
+        }
+        let mut report = ScanReport::default();
+        let mut settle = |target: &ScanTarget, outcome: ScanOutcome, cached: bool| {
+            progress(target, &outcome, cached);
+            match outcome {
+                ScanOutcome::Ok(plugins) => report.plugins.extend(plugins),
+                other => report.failures.push((target.clone(), other)),
+            }
+        };
+        for target in targets {
+            // Targets without a path (the Audio Unit registry) are cheap to list and are not
+            // cached.
+            let Some(path) = target.path.as_deref() else {
+                settle(target, self.scan(target), false);
+                continue;
+            };
+
+            match cache.lookup(path) {
+                Some(CachedOutcome::Plugins { plugins }) => {
+                    settle(target, ScanOutcome::Ok(plugins), true);
+                    continue;
+                }
+                Some(CachedOutcome::Blocked { reason }) => {
+                    let outcome = ScanOutcome::Failed(format!("on the blocklist: {reason}"));
+                    settle(target, outcome, true);
+                    continue;
+                }
+                Some(CachedOutcome::Probing { .. }) | None => {}
+            }
+
+            // Leave a mark that outlives this process, in case the probe takes it down.
+            cache.store(
+                path,
+                CachedOutcome::Probing {
+                    pid: std::process::id(),
+                },
+            );
+            if let Some(file) = cache_file {
+                let _ = cache.save(file);
+            }
+            let outcome = self.scan(target);
+            let cached = match &outcome {
+                ScanOutcome::Ok(plugins) => CachedOutcome::Plugins {
+                    plugins: plugins.clone(),
+                },
+                ScanOutcome::Failed(reason) => CachedOutcome::Blocked {
+                    reason: reason.clone(),
+                },
+                ScanOutcome::Crashed(detail) => CachedOutcome::Blocked {
+                    reason: format!("crashed the scanner ({detail})"),
+                },
+                ScanOutcome::TimedOut => CachedOutcome::Blocked {
+                    reason: "hung the scanner".into(),
+                },
+            };
+            cache.store(path, cached);
+            if let Some(file) = cache_file {
+                let _ = cache.save(file);
+            }
+            settle(target, outcome, false);
+        }
+        report
+    }
+}
+
+/// Everything there is to scan in the default locations (plus `extra_dirs`).
+pub fn default_targets(extra_dirs: &[PathBuf]) -> Vec<ScanTarget> {
+    let mut dirs = format::vst3::default_search_paths();
+    dirs.extend(extra_dirs.iter().cloned());
+    let mut targets: Vec<ScanTarget> = format::vst3::find_bundles(&dirs)
+        .into_iter()
+        .map(|path| ScanTarget {
+            format: PluginFormat::Vst3,
+            path: Some(path),
+        })
+        .collect();
+    // The extra directories are searched for CLAP plugins as well.
+    let mut dirs = format::clap::default_search_paths();
+    dirs.extend(extra_dirs.iter().cloned());
+    targets.extend(
+        format::clap::find_bundles(&dirs)
+            .into_iter()
+            .map(|path| ScanTarget {
+                format: PluginFormat::Clap,
+                path: Some(path),
+            }),
+    );
+    if cfg!(target_os = "macos") {
+        targets.push(ScanTarget {
+            format: PluginFormat::AudioUnit,
+            path: None,
+        });
+    }
+    targets
+}
+
+#[cfg(unix)]
+fn describe_exit(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (_, Some(signal)) => format!("killed by signal {signal}"),
+        (Some(code), _) => format!("exited with code {code}"),
+        _ => "exited abnormally".to_string(),
+    }
+}
+
+#[cfg(not(unix))]
+fn describe_exit(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exited with code {code}"),
+        None => "exited abnormally".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor::{PluginId, PluginKind};
+
+    #[test]
+    fn messages_are_single_json_lines() {
+        let message = ScanMessage::Plugin {
+            descriptor: PluginDescriptor {
+                id: PluginId::new(PluginFormat::Vst3, "AB"),
+                name: "N\new\"line".into(),
+                vendor: "V".into(),
+                version: "1".into(),
+                kind: PluginKind::Effect,
+                categories: vec![],
+                path: None,
+            },
+        };
+        let line = serde_json::to_string(&message).unwrap();
+        assert!(!line.contains('\n'));
+        assert_eq!(serde_json::from_str::<ScanMessage>(&line).unwrap(), message);
+    }
+
+    /// A process id that belongs to nothing: a child that has exited and been waited for.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_of_another_hosts_probe_mark_is_never_written_back_over_its_result() {
+        let dir = std::env::temp_dir().join(format!("riddim-scan-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cache.json");
+        let bundle = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        };
+        let (slow, other, third) = (
+            bundle("slow.clap"),
+            bundle("other.clap"),
+            bundle("third.clap"),
+        );
+        let found = || CachedOutcome::Plugins { plugins: vec![] };
+        let blocked = || CachedOutcome::Blocked {
+            reason: "it crashed".into(),
+        };
+
+        // Host A marks a bundle as being probed and saves, as `scan_cached` does. (Its
+        // process id here is one that will be gone by the time anyone asks.)
+        let mut a = ScanCache::load(&file);
+        a.store(&slow, CachedOutcome::Probing { pid: dead_pid() });
+        a.save(&file).unwrap();
+        // Host B starts at that moment and reads the file, mark and all.
+        let mut b = ScanCache::load(&file);
+        // A finishes its probe, records what it found, and exits.
+        a.store(&slow, found());
+        a.save(&file).unwrap();
+        // B records something about another bundle and saves.
+        b.store(&other, blocked());
+        b.save(&file).unwrap();
+
+        // A's result is still what the file says: B's copy of the mark did not replace it,
+        // so the bundle is not taken for one that took its host down.
+        let now = ScanCache::load(&file);
+        assert_eq!(now.lookup(&slow), Some(found()));
+        assert_eq!(now.lookup(&other), Some(blocked()));
+        assert_eq!(now.blocked().len(), 1);
+        // And B, having saved, knows it too.
+        assert_eq!(b.lookup(&slow), Some(found()));
+
+        // The same for a bundle taken off the blocklist: a host holding an older copy of the
+        // entry does not put it back.
+        let mut c = ScanCache::load(&file);
+        let mut d = ScanCache::load(&file);
+        assert!(c.forget(&other));
+        c.save(&file).unwrap();
+        d.store(&third, found());
+        d.save(&file).unwrap();
+        let now = ScanCache::load(&file);
+        assert_eq!(now.lookup(&other), None, "a forgotten bundle came back");
+        assert_eq!(now.lookup(&third), Some(found()));
+        assert_eq!(now.len(), 2);
+
+        // A long-running host catches up when it next scans or refreshes, without saving.
+        let mut e = ScanCache::load(&file);
+        let mut f = ScanCache::load(&file);
+        e.store(&other, blocked());
+        e.save(&file).unwrap();
+        assert_eq!(f.lookup(&other), None);
+        f.refresh(&file);
+        assert_eq!(f.lookup(&other), Some(blocked()));
+
+        // What a host has changed and not yet saved survives its own refresh.
+        f.store(&third, blocked());
+        assert!(f.forget(&slow));
+        f.refresh(&file);
+        assert_eq!(f.lookup(&third), Some(blocked()));
+        assert_eq!(f.lookup(&slow), None);
+
+        // A mark whose owner really is gone, with nothing after it, still blocks.
+        let mut g = ScanCache::load(&file);
+        g.store(&slow, CachedOutcome::Probing { pid: dead_pid() });
+        g.save(&file).unwrap();
+        assert!(matches!(
+            ScanCache::load(&file).lookup(&slow),
+            Some(CachedOutcome::Blocked { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_scanner_is_a_failure_not_a_panic() {
+        let scanner = Scanner::new("/nonexistent/riddim-scan");
+        let target = ScanTarget {
+            format: PluginFormat::Vst3,
+            path: Some("/tmp/x.vst3".into()),
+        };
+        assert!(matches!(scanner.scan(&target), ScanOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn scanning_a_missing_bundle_reports_an_error_message() {
+        let target = ScanTarget {
+            format: PluginFormat::Vst3,
+            path: Some("/nonexistent/Nope.vst3".into()),
+        };
+        let mut out = Vec::new();
+        assert_eq!(run_scanner(&target, &mut out), 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ScanMessage>(text.trim()).unwrap(),
+            ScanMessage::Error { .. }
+        ));
+    }
+}

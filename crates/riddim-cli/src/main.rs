@@ -1,0 +1,519 @@
+//! `riddim`: a headless tool for exercising the engine.
+//!
+//! Hosting-level commands (`scan`, `info`, `check`, `state`, `editor-cycle`) talk to plugins
+//! directly. Everything that makes sound (`play`, `render`, `session ...`) runs the engine.
+
+mod commands;
+mod resolve;
+mod session;
+mod ui;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Args, Parser, Subcommand};
+
+// Count heap traffic inside real-time sections in every build of the tool, so "audio-thread
+// heap operations: 0" in its output is a measurement and not an assumption.
+#[global_allocator]
+static ALLOC: riddim::rt::RtCheckAllocator = riddim::rt::RtCheckAllocator::system();
+
+#[derive(Parser)]
+#[command(
+    name = "riddim",
+    version,
+    about = "Headless tool for the Riddim audio engine"
+)]
+struct Cli {
+    /// Extra directory to search for VST3 bundles (repeatable).
+    #[arg(long = "vst3-dir", global = true, value_name = "DIR")]
+    vst3_dirs: Vec<PathBuf>,
+
+    /// Path to the riddim-scan executable (default: next to this one, or $RIDDIM_SCAN).
+    #[arg(long, global = true, value_name = "PATH")]
+    scanner: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List installed plugins (each bundle is probed in a separate process).
+    Scan {
+        /// Print descriptors as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Probe every bundle again, ignoring the cache and the blocklist.
+        #[arg(long)]
+        rescan: bool,
+        /// List the bundles that crashed, hung or failed their scan and are being skipped.
+        #[arg(long)]
+        blocklist: bool,
+        /// Take a bundle off the blocklist so it is scanned again.
+        #[arg(long, value_name = "BUNDLE")]
+        unblock: Option<PathBuf>,
+    },
+    /// Show a plugin's buses and parameters.
+    Info {
+        plugin: String,
+        /// List every parameter instead of the first 40.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Run the host conformance steps against one or more plugins.
+    Check {
+        plugins: Vec<String>,
+        #[arg(long, default_value_t = 48_000.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 128)]
+        block: u32,
+    },
+    /// Render a plugin playing a MIDI file (or the test arpeggio), offline, to a WAV file.
+    Render {
+        plugin: String,
+        #[arg(long, short)]
+        out: PathBuf,
+        /// A Standard MIDI File to play. Without it, the built-in arpeggio loops.
+        #[arg(long)]
+        midi: Option<PathBuf>,
+        #[arg(long, default_value_t = 4.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 48_000.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 128)]
+        block: u32,
+        /// Restore this state file before rendering.
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Extra threads to render with. The file is the same whatever the number.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+    },
+    /// Save, restore and compare plugin state.
+    State {
+        #[command(subcommand)]
+        action: StateAction,
+    },
+    /// Play a plugin live through the engine: device out, MIDI keyboards in, editor open.
+    Play {
+        plugin: String,
+        #[command(flatten)]
+        device: DeviceArgs,
+        /// Stop after this many seconds (default: until Enter is pressed or the editor closes).
+        #[arg(long)]
+        seconds: Option<f64>,
+        /// Loop the built-in test arpeggio.
+        #[arg(long)]
+        sequence: bool,
+        /// Play this Standard MIDI File.
+        #[arg(long)]
+        midi: Option<PathBuf>,
+        /// Do not open the plugin's editor.
+        #[arg(long)]
+        no_editor: bool,
+        /// Restore this state file after loading.
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Save the plugin's state to this file on exit.
+        #[arg(long)]
+        save_state: Option<PathBuf>,
+    },
+    /// Small projects: build one, play it, record a take into it, render it.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+    /// Measure recording alignment through a cable from an output to an input.
+    Loopback {
+        #[command(flatten)]
+        device: DeviceArgs,
+        /// Device input the cable returns on, e.g. "1" or "1-2".
+        #[arg(long, default_value = "1")]
+        input: String,
+        #[arg(long, default_value_t = 5.0)]
+        seconds: f64,
+    },
+    /// Open, resize and close a plugin's editor repeatedly (macOS).
+    EditorCycle {
+        plugin: String,
+        #[arg(long, default_value_t = 10)]
+        count: u32,
+    },
+    /// List audio devices.
+    Devices,
+}
+
+#[derive(Args, Clone, Copy)]
+struct DeviceArgs {
+    #[arg(long, default_value_t = 48_000.0)]
+    rate: f64,
+    #[arg(long, default_value_t = 128)]
+    buffer: u32,
+    /// Use the silent, timer-driven null device instead of audio hardware.
+    #[arg(long)]
+    null_device: bool,
+    /// With --null-device: feed the output back to the input after this many frames.
+    #[arg(long, value_name = "FRAMES")]
+    loopback: Option<u32>,
+    /// Threads that help the audio thread render (default: one fewer than the cores, at most
+    /// 7, on audio hardware; none on the null device). The sound is the same either way.
+    #[arg(long, value_name = "N")]
+    render_threads: Option<usize>,
+    /// Change to this buffer size a few seconds in, while running.
+    #[arg(long, value_name = "FRAMES")]
+    switch_buffer: Option<u32>,
+    /// Let each plugin's first block run on the audio thread, instead of giving it one block
+    /// of silence where it was loaded. For finding out whether a plugin minds the latter.
+    #[arg(long)]
+    no_warm_up: bool,
+}
+
+impl DeviceArgs {
+    fn options(self) -> session::DeviceOptions {
+        session::DeviceOptions {
+            rate: self.rate,
+            buffer: self.buffer,
+            null_device: self.null_device,
+            loopback: self.loopback,
+            capture: false,
+            render_threads: self.render_threads,
+            switch_buffer: self.switch_buffer,
+            warm_up: !self.no_warm_up,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Create a project file with an instrument track and, optionally, an armed audio track.
+    New {
+        project: PathBuf,
+        /// Plugin for the instrument track.
+        #[arg(long)]
+        instrument: Option<String>,
+        /// Standard MIDI File for the instrument track.
+        #[arg(long)]
+        midi: Option<PathBuf>,
+        /// Put the test arpeggio on the instrument track.
+        #[arg(long)]
+        sequence: bool,
+        /// Add an audio track armed to record these device inputs, e.g. "1" or "1-2".
+        #[arg(long, value_name = "INPUTS")]
+        audio_input: Option<String>,
+        /// How many armed audio tracks to create on that input.
+        #[arg(long, default_value_t = 1)]
+        audio_tracks: u8,
+        /// Bars of metronome before recording starts.
+        #[arg(long, default_value_t = 0)]
+        count_in: u8,
+        /// Insert this effect on the instrument track (repeatable, in order).
+        #[arg(long, value_name = "PLUGIN")]
+        insert: Vec<String>,
+        /// Put this effect on a bus of its own, fed by a send from the instrument track.
+        #[arg(long, value_name = "PLUGIN")]
+        send_effect: Option<String>,
+        /// Automate the instrument's fader from silence to full over this many beats.
+        #[arg(long, value_name = "BEATS")]
+        fade_in: Option<u32>,
+        /// Run each plugin in a process of its own (riddim-bridge): a crash then costs only
+        /// that plugin.
+        #[arg(long)]
+        bridged: bool,
+        /// Make this many instrument tracks, each with the instrument, its material and its
+        /// inserts: `--copies 4` with five `--insert`s is four instruments and twenty effects.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        copies: u8,
+        /// Loop the instrument's material, so the project plays for as long as it is left to.
+        #[arg(long)]
+        looped: bool,
+    },
+    /// Describe a project file.
+    Info { project: PathBuf },
+    /// Play a project.
+    Play {
+        project: PathBuf,
+        #[command(flatten)]
+        device: DeviceArgs,
+        #[arg(long)]
+        seconds: Option<f64>,
+        /// Open the instrument's editor.
+        #[arg(long)]
+        editor: bool,
+        /// On exit, save the plugins' current settings back into the project.
+        #[arg(long)]
+        save: bool,
+    },
+    /// Play a project and record its armed tracks; the takes and plugin states are saved back.
+    Record {
+        project: PathBuf,
+        #[command(flatten)]
+        device: DeviceArgs,
+        #[arg(long)]
+        seconds: Option<f64>,
+        #[arg(long)]
+        editor: bool,
+        /// Loop this stretch (beats, START:END) while recording: each time round is a take.
+        #[arg(long = "loop", value_name = "BEATS")]
+        loop_range: Option<session::BeatRange>,
+        /// Record only inside this stretch (beats, START:END), replacing what is there.
+        #[arg(long, value_name = "BEATS")]
+        punch: Option<session::BeatRange>,
+    },
+    /// Edit a project with ops given as JSON: a file holding an array of ops, or `-` for stdin.
+    Apply { project: PathBuf, ops: PathBuf },
+    /// Render a project offline to a WAV file and print a fingerprint of the audio.
+    Render {
+        project: PathBuf,
+        #[arg(long, short)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 48_000.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 128)]
+        block: u32,
+        /// Extra seconds after the end, for reverb and release tails.
+        #[arg(long, default_value_t = 0.0)]
+        tail: f64,
+        /// Render only this track id, as a stem (repeatable; see `session info` for ids).
+        #[arg(long, value_name = "TRACK")]
+        stem: Vec<u64>,
+        /// Extra threads to render with. The file is the same whatever the number.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+    },
+}
+
+/// Parses "1" or "1-2" (1-based device inputs) into a first channel and a count.
+fn parse_inputs(text: &str) -> Result<(u16, u8), String> {
+    let bad = || format!("'{text}' is not an input like \"1\" or \"1-2\"");
+    let (first, last) = match text.split_once('-') {
+        Some((first, last)) => (
+            first.parse::<u16>().map_err(|_| bad())?,
+            last.parse::<u16>().map_err(|_| bad())?,
+        ),
+        None => {
+            let only = text.parse::<u16>().map_err(|_| bad())?;
+            (only, only)
+        }
+    };
+    if first == 0 || last < first || last - first > 1 {
+        return Err(bad());
+    }
+    Ok((first - 1, (last - first + 1) as u8))
+}
+
+#[derive(Subcommand)]
+enum StateAction {
+    /// Save a plugin's current (default) state to a file.
+    Save {
+        plugin: String,
+        #[arg(long, short)]
+        out: PathBuf,
+    },
+    /// Check save -> restore -> save gives an identical blob, starting from a state file if given.
+    Roundtrip {
+        plugin: String,
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
+}
+
+/// Lets `riddim scan | head` end quietly instead of panicking on a closed pipe.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    // SAFETY: resetting a signal disposition to its default before any threads exist.
+    unsafe { signal(SIGPIPE, SIG_DFL) };
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
+fn main() -> ExitCode {
+    restore_default_sigpipe();
+    let cli = Cli::parse();
+    let context = commands::Context {
+        vst3_dirs: cli.vst3_dirs,
+        scanner: cli.scanner,
+    };
+    let result = match cli.command {
+        Command::Scan {
+            json,
+            rescan,
+            blocklist,
+            unblock,
+        } => commands::scan(
+            &context,
+            commands::ScanOptions {
+                json,
+                rescan,
+                blocklist,
+                unblock,
+            },
+        ),
+        Command::Info { plugin, all } => commands::info(&context, &plugin, all),
+        Command::Check {
+            plugins,
+            rate,
+            block,
+        } => commands::check(&context, &plugins, rate, block),
+        Command::Render {
+            plugin,
+            out,
+            midi,
+            seconds,
+            rate,
+            block,
+            state,
+            threads,
+        } => session::render(
+            &context,
+            &plugin,
+            session::RenderOptions {
+                out,
+                seconds,
+                rate,
+                buffer: block,
+                state,
+                midi,
+                threads,
+            },
+        ),
+        Command::State {
+            action: StateAction::Save { plugin, out },
+        } => commands::state_save(&context, &plugin, &out),
+        Command::State {
+            action: StateAction::Roundtrip { plugin, state },
+        } => commands::state_roundtrip(&context, &plugin, state.as_deref()),
+        Command::Play {
+            plugin,
+            device,
+            seconds,
+            sequence,
+            midi,
+            no_editor,
+            state,
+            save_state,
+        } => session::play(
+            &context,
+            &plugin,
+            session::PlayOptions {
+                device: device.options(),
+                seconds,
+                sequence,
+                midi,
+                editor: !no_editor,
+                state,
+                save_state,
+            },
+        ),
+        Command::Session { action } => match action {
+            SessionAction::New {
+                project,
+                instrument,
+                midi,
+                sequence,
+                audio_input,
+                audio_tracks,
+                count_in,
+                insert,
+                send_effect,
+                fade_in,
+                bridged,
+                copies,
+                looped,
+            } => match audio_input.as_deref().map(parse_inputs).transpose() {
+                Ok(audio_input) => session::session_new(
+                    &context,
+                    &project,
+                    session::NewOptions {
+                        instrument,
+                        midi,
+                        sequence,
+                        audio_input,
+                        audio_tracks,
+                        count_in,
+                        inserts: insert,
+                        send_effect,
+                        fade_in,
+                        bridged,
+                        copies,
+                        looped,
+                    },
+                ),
+                Err(message) => Err(message),
+            },
+            SessionAction::Info { project } => session::session_info(&project),
+            SessionAction::Play {
+                project,
+                device,
+                seconds,
+                editor,
+                save,
+            } => session::session_play(&project, device.options(), seconds, editor, save),
+            SessionAction::Record {
+                project,
+                device,
+                seconds,
+                editor,
+                loop_range,
+                punch,
+            } => session::session_record(
+                &project,
+                device.options(),
+                session::RecordOptions {
+                    seconds,
+                    editor,
+                    loop_range,
+                    punch,
+                },
+            ),
+            SessionAction::Apply { project, ops } => session::session_apply(&project, &ops),
+            SessionAction::Render {
+                project,
+                out,
+                seconds,
+                rate,
+                block,
+                tail,
+                stem,
+                threads,
+            } => session::session_render(
+                &project,
+                session::SessionRenderOptions {
+                    out,
+                    seconds,
+                    rate,
+                    buffer: block,
+                    tail,
+                    stem,
+                    threads,
+                },
+            ),
+        },
+        Command::Loopback {
+            device,
+            input,
+            seconds,
+        } => match parse_inputs(&input) {
+            Ok(input) => session::loopback(device.options(), input, seconds),
+            Err(message) => Err(message),
+        },
+        Command::EditorCycle { plugin, count } => commands::editor_cycle(&context, &plugin, count),
+        Command::Devices => commands::devices(),
+    };
+    match result {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::from(2)
+        }
+    }
+}
