@@ -7,7 +7,7 @@ Riddim is a native audio engine written in Rust. It handles playback, recording,
 - **Platform:** macOS first (CoreAudio, Apple Silicon); Windows later (WASAPI or ASIO). Everything platform-neutral also builds and is tested on Linux, and is type-checked for Windows. **Nothing has been run on macOS yet**: see the phase notes.
 - **Plugin formats:** VST3, AU and CLAP, in process or (opt-in per plugin) each in a process of its own.
 - **Architecture:** real-time safe by design, and deterministic in offline render.
-- **First client:** [Whiplash](https://github.com/hejijunhao/whiplash), a Tauri 2 application that links the engine in process ([`docs/api/embedding.md`](docs/api/embedding.md)). The API is commands, queries and events; there is a C ABI for clients that are not Rust.
+- **First client:** the Whiplash DAW, a Kamino application that is not yet public. It is to be a Tauri 2 application that links the engine in process ([`docs/api/embedding.md`](docs/api/embedding.md)). The API is commands, queries and events; there is a C ABI for clients that are not Rust.
 
 ## Layout
 
