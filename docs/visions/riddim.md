@@ -2,7 +2,7 @@
 
 Status: **vision draft for Phil to refine, 2026-11-21.** This is docs only; no code exists and none is written until Phil gives the go-ahead. Facts were checked against the linked sources on 2026-11-21. Anything marked **UNVERIFIED** wasn't confirmed from a primary source, and **[inferred]** marks our own reasoning. §7 lists the risks and open questions.
 
-Companion doc: the Whiplash DAW vision ([hejijunhao/whiplash `daw` branch, `docs/vision/daw.md`](https://github.com/hejijunhao/whiplash/blob/daw/docs/vision/daw.md)). Its §6 recommends Tracktion Engine + JUCE and leaves "a Rust-first core?" open as Q4. **Riddim is the Rust-first answer to that question.** The two docs have to agree before either build starts (Q1, §7.2).
+Riddim's first client is the Whiplash DAW, a Kamino app (not yet public). Its vision is this document's companion, and is not public either. Its §6 recommends Tracktion Engine + JUCE and leaves "a Rust-first core?" open as Q4. **Riddim is the Rust-first answer to that question.** The two docs have to agree before either build starts (Q1, §7.2).
 
 ---
 
@@ -316,7 +316,7 @@ Riddim phases map onto the Whiplash phases (its §8). Estimates are **[estimates
 - **Dependency hygiene from day one:**
   - Run `cargo deny check licenses` in CI ([cargo-deny](https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html)), with an allow list of MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, plus MPL-2.0 for unmodified crates (symphonia, audio_thread_priority).
   - Any GPL dependency (vst3-sys, Carla) blocks the commercial build, so it's denied.
-- **Whiplash:** as copyright holder, we can ship Whiplash on any terms. That works only if Riddim's copyright and Whiplash's owner line up legally. Riddim sits under `kaminocorp`, Whiplash under `hejijunhao`, so an internal licence may be needed (Q8).
+- **Whiplash:** as copyright holder, we can ship Whiplash on any terms. That works only if Riddim's copyright and Whiplash's owner line up legally. Whether an internal licence is needed depends on who owns each (Q8; answered in §7.2: one owner for both, so none is).
 - **Not legal advice.** Counsel should review the CLA, the commercial EULA, and **the GPL/AGPL vs Mac App Store question** (**UNVERIFIED**; it matters only if we ship through the App Store).
 
 ---
